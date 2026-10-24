@@ -166,306 +166,28 @@ where
                 (
                     LayerKind::Convolutional(spec),
                     LayerParams::Convolutional(_) | LayerParams::None,
-                ) => {
-                    let conv =
-                        resolve_convolutional_params(&self.network, &self.params, layer.index)?;
-                    let owner = resolve_convolutional_owner(&self.network, layer.index)?;
-                    let cached = self.cached_convolution_params(
-                        owner,
-                        layer.input_shape.channels,
+                ) => self.forward_convolutional_compact_gpu(
+                    layer,
+                    spec,
+                    current_input.expect("convolution requires current input"),
+                    launch_config,
+                )?,
+                (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(params)) => self
+                    .forward_deconvolutional_compact_gpu(
+                        layer,
                         spec,
-                        conv,
-                    )?;
-                    let conv_output = self
-                        .backend
-                        .conv2d_f32(
-                            current_input.expect("convolution requires current input"),
-                            &cached.weights,
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.input_shape.channels,
-                            layer.input_shape.height,
-                            layer.input_shape.width,
-                            spec.filters,
-                            spec.size,
-                            spec.stride_x,
-                            spec.stride_y,
-                            spec.dilation,
-                            spec.padding,
-                            spec.groups.max(1),
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("convolution", err))?;
-                    if let Some(normalization) = spec.activation.to_channel_normalization() {
-                        let biased = self
-                            .backend
-                            .bias_add_f32(
-                                &conv_output,
-                                &cached.biases,
-                                spec.filters,
-                                layer.output_shape.width * layer.output_shape.height,
-                                launch_config,
-                            )
-                            .map_err(|err| backend_error("convolution bias add", err))?;
-                        self.backend
-                            .normalize_channels_f32(
-                                &biased,
-                                &tensor_backend_shape(layer.output_shape),
-                                layer.output_shape.batch,
-                                layer.output_shape.channels,
-                                layer.output_shape.width * layer.output_shape.height,
-                                normalization,
-                                launch_config,
-                            )
-                            .map_err(|err| {
-                                backend_error("convolution channel normalization", err)
-                            })?
-                    } else {
-                        let activation = gpu_activation_kind(layer.index, &spec.activation)?;
-                        self.backend
-                            .bias_activation_f32(
-                                &conv_output,
-                                &cached.biases,
-                                spec.filters,
-                                layer.output_shape.width * layer.output_shape.height,
-                                activation,
-                                launch_config,
-                            )
-                            .map_err(|err| backend_error("convolution bias + activation", err))?
-                    }
-                }
-                (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(params)) => {
-                    let input = current_input.expect("deconvolution requires current input");
-                    let weights = self
-                        .backend
-                        .upload_f32(
-                            &[
-                                layer.input_shape.channels,
-                                spec.filters,
-                                spec.size,
-                                spec.size,
-                            ],
-                            &params.weights,
-                        )
-                        .map_err(|err| backend_error("compact deconvolution weights", err))?;
-                    let raw = self
-                        .backend
-                        .deconvolutional_f32(
-                            input,
-                            &weights,
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.input_shape.channels,
-                            layer.input_shape.height,
-                            layer.input_shape.width,
-                            spec.filters,
-                            spec.size,
-                            spec.stride,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("compact deconvolution", err))?;
-                    let biases = self
-                        .backend
-                        .upload_f32(&[spec.filters], &params.biases)
-                        .map_err(|err| backend_error("compact deconvolution biases", err))?;
-                    let biased = self
-                        .backend
-                        .bias_add_f32(
-                            &raw,
-                            &biases,
-                            spec.filters,
-                            layer.output_shape.width * layer.output_shape.height,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("compact deconvolution bias", err))?;
-                    if let Some(normalization) = spec.activation.to_channel_normalization() {
-                        self.backend
-                            .normalize_channels_f32(
-                                &biased,
-                                &tensor_backend_shape(layer.output_shape),
-                                layer.output_shape.batch,
-                                layer.output_shape.channels,
-                                layer.output_shape.width * layer.output_shape.height,
-                                normalization,
-                                launch_config,
-                            )
-                            .map_err(|err| {
-                                backend_error("compact deconvolution channel normalization", err)
-                            })?
-                    } else {
-                        self.backend
-                            .activation_f32(
-                                &biased,
-                                gpu_activation_kind(layer.index, &spec.activation)?,
-                                launch_config,
-                            )
-                            .map_err(|err| backend_error("compact deconvolution activation", err))?
-                    }
-                }
-                (LayerKind::GraphConv(spec), LayerParams::GraphConv(params)) => {
-                    let input = current_input.expect("GraphConv requires current input");
-                    let groups = spec.groups.max(1);
-                    let geometry = graph_conv_aggregation_geometry(
+                        params,
+                        current_input.expect("deconvolution requires current input"),
+                        launch_config,
+                    )?,
+                (LayerKind::GraphConv(spec), LayerParams::GraphConv(params)) => self
+                    .forward_graph_conv_compact_gpu(
+                        layer,
                         spec,
-                        layer.input_shape,
-                        layer.output_shape,
-                    );
-                    let aggregate = if spec.edge_mode == 0 {
-                        self.backend
-                            .graph_conv_aggregate_f32(input, geometry, launch_config)
-                            .map_err(|err| backend_error("compact GraphConv aggregation", err))?
-                    } else {
-                        let edge_kernel_values =
-                            params.edge_kernel.as_deref().ok_or_else(|| {
-                                Error::InvalidConfig(
-                                    "GraphConv learned edge kernel is missing".to_owned(),
-                                )
-                            })?;
-                        let edge_bias_values = params.edge_biases.as_deref().ok_or_else(|| {
-                            Error::InvalidConfig(
-                                "GraphConv learned edge biases are missing".to_owned(),
-                            )
-                        })?;
-                        let edge_kernel = self
-                            .backend
-                            .upload_f32(&[edge_kernel_values.len()], edge_kernel_values)
-                            .map_err(|err| backend_error("compact GraphConv edge kernel", err))?;
-                        let edge_biases = self
-                            .backend
-                            .upload_f32(&[edge_bias_values.len()], edge_bias_values)
-                            .map_err(|err| backend_error("compact GraphConv edge biases", err))?;
-                        self.backend
-                            .graph_conv_learned_aggregate_f32(
-                                input,
-                                &edge_kernel,
-                                &edge_biases,
-                                geometry,
-                                groups,
-                                launch_config,
-                            )
-                            .map_err(|err| {
-                                backend_error("compact GraphConv learned aggregation", err)
-                            })?
-                    };
-                    let weight_shape = [spec.filters, layer.input_shape.channels / groups, 1, 1];
-                    let weights = self
-                        .backend
-                        .upload_f32(&weight_shape, &params.projection.weights)
-                        .map_err(|err| {
-                            backend_error("compact GraphConv projection weights", err)
-                        })?;
-                    let mut raw = self
-                        .backend
-                        .conv2d_f32(
-                            &aggregate,
-                            &weights,
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.input_shape.channels,
-                            layer.output_shape.height,
-                            layer.output_shape.width,
-                            spec.filters,
-                            1,
-                            1,
-                            1,
-                            1,
-                            0,
-                            groups,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("compact GraphConv projection", err))?;
-                    if spec.use_self {
-                        let reference = self
-                            .backend
-                            .graph_conv_reference_f32(input, geometry, launch_config)
-                            .map_err(|err| {
-                                backend_error("compact GraphConv reference gather", err)
-                            })?;
-                        let self_values = params.self_weights.as_deref().ok_or_else(|| {
-                            Error::InvalidConfig("GraphConv self weights are missing".to_owned())
-                        })?;
-                        let self_weights = self
-                            .backend
-                            .upload_f32(&weight_shape, self_values)
-                            .map_err(|err| backend_error("compact GraphConv self weights", err))?;
-                        let self_raw = self
-                            .backend
-                            .conv2d_f32(
-                                &reference,
-                                &self_weights,
-                                &tensor_backend_shape(layer.output_shape),
-                                layer.input_shape.channels,
-                                layer.output_shape.height,
-                                layer.output_shape.width,
-                                spec.filters,
-                                1,
-                                1,
-                                1,
-                                1,
-                                0,
-                                groups,
-                                launch_config,
-                            )
-                            .map_err(|err| {
-                                backend_error("compact GraphConv self projection", err)
-                            })?;
-                        raw = self
-                            .backend
-                            .shortcut_add_f32(&raw, &self_raw, launch_config)
-                            .map_err(|err| {
-                                backend_error("compact GraphConv projection sum", err)
-                            })?;
-                    }
-                    let biased = if spec.batch_normalize {
-                        let mut batch_norm =
-                            params.projection.batch_norm.clone().ok_or_else(|| {
-                                Error::InvalidConfig(
-                                    "GraphConv batch-norm parameters are missing".to_owned(),
-                                )
-                            })?;
-                        batch_norm.biases.clone_from(&params.projection.biases);
-                        self.forward_batchnorm_inference_gpu(
-                            &raw,
-                            layer.output_shape,
-                            &batch_norm,
-                            launch_config,
-                        )?
-                    } else {
-                        let biases = self
-                            .backend
-                            .upload_f32(&[spec.filters], &params.projection.biases)
-                            .map_err(|err| backend_error("compact GraphConv biases", err))?;
-                        self.backend
-                            .bias_add_f32(
-                                &raw,
-                                &biases,
-                                spec.filters,
-                                layer.output_shape.width * layer.output_shape.height,
-                                launch_config,
-                            )
-                            .map_err(|err| backend_error("compact GraphConv bias", err))?
-                    };
-                    if let Some(normalization) = spec.activation.to_channel_normalization() {
-                        self.backend
-                            .normalize_channels_f32(
-                                &biased,
-                                &tensor_backend_shape(layer.output_shape),
-                                layer.output_shape.batch,
-                                layer.output_shape.channels,
-                                layer.output_shape.width * layer.output_shape.height,
-                                normalization,
-                                launch_config,
-                            )
-                            .map_err(|err| {
-                                backend_error("compact GraphConv channel normalization", err)
-                            })?
-                    } else {
-                        self.backend
-                            .activation_f32(
-                                &biased,
-                                gpu_activation_kind(layer.index, &spec.activation)?,
-                                launch_config,
-                            )
-                            .map_err(|err| backend_error("compact GraphConv activation", err))?
-                    }
-                }
+                        params,
+                        current_input.expect("GraphConv requires current input"),
+                        launch_config,
+                    )?,
                 (LayerKind::MaxPool(spec), LayerParams::None) => {
                     let maxpool_input = current_input.expect("maxpool requires current input");
                     if spec.depth {
@@ -888,62 +610,14 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("modern-YOLO compact forward", err))?,
-                (LayerKind::Connected(spec), LayerParams::Connected(connected)) => {
-                    let inputs = layer.input_shape.element_count();
-                    if connected.weights.len() != spec.output * inputs
-                        || connected.biases.len() != spec.output
-                    {
-                        return Err(Error::InvalidConfig(format!(
-                            "connected layer #{} expects {} weights and {} biases, got {} and {}",
-                            layer.index,
-                            spec.output * inputs,
-                            spec.output,
-                            connected.weights.len(),
-                            connected.biases.len()
-                        )));
-                    }
-                    let (weights, biases) = match connected.batch_norm.as_ref() {
-                        Some(bn) => {
-                            let mut weights = connected.weights.clone();
-                            let mut biases = connected.biases.clone();
-                            for (o, row) in weights.chunks_mut(inputs).enumerate() {
-                                let k = bn.scales[o]
-                                    / (bn.rolling_variance[o] + BATCH_NORM_EPSILON).sqrt();
-                                row.iter_mut().for_each(|w| *w *= k);
-                                biases[o] -= bn.rolling_mean[o] * k;
-                            }
-                            (weights, biases)
-                        }
-                        None => (connected.weights.clone(), connected.biases.clone()),
-                    };
-                    let weights_gpu = self
-                        .backend
-                        .upload_f32(&[spec.output, inputs], &weights)
-                        .map_err(|err| backend_error("compact connected weights", err))?;
-                    let biases_gpu = self
-                        .backend
-                        .upload_f32(&[spec.output], &biases)
-                        .map_err(|err| backend_error("compact connected biases", err))?;
-                    let pre_activation = self
-                        .backend
-                        .connected_f32(
-                            current_input.expect("Connected requires current input"),
-                            &weights_gpu,
-                            &biases_gpu,
-                            layer.input_shape.batch,
-                            inputs,
-                            spec.output,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("compact connected", err))?;
-                    self.backend
-                        .activation_f32(
-                            &pre_activation,
-                            gpu_activation_kind(layer.index, &spec.activation)?,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("compact connected activation", err))?
-                }
+                (LayerKind::Connected(spec), LayerParams::Connected(connected)) => self
+                    .forward_connected_compact_gpu(
+                        layer,
+                        spec,
+                        connected,
+                        current_input.expect("Connected requires current input"),
+                        launch_config,
+                    )?,
                 (LayerKind::ScaleChannels(spec), LayerParams::None) => {
                     let source_index = resolve_relative_layer(layer.index, spec.from)?;
                     let source = gpu_layer_outputs

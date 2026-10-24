@@ -118,4 +118,79 @@ where
         };
         Ok((output, activation_input, batch_norm_cache))
     }
+
+    /// Compact inference forward: native convolution with fused bias and activation.
+    pub(crate) fn forward_convolutional_compact_gpu(
+        &self,
+        layer: &Layer,
+        spec: &ConvolutionalSpec,
+        current_input: &B::Tensor,
+        launch_config: ElementwiseLaunchConfig,
+    ) -> Result<B::Tensor> {
+        let conv =
+            resolve_convolutional_params(&self.network, &self.params, layer.index)?;
+        let owner = resolve_convolutional_owner(&self.network, layer.index)?;
+        let cached = self.cached_convolution_params(
+            owner,
+            layer.input_shape.channels,
+            spec,
+            conv,
+        )?;
+        let conv_output = self
+            .backend
+            .conv2d_f32(
+                current_input,
+                &cached.weights,
+                &tensor_backend_shape(layer.output_shape),
+                layer.input_shape.channels,
+                layer.input_shape.height,
+                layer.input_shape.width,
+                spec.filters,
+                spec.size,
+                spec.stride_x,
+                spec.stride_y,
+                spec.dilation,
+                spec.padding,
+                spec.groups.max(1),
+                launch_config,
+            )
+            .map_err(|err| backend_error("convolution", err))?;
+        Ok(if let Some(normalization) = spec.activation.to_channel_normalization() {
+            let biased = self
+                .backend
+                .bias_add_f32(
+                    &conv_output,
+                    &cached.biases,
+                    spec.filters,
+                    layer.output_shape.width * layer.output_shape.height,
+                    launch_config,
+                )
+                .map_err(|err| backend_error("convolution bias add", err))?;
+            self.backend
+                .normalize_channels_f32(
+                    &biased,
+                    &tensor_backend_shape(layer.output_shape),
+                    layer.output_shape.batch,
+                    layer.output_shape.channels,
+                    layer.output_shape.width * layer.output_shape.height,
+                    normalization,
+                    launch_config,
+                )
+                .map_err(|err| {
+                    backend_error("convolution channel normalization", err)
+                })?
+        } else {
+            let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+            self.backend
+                .bias_activation_f32(
+                    &conv_output,
+                    &cached.biases,
+                    spec.filters,
+                    layer.output_shape.width * layer.output_shape.height,
+                    activation,
+                    launch_config,
+                )
+                .map_err(|err| backend_error("convolution bias + activation", err))?
+        })
+    }
 }

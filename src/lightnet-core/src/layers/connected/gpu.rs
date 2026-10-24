@@ -3,7 +3,7 @@ use crate::error::{Error, Result};
 use crate::model::{ConnectedSpec, Layer};
 use crate::runtime::{
     BATCH_NORM_EPSILON, ConnectedParams, GpuExecutableNetwork, backend_error,
-    forward_connected_with_cache, tensor_backend_shape,
+    forward_connected_with_cache, gpu_activation_kind, tensor_backend_shape,
 };
 use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
 
@@ -108,5 +108,70 @@ where
                 .map_err(|err| backend_error("upload connected output", err))?
         };
         Ok((output, activation_input_gpu))
+    }
+
+    /// Compact inference forward: weights are folded with batch norm, activation has a device kind.
+    pub(crate) fn forward_connected_compact_gpu(
+        &self,
+        layer: &Layer,
+        spec: &ConnectedSpec,
+        connected: &ConnectedParams,
+        current_input: &B::Tensor,
+        launch_config: ElementwiseLaunchConfig,
+    ) -> Result<B::Tensor> {
+        let inputs = layer.input_shape.element_count();
+        if connected.weights.len() != spec.output * inputs
+            || connected.biases.len() != spec.output
+        {
+            return Err(Error::InvalidConfig(format!(
+                "connected layer #{} expects {} weights and {} biases, got {} and {}",
+                layer.index,
+                spec.output * inputs,
+                spec.output,
+                connected.weights.len(),
+                connected.biases.len()
+            )));
+        }
+        let (weights, biases) = match connected.batch_norm.as_ref() {
+            Some(bn) => {
+                let mut weights = connected.weights.clone();
+                let mut biases = connected.biases.clone();
+                for (o, row) in weights.chunks_mut(inputs).enumerate() {
+                    let k = bn.scales[o]
+                        / (bn.rolling_variance[o] + BATCH_NORM_EPSILON).sqrt();
+                    row.iter_mut().for_each(|w| *w *= k);
+                    biases[o] -= bn.rolling_mean[o] * k;
+                }
+                (weights, biases)
+            }
+            None => (connected.weights.clone(), connected.biases.clone()),
+        };
+        let weights_gpu = self
+            .backend
+            .upload_f32(&[spec.output, inputs], &weights)
+            .map_err(|err| backend_error("compact connected weights", err))?;
+        let biases_gpu = self
+            .backend
+            .upload_f32(&[spec.output], &biases)
+            .map_err(|err| backend_error("compact connected biases", err))?;
+        let pre_activation = self
+            .backend
+            .connected_f32(
+                current_input,
+                &weights_gpu,
+                &biases_gpu,
+                layer.input_shape.batch,
+                inputs,
+                spec.output,
+                launch_config,
+            )
+            .map_err(|err| backend_error("compact connected", err))?;
+        Ok(self.backend
+            .activation_f32(
+                &pre_activation,
+                gpu_activation_kind(layer.index, &spec.activation)?,
+                launch_config,
+            )
+            .map_err(|err| backend_error("compact connected activation", err))?)
     }
 }

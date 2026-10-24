@@ -117,4 +117,80 @@ where
         };
         Ok((output, activation_input_gpu))
     }
+
+    /// Compact inference forward: native deconvolution, bias and activation or channel normalization.
+    pub(crate) fn forward_deconvolutional_compact_gpu(
+        &self,
+        layer: &Layer,
+        spec: &DeconvolutionalSpec,
+        params: &ConvolutionalParams,
+        current_input: &B::Tensor,
+        launch_config: ElementwiseLaunchConfig,
+    ) -> Result<B::Tensor> {
+        let input = current_input;
+        let weights = self
+            .backend
+            .upload_f32(
+                &[
+                    layer.input_shape.channels,
+                    spec.filters,
+                    spec.size,
+                    spec.size,
+                ],
+                &params.weights,
+            )
+            .map_err(|err| backend_error("compact deconvolution weights", err))?;
+        let raw = self
+            .backend
+            .deconvolutional_f32(
+                input,
+                &weights,
+                &tensor_backend_shape(layer.output_shape),
+                layer.input_shape.channels,
+                layer.input_shape.height,
+                layer.input_shape.width,
+                spec.filters,
+                spec.size,
+                spec.stride,
+                launch_config,
+            )
+            .map_err(|err| backend_error("compact deconvolution", err))?;
+        let biases = self
+            .backend
+            .upload_f32(&[spec.filters], &params.biases)
+            .map_err(|err| backend_error("compact deconvolution biases", err))?;
+        let biased = self
+            .backend
+            .bias_add_f32(
+                &raw,
+                &biases,
+                spec.filters,
+                layer.output_shape.width * layer.output_shape.height,
+                launch_config,
+            )
+            .map_err(|err| backend_error("compact deconvolution bias", err))?;
+        Ok(if let Some(normalization) = spec.activation.to_channel_normalization() {
+            self.backend
+                .normalize_channels_f32(
+                    &biased,
+                    &tensor_backend_shape(layer.output_shape),
+                    layer.output_shape.batch,
+                    layer.output_shape.channels,
+                    layer.output_shape.width * layer.output_shape.height,
+                    normalization,
+                    launch_config,
+                )
+                .map_err(|err| {
+                    backend_error("compact deconvolution channel normalization", err)
+                })?
+        } else {
+            self.backend
+                .activation_f32(
+                    &biased,
+                    gpu_activation_kind(layer.index, &spec.activation)?,
+                    launch_config,
+                )
+                .map_err(|err| backend_error("compact deconvolution activation", err))?
+        })
+    }
 }
