@@ -1454,70 +1454,10 @@ where
                     }
                 }
                 (LayerKind::Local(spec), LayerParams::Local(local)) => {
-                    if let Some(activation) = spec.activation.to_cuda_f32_kind() {
-                        let locations = layer.output_shape.width * layer.output_shape.height;
-                        let weights = self
-                            .backend
-                            .upload_f32(
-                                &[
-                                    locations,
-                                    spec.filters,
-                                    layer.input_shape.channels,
-                                    spec.size,
-                                    spec.size,
-                                ],
-                                &local.weights,
-                            )
-                            .map_err(|err| backend_error("upload local weights", err))?;
-                        let biases = self
-                            .backend
-                            .upload_f32(&[locations, spec.filters], &local.biases)
-                            .map_err(|err| backend_error("upload local biases", err))?;
-                        let pre_activation = self
-                            .backend
-                            .local_f32(
-                                current_input,
-                                &weights,
-                                &biases,
-                                &tensor_backend_shape(layer.input_shape),
-                                &tensor_backend_shape(layer.output_shape),
-                                spec.filters,
-                                spec.size,
-                                spec.stride_x,
-                                spec.stride_y,
-                                spec.padding,
-                                launch_config,
-                            )
-                            .map_err(|err| backend_error("local forward", err))?;
-                        activation_input_gpu = Some(pre_activation.clone());
-                        self.backend
-                            .activation_f32(&pre_activation, activation, launch_config)
-                            .map_err(|err| backend_error("local activation", err))?
-                    } else {
-                        let host_input = self
-                            .download_tensor(current_input, layer.input_shape)
-                            .map_err(|err| backend_error("download local input", err))?;
-                        let (host_output, host_activation_input) =
-                            forward_local_with_cache(spec, local, &host_input, layer.output_shape)?;
-                        if let Some(pre_activation) = host_activation_input {
-                            activation_input_gpu = Some(
-                                self.backend
-                                    .upload_f32(
-                                        &tensor_backend_shape(layer.output_shape),
-                                        &pre_activation.data,
-                                    )
-                                    .map_err(|err| {
-                                        backend_error("upload local activation cache", err)
-                                    })?,
-                            );
-                        }
-                        self.backend
-                            .upload_f32(
-                                &tensor_backend_shape(layer.output_shape),
-                                &host_output.data,
-                            )
-                            .map_err(|err| backend_error("upload local output", err))?
-                    }
+                    let (output, activation_input) =
+                        self.forward_local_gpu(layer, spec, local, current_input, launch_config)?;
+                    activation_input_gpu = activation_input;
+                    output
                 }
                 (LayerKind::Connected(spec), LayerParams::Connected(connected)) => {
                     let inputs = layer.input_shape.element_count();

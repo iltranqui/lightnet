@@ -1071,7 +1071,7 @@ pub(super) fn update_recurrent_batch_norm_running_stats(
     Ok(())
 }
 
-pub(super) fn forward_local_with_cache(
+pub(crate) fn forward_local_with_cache(
     spec: &LocalSpec,
     params: &LocalParams,
     input: &Tensor,
