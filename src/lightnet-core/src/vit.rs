@@ -1023,7 +1023,7 @@ pub const MHC_DEFAULTS: [f32; MHC_PARAM_COUNT] = [
     4.0, -4.0, -4.0, 4.0, 0.0, -8.0, 4.0, -4.0, -4.0, 4.0, 0.0, -8.0,
 ];
 
-fn mhc_coefficients(params: &[f32], site: usize) -> Result<(f32, f32, f32, f32, f32), String> {
+pub(crate) fn mhc_coefficients(params: &[f32], site: usize) -> Result<(f32, f32, f32, f32, f32), String> {
     if params.len() != MHC_PARAM_COUNT || site >= 2 {
         return Err(format!(
             "vit mHC expects 12 parameters and site 0 or 1 (got {}, {site})",

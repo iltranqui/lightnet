@@ -554,7 +554,7 @@ fn vit_gpu_host_fallback_matches_a_preceding_convolution_and_backward() {
 
     let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
     gpu.params = cpu.params.clone();
-    let gpu_forward = gpu.forward_with_state(&input).unwrap();
+    let gpu_forward = gpu.forward_training_with_state(&input).unwrap();
     assert_eq!(
         gpu_forward.cpu_forward.final_output(),
         cpu_forward.final_output()

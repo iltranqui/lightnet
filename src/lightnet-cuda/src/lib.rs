@@ -2838,6 +2838,115 @@ pub trait F32TensorOpsBackend {
         let _ = (input, batch, channels, height, width, begin, count, config);
         panic!("wmhf_split_channels_f32 is not implemented by this CUDA backend")
     }
+    /// ViT patch gather: NCHW input to `[batch * tokens, patch * patch * channels]`
+    /// with `(dy, dx, channel)` patch order. Returns `(out_h, out_w, patches)`.
+    fn vit_patchify_f32(
+        &self,
+        input: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        patch_size: usize,
+        patch_stride: usize,
+        pad: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(usize, usize, Self::Tensor), Self::Error> {
+        let _ = config;
+        let host = self.download_f32(input)?;
+        let (out_h, out_w, patches) = host_ops::vit_patchify(
+            &host,
+            batch,
+            channels,
+            height,
+            width,
+            patch_size,
+            patch_stride,
+            pad,
+        );
+        let rows = batch * out_h * out_w;
+        let tensor = self.upload_f32(&[rows, patch_size * patch_size * channels], &patches)?;
+        Ok((out_h, out_w, tensor))
+    }
+    /// Add a `[tokens, hidden]` positional table to every sample slab.
+    fn vit_add_pos_embed_f32(
+        &self,
+        tokens: &Self::Tensor,
+        pos: &Self::Tensor,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let host = self.download_f32(tokens)?;
+        let table = self.download_f32(pos)?;
+        let out = host_ops::vit_add_pos_embed(&host, &table);
+        self.upload_f32(&[out.len()], &out)
+    }
+    /// ViT feature guard: clamp finite values to `[-clip, clip]`, map the rest to 0.
+    fn vit_clamp_feature_f32(
+        &self,
+        input: &Self::Tensor,
+        clip: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let host = self.download_f32(input)?;
+        let out: Vec<f32> = host
+            .iter()
+            .map(|&x| host_ops::vit_clamp_feature(x, clip))
+            .collect();
+        self.upload_f32(&[out.len()], &out)
+    }
+    /// ViT mHC residual `clamp(a*clamp(skip) + b*clamp(branch))`.
+    fn vit_mhc_residual_f32(
+        &self,
+        skip: &Self::Tensor,
+        branch: &Self::Tensor,
+        skip_scale: f32,
+        branch_scale: f32,
+        clip: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let s = self.download_f32(skip)?;
+        let b = self.download_f32(branch)?;
+        assert_eq!(s.len(), b.len(), "vit_mhc_residual_f32: length mismatch");
+        let out: Vec<f32> = s
+            .iter()
+            .zip(&b)
+            .map(|(&s, &b)| {
+                host_ops::vit_clamp_feature(
+                    skip_scale * host_ops::vit_clamp_feature(s, clip)
+                        + branch_scale * host_ops::vit_clamp_feature(b, clip),
+                    clip,
+                )
+            })
+            .collect();
+        self.upload_f32(&[out.len()], &out)
+    }
+    /// `[batch * tokens, hidden]` token rows to NCHW `[batch, hidden, out_h, out_w]`.
+    fn vit_tokens_to_nchw_f32(
+        &self,
+        input: &Self::Tensor,
+        batch: usize,
+        out_h: usize,
+        out_w: usize,
+        hidden: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let host = self.download_f32(input)?;
+        let tokens = out_h * out_w;
+        assert_eq!(host.len(), batch * tokens * hidden, "vit_tokens_to_nchw_f32: length");
+        let mut out = vec![0.0; host.len()];
+        for b in 0..batch {
+            for t in 0..tokens {
+                for c in 0..hidden {
+                    out[(b * hidden + c) * tokens + t] = host[(b * tokens + t) * hidden + c];
+                }
+            }
+        }
+        self.upload_f32(&[batch, hidden, out_h, out_w], &out)
+    }
     /// Concatenate WMHF 3x/5x/7x local branch tensors in channel-major order.
     fn wmhf_concat_local_f32(
         &self,

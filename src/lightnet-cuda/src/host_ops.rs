@@ -1850,3 +1850,58 @@ mod eml_convolutional_tests {
         }
     }
 }
+
+/// ViT patch gather: NCHW input to `[batch * tokens, patch * patch * channels]`
+/// with `(dy, dx, channel)` patch order and zero padding. Returns
+/// `(out_h, out_w, patches)`; the extents must tile the padded input.
+pub fn vit_patchify(
+    input: &[f32],
+    batch: usize,
+    channels: usize,
+    height: usize,
+    width: usize,
+    patch_size: usize,
+    patch_stride: usize,
+    pad: usize,
+) -> (usize, usize, Vec<f32>) {
+    let out_h = (height + 2 * pad - patch_size) / patch_stride + 1;
+    let out_w = (width + 2 * pad - patch_size) / patch_stride + 1;
+    let tokens = out_h * out_w;
+    let patch_dim = patch_size * patch_size * channels;
+    let mut out = vec![0.0; batch * tokens * patch_dim];
+    for b in 0..batch {
+        for token in 0..tokens {
+            for dy in 0..patch_size {
+                let y = (token / out_w) * patch_stride + dy;
+                if y < pad || y - pad >= height {
+                    continue;
+                }
+                for dx in 0..patch_size {
+                    let x = (token % out_w) * patch_stride + dx;
+                    if x < pad || x - pad >= width {
+                        continue;
+                    }
+                    for c in 0..channels {
+                        out[(b * tokens + token) * patch_dim + (dy * patch_size + dx) * channels + c] =
+                            input[(b * channels + c) * height * width + (y - pad) * width + (x - pad)];
+                    }
+                }
+            }
+        }
+    }
+    (out_h, out_w, out)
+}
+
+/// Add a `[tokens, hidden]` table to every sample slab of `tokens`.
+pub fn vit_add_pos_embed(tokens: &[f32], pos: &[f32]) -> Vec<f32> {
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(i, &v)| v + pos[i % pos.len()])
+        .collect()
+}
+
+/// ViT `clamp_feature`: finite values clamp to `[-clip, clip]`, others become 0.
+pub fn vit_clamp_feature(x: f32, clip: f32) -> f32 {
+    if x.is_finite() { x.clamp(-clip, clip) } else { 0.0 }
+}

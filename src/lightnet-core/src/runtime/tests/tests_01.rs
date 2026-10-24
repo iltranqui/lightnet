@@ -255,7 +255,13 @@ fn vit_runtime_forward_backward_matches_input_and_parameter_finite_differences()
     let gpu_forward = gpu.forward_with_state(&input).unwrap();
     let gpu_output = gpu_forward.cpu_forward.final_output().unwrap();
     let cpu_output = executable.forward(&input).unwrap();
-    assert_eq!(gpu_output, cpu_output.final_output().unwrap());
+    // Inference takes the native device path, whose reductions order floats
+    // differently from the host reference.
+    let cpu_output = cpu_output.final_output().unwrap();
+    assert_eq!(gpu_output.shape, cpu_output.shape);
+    for (g, c) in gpu_output.data.iter().zip(&cpu_output.data) {
+        assert!((g - c).abs() <= 1e-5 * c.abs().max(1.0), "gpu={g} cpu={c}");
+    }
     // `[vit]` still has no native device backward, so this network must
     // keep the host fallback.
     assert!(gpu.requires_cpu_backward_fallback());

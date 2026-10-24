@@ -56,6 +56,7 @@ mod dcnv4_gpu;
 mod loss_scaler;
 mod laya_act_gpu;
 mod laya_encoder_gpu;
+mod vit_gpu;
 mod laya_head_gpu;
 mod laya_scorer_gpu;
 

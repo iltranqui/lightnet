@@ -1710,6 +1710,20 @@ where
                             .map_err(|err| backend_error("upload deform_conv output", err))?
                     }
                 }
+                (LayerKind::Vit(spec), LayerParams::Vit(weights))
+                    if !training
+                        && vit_gpu::supported(&vit_geometry(layer, spec)) =>
+                {
+                    // Inference only: backward needs the host `VitForwardCache`.
+                    vit_gpu::forward(
+                        &self.backend,
+                        &vit_geometry(layer, spec),
+                        weights,
+                        current_input,
+                        layer.output_shape,
+                        launch_config,
+                    )?
+                }
                 (LayerKind::Vit(spec), LayerParams::Vit(weights)) => {
                     let host_input = self
                         .download_tensor(current_input, layer.input_shape)
