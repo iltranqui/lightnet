@@ -494,7 +494,7 @@ pub(super) fn forward_wmhf_with_cache(
     ))
 }
 
-pub(super) fn forward_deform_conv_with_cache(
+pub(crate) fn forward_deform_conv_with_cache(
     spec: &DeformConvSpec,
     params: &DeformConvParams,
     input: &Tensor,
