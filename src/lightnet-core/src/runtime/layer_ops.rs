@@ -632,7 +632,7 @@ pub(super) fn backward_crop(
     Ok(input_gradient)
 }
 
-pub(super) fn forward_scale_channels(
+pub(crate) fn forward_scale_channels(
     spec: &crate::model::ScaleChannelsSpec,
     input: &Tensor,
     source: &Tensor,
@@ -671,7 +671,7 @@ pub(super) fn forward_scale_channels(
     Ok((output, Some(activation_input)))
 }
 
-pub(super) fn forward_sam(
+pub(crate) fn forward_sam(
     spec: &crate::model::SamSpec,
     input: &Tensor,
     source: &Tensor,

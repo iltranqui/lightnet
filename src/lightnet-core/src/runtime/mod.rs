@@ -101,4 +101,6 @@ pub(crate) use self::forward_layers::*;
 use self::recurrent_forward::*;
 use self::recurrent_backward::*;
 use self::layer_ops::*;
-pub(crate) use self::layer_ops::{resolve_relative_layer, softmax_group_size};
+pub(crate) use self::layer_ops::{
+    forward_sam, forward_scale_channels, resolve_relative_layer, softmax_group_size,
+};

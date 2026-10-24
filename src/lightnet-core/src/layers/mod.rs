@@ -40,3 +40,5 @@ pub(crate) mod pool;
 pub(crate) mod upsample;
 pub(crate) mod reorg;
 pub(crate) mod softmax;
+pub(crate) mod scale_channels;
+pub(crate) mod sam;

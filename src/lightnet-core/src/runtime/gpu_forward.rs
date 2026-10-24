@@ -1902,143 +1902,30 @@ where
                     self.forward_softmax_gpu(layer, *groups, current_input, launch_config)?
                 }
                 (LayerKind::ScaleChannels(spec), LayerParams::None) => {
-                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
-                    let source_layer =
-                        self.network
-                            .layers
-                            .get(source_index)
-                            .ok_or(Error::InvalidRoute {
-                                layer_index: layer.index,
-                                reference: spec.from,
-                            })?;
-                    let source_gpu =
-                        gpu_layer_outputs
-                            .get(source_index)
-                            .ok_or(Error::InvalidRoute {
-                                layer_index: layer.index,
-                                reference: spec.from,
-                            })?;
-                    if let Some(activation) = spec.activation.to_cuda_f32_kind() {
-                        if source_layer.output_shape != layer.output_shape {
-                            return Err(Error::InvalidConfig(format!(
-                                "scale_channels source/output mismatch: {} vs {}",
-                                source_layer.output_shape, layer.output_shape
-                            )));
-                        }
-                        let pre_activation = self
-                            .backend
-                            .scale_channels_f32(
-                                current_input,
-                                source_gpu,
-                                &tensor_backend_shape(layer.output_shape),
-                                spec.scale_wh,
-                                launch_config,
-                            )
-                            .map_err(|err| backend_error("scale_channels", err))?;
-                        activation_input_gpu = Some(pre_activation.clone());
-                        self.backend
-                            .activation_f32(&pre_activation, activation, launch_config)
-                            .map_err(|err| backend_error("scale_channels activation", err))?
-                    } else {
-                        let host_input = self
-                            .download_tensor(current_input, layer.input_shape)
-                            .map_err(|err| backend_error("download scale_channels input", err))?;
-                        let host_source = self
-                            .download_tensor(source_gpu, source_layer.output_shape)
-                            .map_err(|err| backend_error("download scale_channels source", err))?;
-                        let (host_output, host_activation_input) = forward_scale_channels(
-                            spec,
-                            &host_input,
-                            &host_source,
-                            layer.output_shape,
-                        )?;
-                        if let Some(activation_input) = host_activation_input {
-                            activation_input_gpu = Some(
-                                self.backend
-                                    .upload_f32(
-                                        &tensor_backend_shape(layer.output_shape),
-                                        &activation_input.data,
-                                    )
-                                    .map_err(|err| {
-                                        backend_error("upload scale_channels activation cache", err)
-                                    })?,
-                            );
-                        }
-                        self.backend
-                            .upload_f32(
-                                &tensor_backend_shape(layer.output_shape),
-                                &host_output.data,
-                            )
-                            .map_err(|err| backend_error("upload scale_channels output", err))?
+                    let (output, activation_input) = self.forward_scale_channels_gpu(
+                        layer,
+                        spec,
+                        current_input,
+                        &gpu_layer_outputs,
+                        launch_config,
+                    )?;
+                    if activation_input.is_some() {
+                        activation_input_gpu = activation_input;
                     }
+                    output
                 }
                 (LayerKind::Sam(spec), LayerParams::None) => {
-                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
-                    let source_layer =
-                        self.network
-                            .layers
-                            .get(source_index)
-                            .ok_or(Error::InvalidRoute {
-                                layer_index: layer.index,
-                                reference: spec.from,
-                            })?;
-                    let source_gpu =
-                        gpu_layer_outputs
-                            .get(source_index)
-                            .ok_or(Error::InvalidRoute {
-                                layer_index: layer.index,
-                                reference: spec.from,
-                            })?;
-                    if layer.input_shape != layer.output_shape
-                        || source_layer.output_shape != layer.output_shape
-                    {
-                        return Err(Error::InvalidConfig(format!(
-                            "sam shape mismatch: input {}, source {}, output {}",
-                            layer.input_shape, source_layer.output_shape, layer.output_shape
-                        )));
+                    let (output, activation_input) = self.forward_sam_gpu(
+                        layer,
+                        spec,
+                        current_input,
+                        &gpu_layer_outputs,
+                        launch_config,
+                    )?;
+                    if activation_input.is_some() {
+                        activation_input_gpu = activation_input;
                     }
-                    if let Some(activation) = spec.activation.to_cuda_f32_kind() {
-                        let pre_activation = self
-                            .backend
-                            .vector_mul_f32(
-                                current_input,
-                                source_gpu,
-                                &tensor_backend_shape(layer.output_shape),
-                                launch_config,
-                            )
-                            .map_err(|err| backend_error("sam multiply", err))?;
-                        activation_input_gpu = Some(pre_activation.clone());
-                        self.backend
-                            .activation_f32(&pre_activation, activation, launch_config)
-                            .map_err(|err| backend_error("sam activation", err))?
-                    } else {
-                        let host_input = self
-                            .download_tensor(current_input, layer.input_shape)
-                            .map_err(|err| backend_error("download sam input", err))?;
-                        let host_source = self
-                            .download_tensor(source_gpu, source_layer.output_shape)
-                            .map_err(|err| backend_error("download sam source", err))?;
-                        let (host_output, host_activation_input) =
-                            forward_sam(spec, &host_input, &host_source, layer.output_shape)?;
-                        if let Some(activation_input) = host_activation_input {
-                            activation_input_gpu = Some(
-                                self.backend
-                                    .upload_f32(
-                                        &tensor_backend_shape(layer.output_shape),
-                                        &activation_input.data,
-                                    )
-                                    .map_err(|err| {
-                                        backend_error("upload sam activation cache", err)
-                                    })?,
-                            );
-                        }
-                        self.backend
-                            .upload_f32(
-                                &tensor_backend_shape(layer.output_shape),
-                                &host_output.data,
-                            )
-                            .map_err(|err| backend_error("upload sam output", err))?
-                    }
+                    output
                 }
                 (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(params)) => {
                     if deconvolutional_spec_is_native(spec) {
