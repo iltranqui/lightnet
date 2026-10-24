@@ -2076,7 +2076,7 @@ pub(super) fn accumulate_crnn_param_gradients(dst: &mut LayerParams, src: &CrnnP
     accumulate_convolutional_gradient(&mut dst.output, &src.output)
 }
 
-pub(super) fn accumulate_connected_train_buffer(
+pub(crate) fn accumulate_connected_train_buffer(
     dst: &mut ConnectedTrainBuffers,
     src: &ConnectedParams,
 ) -> Result<()> {
@@ -2098,7 +2098,7 @@ pub(super) fn accumulate_connected_train_buffer(
     Ok(())
 }
 
-pub(super) fn accumulate_convolutional_train_buffer(
+pub(crate) fn accumulate_convolutional_train_buffer(
     dst: &mut ConvolutionalTrainBuffers,
     src: &ConvolutionalParams,
 ) -> Result<()> {

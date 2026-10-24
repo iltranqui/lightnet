@@ -73,7 +73,7 @@ pub(super) fn accumulate_convolutional_gradient(
     Ok(())
 }
 
-pub(super) fn upload_rnn_backward_cache<B: F32TensorOpsBackend>(
+pub(crate) fn upload_rnn_backward_cache<B: F32TensorOpsBackend>(
     backend: &B,
     cache: &RnnForwardCache,
 ) -> Result<GpuRnnBackwardCache<B::Tensor>>
@@ -109,7 +109,7 @@ where
     })
 }
 
-pub(super) fn upload_lstm_backward_cache<B: F32TensorOpsBackend>(
+pub(crate) fn upload_lstm_backward_cache<B: F32TensorOpsBackend>(
     backend: &B,
     cache: &LstmForwardCache,
 ) -> Result<GpuLstmBackwardCache<B::Tensor>>
@@ -138,7 +138,7 @@ where
     })
 }
 
-pub(super) fn upload_crnn_backward_cache<B: F32TensorOpsBackend>(
+pub(crate) fn upload_crnn_backward_cache<B: F32TensorOpsBackend>(
     backend: &B,
     cache: &CrnnForwardCache,
 ) -> Result<GpuCrnnBackwardCache<B::Tensor>>
@@ -311,7 +311,7 @@ where
     ))
 }
 
-pub(super) fn backward_rnn_layer_device<B: F32TensorOpsBackend>(
+pub(crate) fn backward_rnn_layer_device<B: F32TensorOpsBackend>(
     backend: &B,
     spec: &RnnSpec,
     params: &RnnParams,
@@ -631,7 +631,7 @@ where
     Ok(())
 }
 
-pub(super) fn backward_lstm_layer_device<B: F32TensorOpsBackend>(
+pub(crate) fn backward_lstm_layer_device<B: F32TensorOpsBackend>(
     backend: &B,
     spec: &LstmSpec,
     params: &LstmParams,
@@ -1471,7 +1471,7 @@ where
     ))
 }
 
-pub(super) fn backward_crnn_layer_device<B: F32TensorOpsBackend>(
+pub(crate) fn backward_crnn_layer_device<B: F32TensorOpsBackend>(
     backend: &B,
     spec: &CrnnSpec,
     params: &CrnnParams,

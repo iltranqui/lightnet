@@ -112,7 +112,7 @@ where
     pub(crate) gpu_lstm_caches: Vec<Option<GpuLstmBackwardCache<T>>>,
     pub(crate) gpu_moe_caches: Vec<Option<GpuMoeBackwardCache<T>>>,
     pub(crate) gpu_eml_caches: Vec<Option<GpuEmlBackwardCache<T>>>,
-    pub(super) gpu_dcnv4_caches: Vec<Option<dcnv4_gpu::ForwardCache<T>>>,
+    pub(crate) gpu_dcnv4_caches: Vec<Option<dcnv4_gpu::ForwardCache<T>>>,
     pub cpu_forward: ForwardResult,
 }
 
@@ -218,7 +218,7 @@ where
     pub(super) device_train_buffers: RefCell<Vec<Option<GpuConvolutionTrainBuffers<B::Tensor>>>>,
     pub(super) device_moe_train_buffers: RefCell<Vec<Option<GpuMoeTrainBuffers<B::Tensor>>>>,
     pub(super) device_eml_train_buffers: RefCell<Vec<Option<GpuEmlTrainBuffers<B::Tensor>>>>,
-    pub(super) device_dcnv4_train_buffers: RefCell<Vec<Option<GpuDcnv4TrainBuffers<B::Tensor>>>>,
+    pub(crate) device_dcnv4_train_buffers: RefCell<Vec<Option<GpuDcnv4TrainBuffers<B::Tensor>>>>,
     /// Reusable DCNv4 parameter uploads; snapshots detect public host edits.
     pub(crate) dcnv4_device_params: RefCell<Vec<Option<dcnv4_gpu::DeviceParameters<B::Tensor>>>>,
     pub(crate) cpu_fallback_train_buffers: RefCell<Vec<LayerTrainBuffers>>,

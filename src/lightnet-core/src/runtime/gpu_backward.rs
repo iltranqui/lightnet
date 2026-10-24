@@ -2348,235 +2348,35 @@ where
                     )?;
                 }
                 (LayerKind::Rnn(spec), Some(LayerParams::Rnn(params))) => {
-                    let has_batch_norm = [
-                        params.input.batch_norm.is_some(),
-                        params.self_params.batch_norm.is_some(),
-                        params.output.batch_norm.is_some(),
-                    ];
-                    if has_batch_norm.iter().any(|present| *present != spec.batch_normalize) {
-                        return Err(Error::InvalidConfig(format!(
-                            "RNN batch-normalization parameter mismatch at layer #{}",
-                            layer.index
-                        )));
-                    }
-                    let cache = if let Some(cache) = forward
-                        .gpu_rnn_caches
-                        .get(layer.index)
-                        .and_then(Option::as_ref)
-                    {
-                        cache.clone()
-                    } else {
-                        let Some(Some(RecurrentForwardCache::Rnn(cache))) =
-                            forward.cpu_forward.recurrent_caches.get(layer.index)
-                        else {
-                            return Err(Error::InvalidConfig(format!(
-                                "missing RNN forward cache for GPU layer #{}",
-                                layer.index
-                            )));
-                        };
-                        upload_rnn_backward_cache(&self.backend, cache)?
-                    };
-                    let current_input = if layer.index == 0 {
-                        &forward.input_gpu
-                    } else {
-                        forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "missing previous GPU output for RNN layer #{}",
-                                layer.index
-                            ))
-                        })?
-                    };
-                    let (input_gradient, gradients) = backward_rnn_layer_device(
-                        &self.backend,
+                    self.backward_rnn_gpu(
+                        layer,
                         spec,
                         params,
-                        &cache,
-                        current_input,
-                        layer.input_shape,
-                        &grad,
-                        layer.index,
+                        forward,
+                        grad,
                         config,
-                    )?;
-                    {
-                        let mut train_buffers = self.cpu_fallback_train_buffers.borrow_mut();
-                        let Some(LayerTrainBuffers::Rnn(train)) = train_buffers.get_mut(layer.index) else {
-                            return Err(Error::InvalidConfig(format!(
-                                "missing RNN train buffers for layer #{}",
-                                layer.index
-                            )));
-                        };
-                        accumulate_connected_train_buffer(&mut train.input, &gradients.input)?;
-                        accumulate_connected_train_buffer(&mut train.self_params, &gradients.self_params)?;
-                        accumulate_connected_train_buffer(&mut train.output, &gradients.output)?;
-                    }
-                    self.accumulate_previous_gpu_gradient(
-                        layer.index,
-                        input_gradient,
                         &mut layer_output_gradients,
                     )?;
                 }
                 (LayerKind::Lstm(spec), Some(LayerParams::Lstm(params))) => {
-                    let has_batch_norm = [
-                        params.wf.batch_norm.is_some(),
-                        params.wi.batch_norm.is_some(),
-                        params.wg.batch_norm.is_some(),
-                        params.wo.batch_norm.is_some(),
-                        params.uf.batch_norm.is_some(),
-                        params.ui.batch_norm.is_some(),
-                        params.ug.batch_norm.is_some(),
-                        params.uo.batch_norm.is_some(),
-                    ];
-                    if has_batch_norm
-                        .iter()
-                        .any(|present| *present != spec.batch_normalize)
-                    {
-                        return Err(Error::InvalidConfig(format!(
-                            "LSTM batch-normalization parameter mismatch at layer #{}",
-                            layer.index
-                        )));
-                    }
-                    let cache = if let Some(cache) = forward
-                        .gpu_lstm_caches
-                        .get(layer.index)
-                        .and_then(Option::as_ref)
-                    {
-                        cache.clone()
-                    } else {
-                        let Some(Some(RecurrentForwardCache::Lstm(cache))) =
-                            forward.cpu_forward.recurrent_caches.get(layer.index)
-                        else {
-                            return Err(Error::InvalidConfig(format!(
-                                "missing LSTM forward cache for GPU layer #{}",
-                                layer.index
-                            )));
-                        };
-                        upload_lstm_backward_cache(&self.backend, cache)?
-                    };
-                    let current_input = if layer.index == 0 {
-                        &forward.input_gpu
-                    } else {
-                        forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "missing previous GPU output for LSTM layer #{}",
-                                layer.index
-                            ))
-                        })?
-                    };
-                    let (input_gradient, gradients) = backward_lstm_layer_device(
-                        &self.backend,
+                    self.backward_lstm_gpu(
+                        layer,
                         spec,
                         params,
-                        &cache,
-                        current_input,
-                        layer.input_shape,
-                        &grad,
-                        layer.index,
+                        forward,
+                        grad,
                         config,
-                    )?;
-                    {
-                        let mut train_buffers = self.cpu_fallback_train_buffers.borrow_mut();
-                        let Some(LayerTrainBuffers::Lstm(train)) =
-                            train_buffers.get_mut(layer.index)
-                        else {
-                            return Err(Error::InvalidConfig(format!(
-                                "missing LSTM train buffers for layer #{}",
-                                layer.index
-                            )));
-                        };
-                        accumulate_connected_train_buffer(&mut train.wf, &gradients.wf)?;
-                        accumulate_connected_train_buffer(&mut train.wi, &gradients.wi)?;
-                        accumulate_connected_train_buffer(&mut train.wg, &gradients.wg)?;
-                        accumulate_connected_train_buffer(&mut train.wo, &gradients.wo)?;
-                        accumulate_connected_train_buffer(&mut train.uf, &gradients.uf)?;
-                        accumulate_connected_train_buffer(&mut train.ui, &gradients.ui)?;
-                        accumulate_connected_train_buffer(&mut train.ug, &gradients.ug)?;
-                        accumulate_connected_train_buffer(&mut train.uo, &gradients.uo)?;
-                    }
-                    self.accumulate_previous_gpu_gradient(
-                        layer.index,
-                        input_gradient,
                         &mut layer_output_gradients,
                     )?;
                 }
                 (LayerKind::Crnn(spec), Some(LayerParams::Crnn(params))) => {
-                    let has_batch_norm = [
-                        params.input.batch_norm.is_some(),
-                        params.self_params.batch_norm.is_some(),
-                        params.output.batch_norm.is_some(),
-                    ];
-                    if has_batch_norm
-                        .iter()
-                        .any(|present| *present != spec.batch_normalize)
-                    {
-                        return Err(Error::InvalidConfig(format!(
-                            "CRNN batch-normalization parameter mismatch at layer #{}",
-                            layer.index
-                        )));
-                    }
-                    let cache = if let Some(cache) = forward
-                        .gpu_crnn_caches
-                        .get(layer.index)
-                        .and_then(Option::as_ref)
-                    {
-                        cache.clone()
-                    } else {
-                        let Some(Some(RecurrentForwardCache::Crnn(cache))) =
-                            forward.cpu_forward.recurrent_caches.get(layer.index)
-                        else {
-                            return Err(Error::InvalidConfig(format!(
-                                "missing CRNN forward cache for GPU layer #{}",
-                                layer.index
-                            )));
-                        };
-                        upload_crnn_backward_cache(&self.backend, cache)?
-                    };
-                    let current_input = if layer.index == 0 {
-                        &forward.input_gpu
-                    } else {
-                        forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "missing previous GPU output for CRNN layer #{}",
-                                layer.index
-                            ))
-                        })?
-                    };
-                    let (input_gradient, gradients) = backward_crnn_layer_device(
-                        &self.backend,
+                    self.backward_crnn_gpu(
+                        layer,
                         spec,
                         params,
-                        &cache,
-                        current_input,
-                        layer.input_shape,
-                        &grad,
-                        layer.index,
+                        forward,
+                        grad,
                         config,
-                    )?;
-                    {
-                        let mut train_buffers = self.cpu_fallback_train_buffers.borrow_mut();
-                        let Some(LayerTrainBuffers::Crnn(train)) =
-                            train_buffers.get_mut(layer.index)
-                        else {
-                            return Err(Error::InvalidConfig(format!(
-                                "missing CRNN train buffers for layer #{}",
-                                layer.index
-                            )));
-                        };
-                        accumulate_convolutional_train_buffer(
-                            &mut train.input,
-                            &gradients.input,
-                        )?;
-                        accumulate_convolutional_train_buffer(
-                            &mut train.self_params,
-                            &gradients.self_params,
-                        )?;
-                        accumulate_convolutional_train_buffer(
-                            &mut train.output,
-                            &gradients.output,
-                        )?;
-                    }
-                    self.accumulate_previous_gpu_gradient(
-                        layer.index,
-                        input_gradient,
                         &mut layer_output_gradients,
                     )?;
                 }
@@ -2633,145 +2433,23 @@ where
                     )?;
                 }
                 (LayerKind::Dcnv4(spec), Some(LayerParams::Dcnv4(params))) => {
-                    let input = if layer.index == 0 {
-                        &forward.input_gpu
-                    } else {
-                        &forward.gpu_layer_outputs[layer.index - 1]
-                    };
-                    let pre = forward.gpu_layer_activation_inputs[layer.index]
-                        .as_ref()
-                        .ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "missing DCNv4 activation cache at #{}", layer.index
-                            ))
-                        })?;
-                    let cache = forward.gpu_dcnv4_caches[layer.index].as_ref().ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "missing GPU DCNv4 forward cache at #{}", layer.index
-                        ))
-                    })?;
-                    let gradients = dcnv4_gpu::backward(
-                        &self.backend, input, pre, &grad, cache, layer, spec, params,
-                    )?;
-                    {
-                        let mut buffers = self.device_dcnv4_train_buffers.borrow_mut();
-                        let train = buffers
-                            .get_mut(layer.index)
-                            .and_then(Option::as_mut)
-                            .ok_or_else(|| {
-                                Error::InvalidConfig(format!(
-                                    "missing GPU DCNv4 train buffers at #{}", layer.index
-                                ))
-                            })?;
-                        dcnv4_gpu::accumulate(&self.backend, train, &gradients)?;
-                    }
-                    self.accumulate_previous_gpu_gradient(
-                        layer.index, gradients.input, &mut layer_output_gradients,
+                    self.backward_dcnv4_gpu(
+                        layer,
+                        spec,
+                        params,
+                        forward,
+                        grad,
+                        &mut layer_output_gradients,
                     )?;
                 }
                 (LayerKind::DsConv(spec), Some(LayerParams::DsConv(params))) => {
-                    let activation = spec.activation.to_cuda_f32_kind().ok_or_else(|| {
-                        Error::UnsupportedLayer {
-                            layer_index: layer.index,
-                            name: format!("[dsconv] unsupported GPU activation {:?}", spec.activation),
-                        }
-                    })?;
-                    let input = if layer.index == 0 {
-                        &forward.input_gpu
-                    } else {
-                        &forward.gpu_layer_outputs[layer.index - 1]
-                    };
-                    let geometry = lightnet_cuda::host_ops::DsConvGeometry {
-                        batch: layer.input_shape.batch,
-                        channels: layer.input_shape.channels,
-                        filters: spec.filters,
-                        input_height: layer.input_shape.height,
-                        input_width: layer.input_shape.width,
-                        kernel_size: spec.size,
-                        extend_scope: spec.extend_scope,
-                        morph: spec.morph,
-                    };
-                    let offset_channels = 2 * spec.size;
-                    let offset_weights = self
-                        .backend
-                        .upload_f32(
-                            &[offset_channels, layer.input_shape.channels, 3, 3],
-                            &params.offset_weights,
-                        )
-                        .map_err(|err| backend_error("upload DSConv offset weights", err))?;
-                    let offset_biases = self
-                        .backend
-                        .upload_f32(&[offset_channels], &params.offset_biases)
-                        .map_err(|err| backend_error("upload DSConv offset biases", err))?;
-                    let weights = self
-                        .backend
-                        .upload_f32(
-                            &[spec.filters, layer.input_shape.channels, spec.size],
-                            &params.collapse.weights,
-                        )
-                        .map_err(|err| backend_error("upload DSConv collapse weights", err))?;
-                    let biases = self
-                        .backend
-                        .upload_f32(&[spec.filters], &params.collapse.biases)
-                        .map_err(|err| backend_error("upload DSConv collapse biases", err))?;
-                    let (d_input, d_weights, d_biases, d_offset_weights, d_offset_biases) = self
-                        .backend
-                        .dsconv_backward_native_f32(
-                            input,
-                            &offset_weights,
-                            &offset_biases,
-                            &weights,
-                            &biases,
-                            &grad,
-                            geometry,
-                            activation,
-                            config,
-                        )
-                        .ok_or_else(|| Error::UnsupportedLayer {
-                            layer_index: layer.index,
-                            name: "backend does not provide native f32 [dsconv] backward".to_owned(),
-                        })?
-                        .map_err(|err| backend_error("native DSConv backward", err))?;
-                    let d_weights = self
-                        .backend
-                        .download_f32(&d_weights)
-                        .map_err(|err| backend_error("download DSConv collapse gradients", err))?;
-                    let d_biases = self
-                        .backend
-                        .download_f32(&d_biases)
-                        .map_err(|err| backend_error("download DSConv collapse bias gradients", err))?;
-                    let d_offset_weights = self
-                        .backend
-                        .download_f32(&d_offset_weights)
-                        .map_err(|err| backend_error("download DSConv offset gradients", err))?;
-                    let d_offset_biases = self
-                        .backend
-                        .download_f32(&d_offset_biases)
-                        .map_err(|err| backend_error("download DSConv offset bias gradients", err))?;
-                    {
-                        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
-                        let LayerTrainBuffers::DsConv(train) = &mut buffers[layer.index] else {
-                            return Err(Error::InvalidConfig(format!(
-                                "[dsconv] layer #{} has no train buffers",
-                                layer.index
-                            )));
-                        };
-                        for (dst, src) in train.collapse.weight_updates.iter_mut().zip(d_weights) {
-                            *dst += src;
-                        }
-                        for (dst, src) in train.collapse.bias_updates.iter_mut().zip(d_biases) {
-                            *dst += src;
-                        }
-                        for (dst, src) in train.offset_weight_updates.iter_mut().zip(d_offset_weights) {
-                            *dst += src;
-                        }
-                        for (dst, src) in train.offset_bias_updates.iter_mut().zip(d_offset_biases) {
-                            *dst += src;
-                        }
-                    }
-                    self.accumulate_previous_gpu_gradient(
-                        layer.index,
-                        d_input,
+                    self.backward_dsconv_gpu(
+                        layer,
+                        spec,
+                        params,
+                        forward,
+                        grad,
+                        config,
                         &mut layer_output_gradients,
                     )?;
                 }

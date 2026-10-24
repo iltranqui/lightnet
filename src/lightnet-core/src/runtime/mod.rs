@@ -95,11 +95,11 @@ pub use self::exec_core::*;
 pub use self::exec_accumulate::*;
 use self::defaults::*;
 pub(crate) use crate::layers::hyperbolic_foveation::gpu::*;
-use self::param_updates::*;
+pub(crate) use self::param_updates::*;
 pub(crate) use self::weights_io::*;
 pub(crate) use self::forward_layers::*;
 pub(crate) use self::recurrent_forward::*;
-use self::recurrent_backward::*;
+pub(crate) use self::recurrent_backward::*;
 use self::layer_ops::*;
 pub(crate) use self::layer_ops::{
     activate, forward_sam, forward_scale_channels, plan_crop_forward, resolve_relative_layer,

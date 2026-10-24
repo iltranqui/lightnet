@@ -626,4 +626,52 @@ where
         }
         Ok(())
     }
+
+    /// DCNv4 backward.
+    pub(crate) fn backward_dcnv4_gpu(
+        &self,
+        layer: &Layer,
+        spec: &Dcnv4Spec,
+        params: &Dcnv4Params,
+        forward: &GpuForwardState<B::Tensor>,
+        grad: B::Tensor,
+        layer_output_gradients: &mut [Option<B::Tensor>],
+    ) -> Result<()> {
+        let input = if layer.index == 0 {
+            &forward.input_gpu
+        } else {
+            &forward.gpu_layer_outputs[layer.index - 1]
+        };
+        let pre = forward.gpu_layer_activation_inputs[layer.index]
+            .as_ref()
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing DCNv4 activation cache at #{}", layer.index
+                ))
+            })?;
+        let cache = forward.gpu_dcnv4_caches[layer.index].as_ref().ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "missing GPU DCNv4 forward cache at #{}", layer.index
+            ))
+        })?;
+        let gradients = backward(
+            &self.backend, input, pre, &grad, cache, layer, spec, params,
+        )?;
+        {
+            let mut buffers = self.device_dcnv4_train_buffers.borrow_mut();
+            let train = buffers
+                .get_mut(layer.index)
+                .and_then(Option::as_mut)
+                .ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing GPU DCNv4 train buffers at #{}", layer.index
+                    ))
+                })?;
+            accumulate(&self.backend, train, &gradients)?;
+        }
+        self.accumulate_previous_gpu_gradient(
+            layer.index, gradients.input, layer_output_gradients,
+        )?;
+        Ok(())
+    }
 }
