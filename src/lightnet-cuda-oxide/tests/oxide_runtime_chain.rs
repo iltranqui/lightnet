@@ -7002,6 +7002,80 @@ fn gpu_deconvolution_native_sgd_and_adam_updates_match_cpu_across_steps() {
 }
 
 #[test]
+fn gpu_deconvolution_native_channel_normalization_matches_cpu_across_steps() {
+    for activation in [
+        "normalize_channels",
+        "normalize_channels_softmax",
+        "normalize_channels_softmax_maxval",
+    ] {
+        let cfg = format!(
+            "[net]\nwidth=2\nheight=2\nchannels=3\nbatch=2\nlearning_rate=0.01\nadam=0\n\
+             [deconvolutional]\nfilters=4\nsize=2\nstride=2\nactivation={activation}\n"
+        );
+        let net = network(&cfg);
+        let mut cpu = ExecutableNetwork::new(net.clone());
+        let LayerParams::Convolutional(params) = &mut cpu.params[0] else {
+            panic!("deconvolution parameters expected");
+        };
+        for (i, weight) in params.weights.iter_mut().enumerate() {
+            *weight = ((i as f32 + 1.0) * 0.37).sin() * 0.4;
+        }
+        for (i, bias) in params.biases.iter_mut().enumerate() {
+            *bias = ((i as f32 + 1.0) * 0.71).cos() * 0.1;
+        }
+        let mut gpu =
+            GpuExecutableNetwork::new(net.clone(), OxideBackend::new().expect("Oxide backend"));
+        gpu.params = cpu.params.clone();
+
+        for step in 1..=2 {
+            cpu.zero_train_buffers();
+            gpu.zero_train_buffers_gpu().expect("zero Oxide buffers");
+            let input = patterned(cpu.network.net.input_shape());
+            let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+            let gpu_forward = gpu
+                .forward_training_device(&input)
+                .expect("native Oxide deconvolution forward");
+            let gpu_output = gpu
+                .backend
+                .download_f32(&gpu_forward.gpu_layer_outputs[0])
+                .expect("download native output for parity");
+            close(
+                &format!("{activation} step {step} forward"),
+                &gpu_output,
+                &cpu_forward.layer_outputs[0].data,
+                3e-5,
+            );
+            let seed = Tensor::filled(cpu.network.layers[0].output_shape, 0.04 * step as f32);
+            let seeds = [Some(seed)];
+            cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+                .expect("CPU backward");
+            gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+                .expect("native Oxide deconvolution backward");
+            cpu.update_weights(0.01, 0.9, net.net.decay, 1);
+            gpu.update_weights_gpu(0.01, 0.9, net.net.decay, 1)
+                .expect("host-staged deconvolution optimizer update");
+            let (LayerParams::Convolutional(cpu_params), LayerParams::Convolutional(gpu_params)) =
+                (&cpu.params[0], &gpu.params[0])
+            else {
+                panic!("deconvolution parameters expected after update");
+            };
+            close(
+                &format!("{activation} step {step} weights"),
+                &gpu_params.weights,
+                &cpu_params.weights,
+                8e-4,
+            );
+            close(
+                &format!("{activation} step {step} biases"),
+                &gpu_params.biases,
+                &cpu_params.biases,
+                8e-4,
+            );
+        }
+    }
+}
+
+#[test]
 fn gpu_deconvolution_native_forward_backward_and_muon_match_cpu_across_steps() {
     let net = network(
         "[net]\nwidth=2\nheight=2\nchannels=1\nbatch=1\nmuon=1\ndecoupled_decay=1\ndecay=0.0002\nloss_scale=8\n\

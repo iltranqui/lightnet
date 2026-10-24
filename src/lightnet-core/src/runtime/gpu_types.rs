@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::DeconvolutionalSpec;
 
 /// Whether the network contains a `[deform_conv]` variant the device path does
 /// not cover yet. Shared by the forward and the backward so they cannot choose
@@ -8,6 +9,11 @@ pub(super) fn has_host_only_deform(network: &Network) -> bool {
         matches!(&layer.kind, LayerKind::DeformConv(spec)
             if spec.batch_normalize)
     })
+}
+
+pub(super) fn deconvolutional_spec_is_native(spec: &DeconvolutionalSpec) -> bool {
+    spec.activation.to_cuda_f32_kind().is_some()
+        || spec.activation.to_channel_normalization().is_some()
 }
 
 /// Native GraphConv training forward/backward covers edge modes 0/1 and

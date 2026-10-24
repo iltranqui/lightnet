@@ -189,6 +189,103 @@ fn deconvolutional_layer_trains_on_cpu_and_gpu_native_ops_identically() {
 }
 
 #[test]
+fn deconvolutional_channel_normalization_trains_on_cpu_and_gpu_native_ops_identically() {
+    for activation in [
+        "normalize_channels",
+        "normalize_channels_softmax",
+        "normalize_channels_softmax_maxval",
+    ] {
+        let network = Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                &format!(
+                    "[net]\nwidth=2\nheight=2\nchannels=3\nbatch=2\n\
+                     [deconvolutional]\nfilters=4\nsize=2\nstride=2\nactivation={activation}\n"
+                ),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut cpu = ExecutableNetwork::new(network.clone());
+        fill_conv_params(&mut cpu.params);
+        let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+        gpu.params = cpu.params.clone();
+        gpu.init_train_buffers_gpu().unwrap();
+        assert!(
+            !gpu.requires_cpu_backward_fallback(),
+            "{activation} deconvolution uses the GPU backward path"
+        );
+
+        let input = patterned_input(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).unwrap();
+        let gpu_forward = gpu.forward_training_with_state(&input).unwrap();
+        assert_slice_close(
+            &format!("{activation} deconvolution output"),
+            &cpu_forward.layer_outputs[0].data,
+            &gpu_forward.cpu_forward.layer_outputs[0].data,
+            1e-5,
+        );
+
+        let shape = cpu.network.layers[0].output_shape;
+        let mut seeds = vec![None; 1];
+        seeds[0] = Some(
+            Tensor::from_data(
+                shape,
+                (0..2 * shape.element_count())
+                    .map(|i| (i as f32 * 0.73).cos())
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+            .unwrap();
+        gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
+            .unwrap();
+        let LayerTrainBuffers::Convolutional(cpu_train) = &cpu.train_buffers[0] else {
+            panic!()
+        };
+        let fallback = gpu.cpu_fallback_train_buffers.borrow();
+        let LayerTrainBuffers::Convolutional(gpu_train) = &fallback[0] else {
+            panic!()
+        };
+        assert_slice_close(
+            &format!("{activation} weight_updates"),
+            &cpu_train.weight_updates,
+            &gpu_train.weight_updates,
+            1e-4,
+        );
+        assert_slice_close(
+            &format!("{activation} bias_updates"),
+            &cpu_train.bias_updates,
+            &gpu_train.bias_updates,
+            1e-4,
+        );
+        drop(fallback);
+
+        cpu.update_weights(1.0e-3, 0.0, 0.0, cpu.network.net.batch);
+        gpu.update_weights_gpu(1.0e-3, 0.0, 0.0, gpu.network.net.batch)
+            .expect("FakeBackend SGD");
+        let (LayerParams::Convolutional(cpu_params), LayerParams::Convolutional(gpu_params)) =
+            (&cpu.params[0], &gpu.params[0])
+        else {
+            panic!("expected deconvolutional parameters after update");
+        };
+        assert_slice_close(
+            &format!("{activation} weights after SGD"),
+            &cpu_params.weights,
+            &gpu_params.weights,
+            1e-6,
+        );
+        assert_slice_close(
+            &format!("{activation} biases after SGD"),
+            &cpu_params.biases,
+            &gpu_params.biases,
+            1e-6,
+        );
+    }
+}
+
+#[test]
 fn gpu_channel_shuffle_matches_cpu_forward_and_backward() {
     assert_gpu_layer_chain_matches_cpu(
         "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n\

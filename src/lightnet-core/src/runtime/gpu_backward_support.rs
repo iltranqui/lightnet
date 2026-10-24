@@ -39,7 +39,7 @@ where
                     }
                 }
                 LayerKind::Deconvolutional(spec) => {
-                    if spec.activation.to_cuda_f32_kind().is_none() {
+                    if !deconvolutional_spec_is_native(spec) {
                         return true;
                     }
                 }

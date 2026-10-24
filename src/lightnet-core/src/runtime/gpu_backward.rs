@@ -1842,7 +1842,7 @@ where
                 (
                     LayerKind::Deconvolutional(spec),
                     Some(LayerParams::Convolutional(params)),
-                ) if spec.activation.to_cuda_f32_kind().is_some() => {
+                ) if deconvolutional_spec_is_native(spec) => {
                     let activation_input = forward.gpu_layer_activation_inputs[layer.index]
                         .as_ref()
                         .ok_or_else(|| {
@@ -1851,11 +1851,36 @@ where
                                 layer.index
                             ))
                         })?;
-                    let activation = gpu_activation_kind(layer.index, &spec.activation)?;
-                    let delta = self
-                        .backend
-                        .activation_backward_f32(activation_input, &grad, activation, config)
-                        .map_err(|err| backend_error("GPU deconvolution activation backward", err))?;
+                    let delta = if let Some(normalization) =
+                        spec.activation.to_channel_normalization()
+                    {
+                        self.backend
+                            .normalize_channels_backward_f32(
+                                activation_input,
+                                &forward.gpu_layer_outputs[layer.index],
+                                &grad,
+                                &tensor_backend_shape(layer.output_shape),
+                                layer.output_shape.batch,
+                                layer.output_shape.channels,
+                                layer.output_shape.width * layer.output_shape.height,
+                                normalization,
+                                GradMode::from_env() == GradMode::Cpp,
+                                config,
+                            )
+                            .map_err(|err| {
+                                backend_error(
+                                    "GPU deconvolution channel-normalization backward",
+                                    err,
+                                )
+                            })?
+                    } else {
+                        let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+                        self.backend
+                            .activation_backward_f32(activation_input, &grad, activation, config)
+                            .map_err(|err| {
+                                backend_error("GPU deconvolution activation backward", err)
+                            })?
+                    };
                     let current_input = if layer.index == 0 {
                         &forward.input_gpu
                     } else {

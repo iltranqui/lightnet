@@ -457,7 +457,7 @@ impl ExecutableNetwork {
                     (output, Some(activation_input))
                 }
                 (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(p)) => {
-                    let pre = crate::deconvolutional::deconv_forward(
+                    let activation_input = crate::deconvolutional::deconv_forward(
                         current_input,
                         &p.weights,
                         &p.biases,
@@ -465,12 +465,16 @@ impl ExecutableNetwork {
                         spec.stride,
                         layer.output_shape,
                     );
-                    let data = pre
-                        .data
-                        .iter()
-                        .map(|v| activate(spec.activation.clone(), *v))
-                        .collect();
-                    (Tensor::from_data(pre.shape, data)?, Some(pre))
+                    let mut output = activation_input.clone();
+                    for (dst, src) in output.data.iter_mut().zip(&activation_input.data) {
+                        *dst = activate_convolution_value(&spec.activation, *src);
+                    }
+                    apply_convolution_channel_normalization(
+                        &mut output,
+                        &activation_input,
+                        &spec.activation,
+                    );
+                    (output, Some(activation_input))
                 }
                 (LayerKind::Connected(spec), LayerParams::Connected(connected)) => {
                     forward_connected_with_cache(spec, connected, current_input, layer.output_shape)

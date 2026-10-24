@@ -2348,7 +2348,7 @@ where
                     }
                 }
                 (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(params)) => {
-                    if spec.activation.to_cuda_f32_kind().is_some() {
+                    if deconvolutional_spec_is_native(spec) {
                         let weights = self
                             .backend
                             .upload_f32(
@@ -2391,13 +2391,29 @@ where
                             )
                             .map_err(|err| backend_error("deconvolution bias add", err))?;
                         activation_input_gpu = Some(biased.clone());
-                        self.backend
-                            .activation_f32(
-                                &biased,
-                                gpu_activation_kind(layer.index, &spec.activation)?,
-                                launch_config,
-                            )
-                            .map_err(|err| backend_error("deconvolution activation", err))?
+                        if let Some(normalization) = spec.activation.to_channel_normalization() {
+                            self.backend
+                                .normalize_channels_f32(
+                                    &biased,
+                                    &tensor_backend_shape(layer.output_shape),
+                                    layer.output_shape.batch,
+                                    layer.output_shape.channels,
+                                    layer.output_shape.width * layer.output_shape.height,
+                                    normalization,
+                                    launch_config,
+                                )
+                                .map_err(|err| {
+                                    backend_error("deconvolution channel normalization", err)
+                                })?
+                        } else {
+                            self.backend
+                                .activation_f32(
+                                    &biased,
+                                    gpu_activation_kind(layer.index, &spec.activation)?,
+                                    launch_config,
+                                )
+                                .map_err(|err| backend_error("deconvolution activation", err))?
+                        }
                     } else {
                         let host_input = self
                             .download_tensor(current_input, layer.input_shape)

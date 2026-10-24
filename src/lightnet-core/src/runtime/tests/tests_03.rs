@@ -1199,7 +1199,7 @@ fn fake_gpu_channel_normalizing_convolution_matches_cpu_training() {
 }
 
 #[test]
-fn channel_normalization_activation_is_convolution_only() {
+fn channel_normalization_activation_is_limited_to_convolution_family() {
     for activation in [
         "normalize_channels",
         "normalize_channels_softmax",
@@ -1216,6 +1216,17 @@ fn channel_normalization_activation_is_convolution_only() {
             Network::from_config(cfg).is_ok(),
             "{activation} convolution"
         );
+        let cfg = ConfigFile::parse_str(
+                "channel-normalization-activation.cfg",
+                &format!(
+                    "[net]\nwidth=2\nheight=2\nchannels=2\n[deconvolutional]\nfilters=3\nsize=2\nstride=2\nactivation={activation}\n"
+                ),
+            )
+            .expect("config parses");
+        assert!(
+            Network::from_config(cfg).is_ok(),
+            "{activation} deconvolution"
+        );
     }
     let unsupported = ConfigFile::parse_str(
             "channel-normalization-activation.cfg",
@@ -1225,7 +1236,7 @@ fn channel_normalization_activation_is_convolution_only() {
     let err = Network::from_config(unsupported).expect_err("connected must reject NORM_CHAN");
     assert!(
         err.to_string()
-            .contains("only supported on [convolutional]")
+            .contains("only supported on convolution-family layers")
     );
 }
 

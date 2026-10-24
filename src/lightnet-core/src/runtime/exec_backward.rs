@@ -1484,13 +1484,47 @@ impl ExecutableNetwork {
                     )?;
                 }
                 (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(p)) => {
-                    let delta = apply_output_activation_gradient(
-                        &forward.layer_outputs[layer.index],
-                        &grad,
-                        &spec.activation,
-                        "deconvolutional",
-                        forward.layer_activation_inputs[layer.index].as_ref(),
-                    )?;
+                    let delta = if let Some(normalization) =
+                        spec.activation.to_channel_normalization()
+                    {
+                        let activation_input = forward.layer_activation_inputs[layer.index]
+                            .as_ref()
+                            .ok_or_else(|| {
+                                Error::InvalidConfig(format!(
+                                    "deconvolutional channel-normalizing backward requires cached pre-activation for layer #{}",
+                                    layer.index
+                                ))
+                            })?;
+                        if activation_input.shape != layer.output_shape {
+                            return Err(Error::InvalidConfig(format!(
+                                "deconvolutional channel-normalization cache shape mismatch at layer #{}: expected {}, got {}",
+                                layer.index,
+                                layer.output_shape,
+                                activation_input.shape
+                            )));
+                        }
+                        Tensor {
+                            shape: layer.output_shape,
+                            data: lightnet_cuda::host_ops::normalize_channels_backward(
+                                &activation_input.data,
+                                &forward.layer_outputs[layer.index].data,
+                                &grad.data,
+                                layer.output_shape.batch,
+                                layer.output_shape.channels,
+                                layer.output_shape.width * layer.output_shape.height,
+                                normalization,
+                                grad_mode == GradMode::Cpp,
+                            ),
+                        }
+                    } else {
+                        apply_output_activation_gradient(
+                            &forward.layer_outputs[layer.index],
+                            &grad,
+                            &spec.activation,
+                            "deconvolutional",
+                            forward.layer_activation_inputs[layer.index].as_ref(),
+                        )?
+                    };
                     // C++ also scales the weight gradient by 1/batch (and the optimizer divides again).
                     let weight_scale = if grad_mode == GradMode::Cpp {
                         1.0 / current_input.shape.batch as f32

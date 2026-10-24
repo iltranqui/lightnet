@@ -3107,10 +3107,15 @@ impl Network {
                     .is_some_and(|activation| activation.to_channel_normalization().is_some()),
             };
             if channel_normalization
-                && !matches!(&kind, LayerKind::Convolutional(_) | LayerKind::Dcnv4(_))
+                && !matches!(
+                    &kind,
+                    LayerKind::Convolutional(_)
+                        | LayerKind::Deconvolutional(_)
+                        | LayerKind::Dcnv4(_)
+                )
             {
                 return Err(Error::InvalidConfig(format!(
-                    "[{}] at line {}: channel-normalizing activations are only supported on [convolutional]",
+                    "[{}] at line {}: channel-normalizing activations are only supported on convolution-family layers",
                     section.name, section.line
                 )));
             }
