@@ -101,3 +101,4 @@ pub(crate) use self::forward_layers::*;
 use self::recurrent_forward::*;
 use self::recurrent_backward::*;
 use self::layer_ops::*;
+pub(crate) use self::layer_ops::resolve_relative_layer;

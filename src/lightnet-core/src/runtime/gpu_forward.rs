@@ -848,136 +848,23 @@ where
                     }
                 }
                 (LayerKind::Route(spec), LayerParams::None) => {
-                    let mut route_inputs = Vec::with_capacity(spec.layers.len());
-                    let mut route_channel_offsets = Vec::with_capacity(spec.layers.len());
-                    let mut route_channels = Vec::with_capacity(spec.layers.len());
-                    let mut route_total_channels = Vec::with_capacity(spec.layers.len());
-                    for raw_index in &spec.layers {
-                        let source_index = resolve_relative_layer(layer.index, *raw_index)?;
-                        let source =
-                            gpu_layer_outputs
-                                .get(source_index)
-                                .ok_or(Error::InvalidRoute {
-                                    layer_index: layer.index,
-                                    reference: *raw_index,
-                                })?;
-                        let source_layer =
-                            self.network.layers.get(source_index).ok_or_else(|| {
-                                Error::InvalidConfig(format!(
-                                    "missing source layer #{source_index} for route layer #{}",
-                                    layer.index
-                                ))
-                            })?;
-                        let chunk_channels =
-                            source_layer.output_shape.channels / spec.groups.max(1);
-                        route_inputs.push(source);
-                        route_channel_offsets.push(chunk_channels * spec.group_id);
-                        route_channels.push(chunk_channels);
-                        route_total_channels.push(source_layer.output_shape.channels);
-                    }
-
-                    self.backend
-                        .route_concat_f32(
-                            &route_inputs,
-                            &route_channel_offsets,
-                            &route_channels,
-                            &route_total_channels,
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.output_shape.width * layer.output_shape.height,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("route concat", err))?
+                    self.forward_route_gpu(layer, spec, &gpu_layer_outputs, launch_config)?
                 }
-                (LayerKind::LayaMarkerGather(spec), LayerParams::None) => {
-                    let a_index = resolve_relative_layer(layer.index, spec.layers[0])?;
-                    let b_index = resolve_relative_layer(layer.index, spec.layers[1])?;
-                    let a_layer = self.network.layers.get(a_index).ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "missing source layer #{a_index} for [laya_marker_gather] layer #{}",
-                            layer.index
-                        ))
-                    })?;
-                    let b_layer = self.network.layers.get(b_index).ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "missing source layer #{b_index} for [laya_marker_gather] layer #{}",
-                            layer.index
-                        ))
-                    })?;
-                    let a_source = gpu_layer_outputs.get(a_index).ok_or(Error::InvalidRoute {
-                        layer_index: layer.index,
-                        reference: spec.layers[0],
-                    })?;
-                    let b_source = gpu_layer_outputs.get(b_index).ok_or(Error::InvalidRoute {
-                        layer_index: layer.index,
-                        reference: spec.layers[1],
-                    })?;
-                    self.backend
-                        .marker_gather_f32(
-                            a_source,
-                            b_source,
-                            &tensor_backend_shape(a_layer.output_shape),
-                            &tensor_backend_shape(b_layer.output_shape),
-                            spec.max_options,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("GPU laya_marker_gather", err))?
-                }
-                (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(weights)) => {
-                    let head_index = resolve_relative_layer(layer.index, spec.layers[0])?;
-                    let scorer_index = resolve_relative_layer(layer.index, spec.layers[1])?;
-                    let marker_index = resolve_relative_layer(layer.index, spec.layers[2])?;
-                    let head_layer = self.network.layers.get(head_index).ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "missing source layer #{head_index} for [laya_act_head] layer #{}",
-                            layer.index
-                        ))
-                    })?;
-                    let scorer_layer = self.network.layers.get(scorer_index).ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "missing source layer #{scorer_index} for [laya_act_head] layer #{}",
-                            layer.index
-                        ))
-                    })?;
-                    let marker_layer = self.network.layers.get(marker_index).ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "missing source layer #{marker_index} for [laya_act_head] layer #{}",
-                            layer.index
-                        ))
-                    })?;
-                    let head_source =
-                        gpu_layer_outputs
-                            .get(head_index)
-                            .ok_or(Error::InvalidRoute {
-                                layer_index: layer.index,
-                                reference: spec.layers[0],
-                            })?;
-                    let scorer_source =
-                        gpu_layer_outputs
-                            .get(scorer_index)
-                            .ok_or(Error::InvalidRoute {
-                                layer_index: layer.index,
-                                reference: spec.layers[1],
-                            })?;
-                    let marker_source =
-                        gpu_layer_outputs
-                            .get(marker_index)
-                            .ok_or(Error::InvalidRoute {
-                                layer_index: layer.index,
-                                reference: spec.layers[2],
-                            })?;
-                    laya_act_gpu::forward(
-                        &self.backend,
+                (LayerKind::LayaMarkerGather(spec), LayerParams::None) => self
+                    .forward_laya_marker_gather_gpu(
+                        layer,
+                        spec,
+                        &gpu_layer_outputs,
+                        launch_config,
+                    )?,
+                (LayerKind::LayaActHead(spec), LayerParams::LayaActHead(weights)) => self
+                    .forward_laya_act_head_gpu(
+                        layer,
                         spec,
                         weights,
-                        [head_source, scorer_source, marker_source],
-                        [
-                            head_layer.output_shape,
-                            scorer_layer.output_shape,
-                            marker_layer.output_shape,
-                        ],
+                        &gpu_layer_outputs,
                         launch_config,
-                    )?
-                }
+                    )?,
                 (LayerKind::Shortcut(spec), LayerParams::Shortcut(params)) => {
                     let mut inputs = Vec::with_capacity(spec.from.len() + 1);
                     inputs.push(current_input.clone());
@@ -2077,37 +1964,11 @@ where
                         .map_err(|err| backend_error("reorg", err))?
                 }
                 (LayerKind::ChannelSlice(spec), LayerParams::None) => {
-                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
-                    let source =
-                        gpu_layer_outputs
-                            .get(source_index)
-                            .ok_or(Error::InvalidRoute {
-                                layer_index: layer.index,
-                                reference: spec.from,
-                            })?;
-                    let source_channels = self.network.layers[source_index].output_shape.channels;
-                    self.backend
-                        .route_concat_f32(
-                            &[source],
-                            &[spec.start],
-                            &[spec.end - spec.start],
-                            &[source_channels],
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.output_shape.width * layer.output_shape.height,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("channel_slice", err))?
+                    self.forward_channel_slice_gpu(layer, spec, &gpu_layer_outputs, launch_config)?
                 }
-                (LayerKind::ChannelShuffle(spec), LayerParams::None) => self
-                    .backend
-                    .channel_shuffle_f32(
-                        current_input,
-                        &tensor_backend_shape(layer.input_shape),
-                        spec.groups,
-                        false,
-                        launch_config,
-                    )
-                    .map_err(|err| backend_error("channel_shuffle", err))?,
+                (LayerKind::ChannelShuffle(spec), LayerParams::None) => {
+                    self.forward_channel_shuffle_gpu(layer, spec, current_input, launch_config)?
+                }
                 (LayerKind::Softmax { groups }, LayerParams::None) => self
                     .backend
                     .softmax_f32(

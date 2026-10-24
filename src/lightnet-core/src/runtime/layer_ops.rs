@@ -2282,7 +2282,7 @@ pub(super) fn forward_reorg(
     Ok(output)
 }
 
-pub(super) fn resolve_relative_layer(layer_index: usize, raw_index: isize) -> Result<usize> {
+pub(crate) fn resolve_relative_layer(layer_index: usize, raw_index: isize) -> Result<usize> {
     let absolute = if raw_index < 0 {
         layer_index
             .checked_add_signed(raw_index)

@@ -1,8 +1,8 @@
 //! Native f32 forward composition only. Backward/update semantics stay unchanged.
-use crate::runtime::{backend_error, tensor_backend_shape};
+use crate::runtime::{GpuExecutableNetwork, backend_error, resolve_relative_layer, tensor_backend_shape};
 use crate::error::{Error, Result};
 use crate::laya_act_head::LayaActHeadWeights;
-use crate::model::{LayaActHeadSpec, TensorShape};
+use crate::model::{LayaActHeadSpec, Layer, TensorShape};
 use lightnet_cuda::{
     ElementwiseLaunchConfig, F16TensorOpsBackend, F32ActivationKind, F32TensorOpsBackend,
 };
@@ -176,4 +176,56 @@ where
             config,
         )
         .map_err(|e| backend_error("GPU f16 act fc2", e))
+}
+
+impl<B> GpuExecutableNetwork<B>
+where
+    B: F32TensorOpsBackend,
+    B::Error: std::fmt::Display,
+{
+    /// Resolve the head, scorer and marker sources, then run the native composition.
+    pub(crate) fn forward_laya_act_head_gpu(
+        &self,
+        layer: &Layer,
+        spec: &LayaActHeadSpec,
+        weights: &LayaActHeadWeights,
+        gpu_layer_outputs: &[B::Tensor],
+        launch_config: ElementwiseLaunchConfig,
+    ) -> Result<B::Tensor> {
+        let head_index = resolve_relative_layer(layer.index, spec.layers[0])?;
+        let scorer_index = resolve_relative_layer(layer.index, spec.layers[1])?;
+        let marker_index = resolve_relative_layer(layer.index, spec.layers[2])?;
+        let source_layer = |index: usize| {
+            self.network.layers.get(index).ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing source layer #{index} for [laya_act_head] layer #{}",
+                    layer.index
+                ))
+            })
+        };
+        let head_layer = source_layer(head_index)?;
+        let scorer_layer = source_layer(scorer_index)?;
+        let marker_layer = source_layer(marker_index)?;
+        let source = |index: usize, reference: isize| {
+            gpu_layer_outputs.get(index).ok_or(Error::InvalidRoute {
+                layer_index: layer.index,
+                reference,
+            })
+        };
+        let head_source = source(head_index, spec.layers[0])?;
+        let scorer_source = source(scorer_index, spec.layers[1])?;
+        let marker_source = source(marker_index, spec.layers[2])?;
+        forward(
+            &self.backend,
+            spec,
+            weights,
+            [head_source, scorer_source, marker_source],
+            [
+                head_layer.output_shape,
+                scorer_layer.output_shape,
+                marker_layer.output_shape,
+            ],
+            launch_config,
+        )
+    }
 }

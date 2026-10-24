@@ -35,3 +35,4 @@ pub(crate) mod tucker_attention;
 pub(crate) mod vc_attention;
 pub(crate) mod vit;
 pub(crate) mod wmhf;
+pub(crate) mod route;
