@@ -46,3 +46,4 @@ pub(crate) mod shortcut;
 pub(crate) mod crop;
 pub(crate) mod batch_norm;
 pub(crate) mod local;
+pub(crate) mod connected;

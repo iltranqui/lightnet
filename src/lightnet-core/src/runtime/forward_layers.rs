@@ -1243,7 +1243,7 @@ pub(super) fn backward_local(
     Ok((input_gradient, gradients))
 }
 
-pub(super) fn forward_connected_with_cache(
+pub(crate) fn forward_connected_with_cache(
     spec: &ConnectedSpec,
     params: &ConnectedParams,
     input: &Tensor,
