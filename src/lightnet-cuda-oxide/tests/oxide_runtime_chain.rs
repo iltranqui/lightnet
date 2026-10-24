@@ -202,6 +202,39 @@ fn compact_reorg_shuffle_channel_slice_and_scale_match_cpu() {
 }
 
 #[test]
+fn compact_deconvolution_matches_cpu() {
+    for activation in [
+        "linear",
+        "leaky",
+        "normalize_channels",
+        "normalize_channels_softmax",
+        "normalize_channels_softmax_maxval",
+    ] {
+        let cfg = format!(
+            "[net]\nwidth=2\nheight=2\nchannels=3\nbatch=2\n\
+             [deconvolutional]\nfilters=4\nsize=2\nstride=2\nactivation={activation}\n"
+        );
+        let net = network(&cfg);
+        let mut cpu = ExecutableNetwork::new(net.clone());
+        fill_params(&mut cpu.params);
+        let mut gpu =
+            GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide backend"));
+        gpu.params = cpu.params.clone();
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+        let compact = gpu
+            .forward_compact(&input)
+            .expect("native compact deconvolution");
+        close(
+            &format!("{activation} compact deconvolution output"),
+            &cpu_forward.final_output().expect("CPU output").data,
+            &compact.final_output.expect("compact output").data,
+            2e-6,
+        );
+    }
+}
+
+#[test]
 fn compact_logistic_and_softmax_forward_match_cpu() {
     for (head, config) in [("logistic", ""), ("softmax", "groups=2\n")] {
         let cfg = format!("[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n[{head}]\n{config}");

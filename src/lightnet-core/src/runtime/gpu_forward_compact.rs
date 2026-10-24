@@ -100,8 +100,7 @@ where
         if self.network.layers.iter().any(|layer| {
             matches!(
                 layer.kind,
-                LayerKind::Deconvolutional(_)
-                    | LayerKind::EmlConvolutional(_)
+                LayerKind::EmlConvolutional(_)
                     | LayerKind::Dcnv4(_)
                     | LayerKind::Contrastive(_)
                     | LayerKind::LayaEncoder(_)
@@ -232,6 +231,73 @@ where
                                 launch_config,
                             )
                             .map_err(|err| backend_error("convolution bias + activation", err))?
+                    }
+                }
+                (LayerKind::Deconvolutional(spec), LayerParams::Convolutional(params)) => {
+                    let input = current_input.expect("deconvolution requires current input");
+                    let weights = self
+                        .backend
+                        .upload_f32(
+                            &[
+                                layer.input_shape.channels,
+                                spec.filters,
+                                spec.size,
+                                spec.size,
+                            ],
+                            &params.weights,
+                        )
+                        .map_err(|err| backend_error("compact deconvolution weights", err))?;
+                    let raw = self
+                        .backend
+                        .deconvolutional_f32(
+                            input,
+                            &weights,
+                            &tensor_backend_shape(layer.output_shape),
+                            layer.input_shape.channels,
+                            layer.input_shape.height,
+                            layer.input_shape.width,
+                            spec.filters,
+                            spec.size,
+                            spec.stride,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("compact deconvolution", err))?;
+                    let biases = self
+                        .backend
+                        .upload_f32(&[spec.filters], &params.biases)
+                        .map_err(|err| backend_error("compact deconvolution biases", err))?;
+                    let biased = self
+                        .backend
+                        .bias_add_f32(
+                            &raw,
+                            &biases,
+                            spec.filters,
+                            layer.output_shape.width * layer.output_shape.height,
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("compact deconvolution bias", err))?;
+                    if let Some(normalization) = spec.activation.to_channel_normalization() {
+                        self.backend
+                            .normalize_channels_f32(
+                                &biased,
+                                &tensor_backend_shape(layer.output_shape),
+                                layer.output_shape.batch,
+                                layer.output_shape.channels,
+                                layer.output_shape.width * layer.output_shape.height,
+                                normalization,
+                                launch_config,
+                            )
+                            .map_err(|err| {
+                                backend_error("compact deconvolution channel normalization", err)
+                            })?
+                    } else {
+                        self.backend
+                            .activation_f32(
+                                &biased,
+                                gpu_activation_kind(layer.index, &spec.activation)?,
+                                launch_config,
+                            )
+                            .map_err(|err| backend_error("compact deconvolution activation", err))?
                     }
                 }
                 (LayerKind::GraphConv(spec), LayerParams::GraphConv(params)) => {
