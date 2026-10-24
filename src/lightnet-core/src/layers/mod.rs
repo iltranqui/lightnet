@@ -52,3 +52,4 @@ pub(crate) mod rnn;
 pub(crate) mod lstm;
 pub(crate) mod crnn;
 pub(crate) mod gru;
+pub(crate) mod convolutional;

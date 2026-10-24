@@ -554,7 +554,7 @@ where
     }
 
     /// Cached device params with the BN-folded copies up to date.
-    pub(super) fn cached_convolution_params(
+    pub(crate) fn cached_convolution_params(
         &self,
         layer_index: usize,
         input_channels: usize,
@@ -589,7 +589,7 @@ where
 
     /// Cached device params whose raw tensors are current but whose folded
     /// copies may be stale (training BN forward/backward only read the raw ones).
-    pub(super) fn cached_convolution_params_raw(
+    pub(crate) fn cached_convolution_params_raw(
         &self,
         layer_index: usize,
         input_channels: usize,

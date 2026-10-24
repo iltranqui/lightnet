@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn resolve_convolutional_owner(network: &Network, layer_index: usize) -> Result<usize> {
+pub(crate) fn resolve_convolutional_owner(network: &Network, layer_index: usize) -> Result<usize> {
     let Some(layer) = network.layers.get(layer_index) else {
         return Err(Error::InvalidConfig(format!(
             "missing convolutional layer #{layer_index}"
@@ -14,7 +14,7 @@ pub(super) fn resolve_convolutional_owner(network: &Network, layer_index: usize)
     Ok(spec.share_index.unwrap_or(layer_index))
 }
 
-pub(super) fn resolve_convolutional_params<'a>(
+pub(crate) fn resolve_convolutional_params<'a>(
     network: &Network,
     params: &'a [LayerParams],
     layer_index: usize,
