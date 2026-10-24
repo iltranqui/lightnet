@@ -11,7 +11,7 @@ pub(super) fn has_host_only_deform(network: &Network) -> bool {
     })
 }
 
-pub(super) fn deconvolutional_spec_is_native(spec: &DeconvolutionalSpec) -> bool {
+pub(crate) fn deconvolutional_spec_is_native(spec: &DeconvolutionalSpec) -> bool {
     spec.activation.to_cuda_f32_kind().is_some()
         || spec.activation.to_channel_normalization().is_some()
 }

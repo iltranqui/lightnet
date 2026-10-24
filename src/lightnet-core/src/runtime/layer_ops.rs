@@ -1662,7 +1662,7 @@ pub(super) fn normalize_value(
     }
 }
 
-pub(super) fn activate(activation: Activation, value: f32) -> f32 {
+pub(crate) fn activate(activation: Activation, value: f32) -> f32 {
     match activation {
         Activation::Linear => value,
         Activation::Logistic => 1.0 / (1.0 + (-value).exp()),
