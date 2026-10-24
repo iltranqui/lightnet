@@ -152,10 +152,10 @@ pub struct GpuMoeBackwardCache<T>
 where
     T: Clone,
 {
-    pub(super) gates: T,
-    pub(super) pooled: T,
-    pub(super) expert_outputs: Vec<T>,
-    pub(super) expert_activation_inputs: Vec<T>,
+    pub(crate) gates: T,
+    pub(crate) pooled: T,
+    pub(crate) expert_outputs: Vec<T>,
+    pub(crate) expert_activation_inputs: Vec<T>,
 }
 
 /// Device-resident branch outputs used by no-BN EML backward.
