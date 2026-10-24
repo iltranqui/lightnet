@@ -36,3 +36,7 @@ pub(crate) mod vc_attention;
 pub(crate) mod vit;
 pub(crate) mod wmhf;
 pub(crate) mod route;
+pub(crate) mod pool;
+pub(crate) mod upsample;
+pub(crate) mod reorg;
+pub(crate) mod softmax;

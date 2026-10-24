@@ -710,61 +710,15 @@ where
                             .map_err(|err| backend_error("convolution activation", err))?
                     }
                 }
-                (LayerKind::MaxPool(spec), LayerParams::None) => if spec.depth {
-                    self.backend.maxpool_depth_f32(
-                        current_input,
-                        &tensor_backend_shape(layer.output_shape),
-                        layer.input_shape.channels,
-                        launch_config,
-                    )
-                } else {
-                    self.backend.maxpool_f32(
-                        current_input,
-                        &tensor_backend_shape(layer.output_shape),
-                        layer.input_shape.channels,
-                        layer.input_shape.height,
-                        layer.input_shape.width,
-                        spec.size,
-                        spec.stride_x,
-                        spec.stride_y,
-                        spec.padding,
-                        launch_config,
-                    )
+                (LayerKind::MaxPool(spec), LayerParams::None) => {
+                    self.forward_maxpool_gpu(layer, spec, current_input, launch_config)?
                 }
-                .map_err(|err| backend_error("maxpool", err))?,
                 (LayerKind::LocalAvgPool(spec), LayerParams::None) => {
-                    if layer.output_shape.channels != layer.input_shape.channels {
-                        return Err(Error::UnsupportedLayer {
-                            layer_index: layer.index,
-                            name: "local_avgpool_depth".to_owned(),
-                        });
-                    }
-                    self.backend
-                        .local_avgpool_f32(
-                            current_input,
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.input_shape.channels,
-                            layer.input_shape.height,
-                            layer.input_shape.width,
-                            spec.size,
-                            spec.stride_x,
-                            spec.stride_y,
-                            spec.padding,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("local_avgpool", err))?
+                    self.forward_local_avgpool_gpu(layer, spec, current_input, launch_config)?
                 }
-                (LayerKind::AvgPool, LayerParams::None) => self
-                    .backend
-                    .avgpool_f32(
-                        current_input,
-                        &tensor_backend_shape(layer.output_shape),
-                        layer.input_shape.channels,
-                        layer.input_shape.height,
-                        layer.input_shape.width,
-                        launch_config,
-                    )
-                    .map_err(|err| backend_error("avgpool", err))?,
+                (LayerKind::AvgPool, LayerParams::None) => {
+                    self.forward_avgpool_gpu(layer, current_input, launch_config)?
+                }
                 (LayerKind::Crop(spec), LayerParams::None) => {
                     let (cache, adjustments) = plan_crop_forward(
                         spec,
@@ -984,20 +938,9 @@ where
                         .activation_f32(&accumulated, activation, launch_config)
                         .map_err(|err| backend_error("shortcut activation", err))?
                 }
-                (LayerKind::Upsample(spec), LayerParams::None) => self
-                    .backend
-                    .upsample_f32(
-                        current_input,
-                        &tensor_backend_shape(layer.output_shape),
-                        layer.input_shape.channels,
-                        layer.input_shape.height,
-                        layer.input_shape.width,
-                        spec.stride.unsigned_abs(),
-                        spec.scale,
-                        spec.reverse,
-                        launch_config,
-                    )
-                    .map_err(|err| backend_error("upsample", err))?,
+                (LayerKind::Upsample(spec), LayerParams::None) => {
+                    self.forward_upsample_gpu(layer, spec, current_input, launch_config)?
+                }
                 (LayerKind::JevCe(spec), LayerParams::None) => self
                     .backend
                     .jev_ce_forward_f32(
@@ -1947,21 +1890,7 @@ where
                     }
                 }
                 (LayerKind::Reorg(spec), LayerParams::None) => {
-                    if spec.stride == 0 {
-                        return Err(Error::InvalidConfig(
-                            "reorg stride cannot be zero".to_owned(),
-                        ));
-                    }
-                    self.backend
-                        .reorg_f32(
-                            current_input,
-                            &tensor_backend_shape(layer.input_shape),
-                            &tensor_backend_shape(layer.output_shape),
-                            spec.stride,
-                            spec.reverse,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("reorg", err))?
+                    self.forward_reorg_gpu(layer, spec, current_input, launch_config)?
                 }
                 (LayerKind::ChannelSlice(spec), LayerParams::None) => {
                     self.forward_channel_slice_gpu(layer, spec, &gpu_layer_outputs, launch_config)?
@@ -1969,15 +1898,9 @@ where
                 (LayerKind::ChannelShuffle(spec), LayerParams::None) => {
                     self.forward_channel_shuffle_gpu(layer, spec, current_input, launch_config)?
                 }
-                (LayerKind::Softmax { groups }, LayerParams::None) => self
-                    .backend
-                    .softmax_f32(
-                        current_input,
-                        &tensor_backend_shape(layer.output_shape),
-                        softmax_group_size(layer.input_shape, *groups)?,
-                        launch_config,
-                    )
-                    .map_err(|err| backend_error("softmax", err))?,
+                (LayerKind::Softmax { groups }, LayerParams::None) => {
+                    self.forward_softmax_gpu(layer, *groups, current_input, launch_config)?
+                }
                 (LayerKind::ScaleChannels(spec), LayerParams::None) => {
                     let source_index = resolve_relative_layer(layer.index, spec.from)?;
                     let source_layer =

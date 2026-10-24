@@ -1,7 +1,7 @@
 use super::*;
 
 /// Elements per softmax group in one batch item.
-pub(super) fn softmax_group_size(shape: TensorShape, groups: usize) -> Result<usize> {
+pub(crate) fn softmax_group_size(shape: TensorShape, groups: usize) -> Result<usize> {
     let groups = groups.max(1);
     let per_batch = shape.element_count();
     if !per_batch.is_multiple_of(groups) {
