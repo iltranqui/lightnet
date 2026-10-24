@@ -911,84 +911,43 @@ where
                     output
                 }
                 (LayerKind::Rnn(spec), LayerParams::Rnn(recurrent)) => {
-                    if spec.activation.to_cuda_f32_kind().is_some()
-                        && (spec.logistic != 2 || Activation::Loggy.to_cuda_f32_kind().is_some())
-                    {
-                        let (output, cache, device_cache) = forward_rnn_layer_device(
-                            &self.backend,
-                            current_input,
-                            layer.input_shape,
-                            spec,
-                            recurrent,
-                            layer.output_shape,
-                            layer.index,
-                            host_copies,
-                            launch_config,
-                        )?;
-                        recurrent_caches.push(cache.map(RecurrentForwardCache::Rnn));
-                        gpu_rnn_cache = Some(device_cache);
-                        output
-                    } else {
-                        let host_input = self
-                            .download_tensor(current_input, layer.input_shape)
-                            .map_err(|err| backend_error("download RNN input", err))?;
-                        let (host_output, cache) =
-                            forward_rnn_layer(spec, recurrent, &host_input, layer.output_shape)?;
-                        recurrent_caches.push(Some(RecurrentForwardCache::Rnn(cache)));
-                        self.backend
-                            .upload_f32(
-                                &tensor_backend_shape(layer.output_shape),
-                                &host_output.data,
-                            )
-                            .map_err(|err| backend_error("upload RNN output", err))?
-                    }
-                }
-                (LayerKind::Lstm(spec), LayerParams::Lstm(recurrent)) => {
-                    let (output, cache, device_cache) = forward_lstm_layer_device(
-                        &self.backend,
+                    let (output, cache, device_cache) = self.forward_rnn_gpu(
+                        layer,
                         spec,
                         recurrent,
                         current_input,
-                        layer.input_shape,
-                        layer.output_shape,
-                        layer.index,
                         host_copies,
                         launch_config,
                     )?;
-                    recurrent_caches.push(cache.map(RecurrentForwardCache::Lstm));
+                    recurrent_caches.push(cache);
+                    gpu_rnn_cache = device_cache;
+                    output
+                }
+                (LayerKind::Lstm(spec), LayerParams::Lstm(recurrent)) => {
+                    let (output, cache, device_cache) = self.forward_lstm_gpu(
+                        layer,
+                        spec,
+                        recurrent,
+                        current_input,
+                        host_copies,
+                        launch_config,
+                    )?;
+                    recurrent_caches.push(cache);
                     gpu_lstm_cache = Some(device_cache);
                     output
                 }
                 (LayerKind::Crnn(spec), LayerParams::Crnn(recurrent)) => {
-                    if spec.activation.to_cuda_f32_kind().is_some() {
-                        let (output, cache, device_cache) = forward_crnn_layer_device(
-                            &self.backend,
-                            spec,
-                            recurrent,
-                            current_input,
-                            layer.input_shape,
-                            layer.output_shape,
-                            layer.index,
-                            host_copies,
-                            launch_config,
-                        )?;
-                        recurrent_caches.push(cache.map(RecurrentForwardCache::Crnn));
-                        gpu_crnn_cache = Some(device_cache);
-                        output
-                    } else {
-                        let host_input = self
-                            .download_tensor(current_input, layer.input_shape)
-                            .map_err(|err| backend_error("download CRNN input", err))?;
-                        let (host_output, cache) =
-                            forward_crnn_layer(spec, recurrent, &host_input, layer.output_shape)?;
-                        recurrent_caches.push(Some(RecurrentForwardCache::Crnn(cache)));
-                        self.backend
-                            .upload_f32(
-                                &tensor_backend_shape(layer.output_shape),
-                                &host_output.data,
-                            )
-                            .map_err(|err| backend_error("upload CRNN output", err))?
-                    }
+                    let (output, cache, device_cache) = self.forward_crnn_gpu(
+                        layer,
+                        spec,
+                        recurrent,
+                        current_input,
+                        host_copies,
+                        launch_config,
+                    )?;
+                    recurrent_caches.push(cache);
+                    gpu_crnn_cache = device_cache;
+                    output
                 }
                 (LayerKind::EmlConvolutional(spec), LayerParams::EmlConvolutional(eml)) => {
                     let (output, gpu_cache, host_cache) = self.forward_eml_convolutional_gpu(
@@ -1024,16 +983,7 @@ where
                     )));
                 }
                 (LayerKind::Gru(spec), LayerParams::Gru(params)) if !training => {
-                    forward_gru_layer_device(
-                        &self.backend,
-                        current_input,
-                        layer.input_shape,
-                        spec,
-                        params,
-                        layer.output_shape,
-                        layer.index,
-                        launch_config,
-                    )?
+                    self.forward_gru_gpu(layer, spec, params, current_input, launch_config)?
                 }
                 (LayerKind::Gru(_), _) => {
                     return Err(Error::UnsupportedLayer {

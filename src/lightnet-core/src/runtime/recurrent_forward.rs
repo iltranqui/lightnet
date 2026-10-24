@@ -226,7 +226,7 @@ pub(super) fn forward_gru_layer(
     Ok(output)
 }
 
-pub(super) fn forward_gru_layer_device<B: F32TensorOpsBackend>(
+pub(crate) fn forward_gru_layer_device<B: F32TensorOpsBackend>(
     backend: &B,
     input_gpu: &B::Tensor,
     input_shape: TensorShape,
@@ -392,7 +392,7 @@ where
     Tensor::from_data(shape, data)
 }
 
-pub(super) fn forward_rnn_layer_device<B: F32TensorOpsBackend>(
+pub(crate) fn forward_rnn_layer_device<B: F32TensorOpsBackend>(
     backend: &B,
     input_gpu: &B::Tensor,
     input_shape: TensorShape,
@@ -645,7 +645,7 @@ where
     Ok((output_gpu, host_cache, device_cache))
 }
 
-pub(super) fn forward_rnn_layer(
+pub(crate) fn forward_rnn_layer(
     spec: &RnnSpec,
     params: &RnnParams,
     input: &Tensor,
@@ -735,7 +735,7 @@ pub(super) fn forward_rnn_layer(
     Ok((output, cache))
 }
 
-pub(super) fn forward_lstm_layer_device<B: F32TensorOpsBackend>(
+pub(crate) fn forward_lstm_layer_device<B: F32TensorOpsBackend>(
     backend: &B,
     spec: &LstmSpec,
     params: &LstmParams,
@@ -1271,7 +1271,7 @@ pub(super) fn forward_lstm_layer(
     Ok((output, cache))
 }
 
-pub(super) fn forward_crnn_layer_device<B: F32TensorOpsBackend>(
+pub(crate) fn forward_crnn_layer_device<B: F32TensorOpsBackend>(
     backend: &B,
     spec: &CrnnSpec,
     params: &CrnnParams,
@@ -1563,7 +1563,7 @@ where
     Ok((output_gpu, host_cache, device_cache))
 }
 
-pub(super) fn forward_crnn_layer(
+pub(crate) fn forward_crnn_layer(
     spec: &CrnnSpec,
     params: &CrnnParams,
     input: &Tensor,
