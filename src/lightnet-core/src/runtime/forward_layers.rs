@@ -1311,7 +1311,7 @@ pub(super) fn batchnorm_channel_stats(input: &Tensor) -> (Vec<f32>, Vec<f32>) {
     (mean, variance)
 }
 
-pub(super) fn validate_batchnorm_params(params: &BatchNormParams, channels: usize) -> Result<()> {
+pub(crate) fn validate_batchnorm_params(params: &BatchNormParams, channels: usize) -> Result<()> {
     if params.biases.len() != channels
         || params.scales.len() != channels
         || params.rolling_mean.len() != channels
@@ -1328,7 +1328,7 @@ pub(super) fn validate_batchnorm_params(params: &BatchNormParams, channels: usiz
     Ok(())
 }
 
-pub(super) fn folded_batchnorm_inference_params(
+pub(crate) fn folded_batchnorm_inference_params(
     params: &BatchNormParams,
     channels: usize,
 ) -> Result<(Vec<f32>, Vec<f32>)> {

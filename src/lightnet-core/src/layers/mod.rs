@@ -44,3 +44,4 @@ pub(crate) mod scale_channels;
 pub(crate) mod sam;
 pub(crate) mod shortcut;
 pub(crate) mod crop;
+pub(crate) mod batch_norm;

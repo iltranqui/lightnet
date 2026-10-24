@@ -47,7 +47,7 @@ use lightnet_cuda::{
 pub(crate) const BATCH_NORM_EPSILON: f32 = 0.000_01;
 /// Rolling-stat EMA keep factor of the GPU batch-statistics training path:
 /// C++ CUDA `scal_ongpu(.99)` + `axpy_ongpu(.01)` / cuDNN factor `.01`.
-const BATCH_NORM_ROLLING_KEEP: f32 = 0.99;
+pub(crate) const BATCH_NORM_ROLLING_KEEP: f32 = 0.99;
 /// Rolling-stat EMA keep factor of the host (CPU) training path: C++
 /// `forward_batchnorm_layer` uses `scal_cpu(.9)` + `axpy_cpu(.1)`.
 pub(crate) const BATCH_NORM_ROLLING_KEEP_CPU: f32 = 0.9;

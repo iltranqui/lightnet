@@ -194,13 +194,13 @@ pub struct GpuBatchNormCache<T>
 where
     T: Clone,
 {
-    pub(super) scales: T,
-    pub(super) x_hat: T,
+    pub(crate) scales: T,
+    pub(crate) x_hat: T,
     /// Biased batch variance.
-    pub(super) variance: T,
+    pub(crate) variance: T,
     /// Updated `(rolling_mean, rolling_variance)`; `None` for shared layers,
     /// whose owner keeps the statistics.
-    pub(super) rolling: Option<(T, T)>,
+    pub(crate) rolling: Option<(T, T)>,
 }
 
 #[derive(Clone, Debug)]
@@ -449,26 +449,26 @@ where
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct GpuConvolutionLayerParams<T> {
-    pub(super) raw_weights: T,
-    pub(super) raw_biases: T,
-    pub(super) weights: T,
-    pub(super) biases: T,
-    pub(super) batch_norm_scales: Option<T>,
+pub(crate) struct GpuConvolutionLayerParams<T> {
+    pub(crate) raw_weights: T,
+    pub(crate) raw_biases: T,
+    pub(crate) weights: T,
+    pub(crate) biases: T,
+    pub(crate) batch_norm_scales: Option<T>,
     /// Device-resident BN gamma and rolling stats (the source of truth during
     /// training; the host copies lag when `host_weights_stale`).
-    pub(super) bn: Option<GpuBatchNormState<T>>,
+    pub(crate) bn: Option<GpuBatchNormState<T>>,
     /// The raw weights/BN stats changed since `weights`/`biases`/
     /// `batch_norm_scales` (the BN-folded inference copies) were built; they
     /// are re-folded on the device the next time something needs them.
-    pub(super) folded_stale: bool,
+    pub(crate) folded_stale: bool,
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct GpuBatchNormState<T> {
-    pub(super) scales: T,
-    pub(super) rolling_mean: T,
-    pub(super) rolling_variance: T,
+pub(crate) struct GpuBatchNormState<T> {
+    pub(crate) scales: T,
+    pub(crate) rolling_mean: T,
+    pub(crate) rolling_variance: T,
 }
 
 #[derive(Clone, Debug)]
