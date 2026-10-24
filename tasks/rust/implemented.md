@@ -2720,3 +2720,26 @@ gradient parity, plus gated softmax loss/delta parity; `cargo xtask gpu-check`
 clean; `cargo xtask clippy` completed with pre-existing warnings only. Runs were
 uncapped (`systemd-run --user` unavailable), `-j 2`. No training run and no
 full-suite claim. Tag `v0.2.197`.
+
+## 262. Native ViT inference forward
+
+v0.2.198. Added five Oxide kernels in `kernels/layers_extra.rs` (`vit_patchify`,
+`vit_add_pos_embed`, `vit_clamp_feature`, `vit_mhc_residual`,
+`vit_tokens_to_nchw`), their `OxideBackend` methods and `F32TensorOpsBackend`
+entries (trait defaults are host references in `host_ops`), and
+`runtime/vit_gpu.rs`, which composes patchify, linear, LayerNorm, flash
+attention, mHC residual, clamped FFN activation and the NCHW transpose. The
+`gpu_forward.rs` arm takes it only when `!training`, no MSA, no VC attention,
+head_dim <= 128 and the activation maps to a device kind; otherwise the host
+arm runs unchanged and fills `VitForwardCache`.
+
+Known limits: no device ViT backward, no compact (`forward_compact`) arm, the
+native path leaves `vit_cache` empty so backward needs a training forward, and
+no compiled-C++ golden exists.
+
+Evidence: `cargo xtask oxide --test oxide_vit` 3 of 3 (patchify pad/stride,
+elementwise kernels incl. NaN/inf, native forward vs CPU for 5 configs at rel
+tol 2e-4); `cargo xtask test vit` 33 passed after two host tests were updated
+(inference compared with tolerance, backward test uses
+`forward_training_with_state`). Runs uncapped (`systemd-run --user`
+unavailable). No training run, no full-suite claim. Tag `v0.2.198`.

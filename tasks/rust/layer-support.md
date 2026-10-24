@@ -114,7 +114,7 @@ with the command given rather than trusting the number.
 | `RecursiveBlock` | alias | body only | fwd | exact | T1 | none | none | no |
 | `HyperbolicFoveation` | yes | C++ | fwd | exact | pin | native Oxide predictor + warp + isotropic/anisotropic fixed-point/Newton grids; native warp, predictor and fixed-point/Newton parameter adjoints | runtime input-gradient parity directly tested; supported hybrid/cache limitations remain | no |
 | `FoveationFilm` | alias | C++ | fwd | exact | T4 | native Oxide f32 (HF source/cache host-managed) | native FiLM adjoint + host HF backward; host SGD/Adam updates | no |
-| `Vit` | yes | C++ | fwd | exact | pin | host | cpu | no |
+| `Vit` | yes | C++ | fwd | exact | pin | native f32 inference (flash/non-flash, no MSA/VC, head_dim<=128, mapped activation; v0.2.198) / host for training | cpu | no |
 | `Swin` | alias | Rust | fwd | exact | pin | host | cpu | no |
 | `TuckerAttention` | alias | C++ | fwd | exact | pin | host | cpu | no |
 | `MambaVision` | alias | C++ | fwd | exact | pin | host | cpu | no |
@@ -223,7 +223,7 @@ layer count.
 | Variant | GPU forward | Missing backward piece |
 |---|---|---|
 | `Dcnv4` excluded/mixed variants | host round trip (>961 points, unsupported activation or another fallback layer) | remaining unsupported/unknown activations and larger kernels; BN and NormalizeChannels* math native since v0.2.014/015; Revleaky native since v0.2.026; 961-point bound since v0.2.111 |
-| `Vit` | host round trip | device attention/MLP backward (flash dQ/dK/dV primitives exist) |
+| `Vit` | host round trip for training, MSA, VC attention, head_dim>128, unmapped activation | device attention/MLP backward (flash dQ/dK/dV primitives exist) |
 | `Swin` | host round trip | device windowed-attention backward |
 | `TuckerAttention` | host round trip | device low-rank factor backward |
 | `MambaVision` | host round trip | device selective-scan backward |
