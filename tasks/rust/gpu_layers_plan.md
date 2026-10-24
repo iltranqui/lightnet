@@ -29,7 +29,7 @@ deliverable. Sparse MoE remains unstarted.
 ## Resume point
 
 Marker gather is native in f32 full/compact forward/backward and f16 compact
-inference (v0.2.001–002). v0.2.149 adds compact f16 Logistic sigmoid through the native half-storage channel-affine activation kernel; v0.2.150 adds direct CPU-reference parity. v0.2.151 adds OMD loss inference as a device identity pass-through. The full `oxide_runtime_f16` suite passed 20 tests at that increment; these paths are inference only. v0.2.152 adds group-major JevCe compact f16 inference via native temperature scaling and softmax; v0.2.153 adds native channel-major NCHW group-softmax. Both layouts pass CPU parity. v0.2.154 adds compact f16 LAYA act-head with native half-storage feature extraction and exact-erf GELU; CPU-reference output parity and all 22 f16 tests pass. v0.2.155 adds the native LayaHead masked-attention primitive and v0.2.156 composes it into native full/compact f32 runtime forward; v0.2.157 adds native full/compact f32 LayaScorer inference and v0.2.158 adds its native input adjoint. v0.2.159 adds native full/compact f32 LayaEncoder inference with RoPE full/sliding attention and GeGLU. v0.2.160 adds non-BN DeformConv predictor/runtime support for dilated geometries without changing ordinary conv extents (§199). Act-head inference now supports f32 and compact f16; training/backward/update and shared-file loading gaps remain. Act-head features/exact-erf primitives are native f32
+inference (v0.2.001–002). v0.2.149 adds compact f16 Logistic sigmoid through the native half-storage channel-affine activation kernel; v0.2.150 adds direct CPU-reference parity. v0.2.151 adds OMD loss inference as a device identity pass-through. The full `oxide_runtime_f16` suite passed 20 tests at that increment; these paths are inference only. v0.2.152 adds group-major JevCe compact f16 inference via native temperature scaling and softmax; v0.2.153 adds native channel-major NCHW group-softmax. Both layouts pass CPU parity. v0.2.154 adds compact f16 LAYA act-head with native half-storage feature extraction and exact-erf GELU; CPU-reference output parity and all 22 f16 tests pass. v0.2.155 adds the native LayaHead masked-attention primitive and v0.2.156 composes it into native full/compact f32 runtime forward; v0.2.157 adds native full/compact f32 LayaScorer inference and v0.2.158 adds its native input adjoint. v0.2.159 adds native full/compact f32 LayaEncoder inference with RoPE full/sliding attention and GeGLU. v0.2.160 adds non-BN DeformConv predictor/runtime support for dilated geometries without changing ordinary conv extents (§199). v0.2.193 adds native f32 deconvolution `NormalizeChannels*` forward/backward, so every parsed deconvolution activation stays on the device (§257). Act-head inference now supports f32 and compact f16; training/backward/update and shared-file loading gaps remain. Act-head features/exact-erf primitives are native f32
 (v0.2.003–004), and full/compact act-head f32 forward is native in v0.2.005.
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
@@ -661,10 +661,10 @@ CenterNet, modern-YOLO, Segmentation, JevCe and LayaLoss host-owned head
 loss/backward (native full/compact f32 activation forwards landed unversioned
 in §§224–228), DCNv4 Adam and
 excluded-variant host fallbacks,
-batch-normalized DeformConv host fallback,
-deconvolution unsupported-activation fallback, CPU-only layer GPU paths and
+batch-normalized DeformConv host fallback, CPU-only layer GPU paths and
 other matrix-family GPU Muon remain open. Dilated non-BN DeformConv
 predictor/runtime coverage landed in
-v0.2.160; see `implemented.md` §199. Each layer needs device forward/backward/update tests as
+v0.2.160; native deconvolution `NormalizeChannels*` landed in v0.2.193; see
+`implemented.md` §§199, 257. Each layer needs device forward/backward/update tests as
 applicable and explicit limits. CPU/config/axis gaps remain open. No green full-
 host/corpus/full-Oxide suite is established; sparse MoE stays unstarted.

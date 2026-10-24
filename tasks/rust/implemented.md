@@ -2608,3 +2608,26 @@ identity carried through the runtime.
 Evidence: `cargo xtask oxide --test oxide_gemm_f8` 54 of 54; `cargo xtask
 gpu-check` clean. Both uncapped (`systemd-run --user` unavailable), `-j 2`. No
 training run. Tag `v0.2.192`.
+
+## 257. Native deconvolution channel normalization
+
+v0.2.193. `[deconvolutional]` now accepts `normalize_channels`,
+`normalize_channels_softmax`, and `normalize_channels_softmax_maxval` and keeps
+them on the native f32 path. The CPU reference applies the same tensor-level
+normalization used by convolution and computes its exact backward Jacobian,
+honouring `GradMode::Cpp`; the GPU forward uses `normalize_channels_f32` after
+the bias add, and the GPU backward uses `normalize_channels_backward_f32` with
+the cached pre-activation and the layer output. The whole-network CPU fallback
+now triggers only for unmapped `Other` activations, which config parsing
+rejects; every parsed deconvolution activation is native.
+
+Known limits: compact/f16 deconvolution is still unsupported, optimizer
+parameters and gradients remain host-staged, and no compiled-C++ golden exists.
+
+Evidence: `cargo xtask test deconvolutional` 9 of 9; the
+channel-normalization config test passes; `cargo xtask oxide --test
+oxide_runtime_chain deconvolution` 3 of 3, including the new two-step
+channel-normalization SGD parity for all three modes; `cargo xtask gpu-check`
+clean; `cargo xtask clippy` completed with pre-existing warnings only. Runs
+were uncapped (`systemd-run --user` unavailable), `-j 2`. No training run and no
+full-suite claim. Tag `v0.2.193`.

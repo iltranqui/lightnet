@@ -81,7 +81,7 @@ with the command given rather than trusting the number.
 | Kind | cfg | wts | cpu fwd | cpu bwd | axis | gpu fwd | gpu bwd | f16 |
 |---|---|---|---|---|---|---|---|---|
 | `Convolutional` | yes | C++ | fwd | exact | pin | native | device | yes |
-| `Deconvolutional` | yes | C++ | fwd | exact | pin | native / host (unsupported act) | native / cpu fallback (unsupported act) | no |
+| `Deconvolutional` | yes | C++ | fwd | exact | pin | native f32 (all parsed activations incl. NormalizeChannels*) | native f32 (all parsed activations; host-staged optimizer) | no |
 | `Connected` | yes | C++ | fwd | exact | pin | native / host (unsupported act) | mixed (native BN/activation adjoint for supported activations; host-staged optimizer/stat sync) | yes (inference) |
 | `MaxPool` | alias | none | fwd | exact | pin | native f32; compact f16 inference incl. depth pooling | device f32 backward | yes |
 | `LocalAvgPool` | alias | none | fwd | exact | pin | native (channel-changing rejected) | device | yes |
@@ -236,8 +236,9 @@ backward for non-BN variants; v0.2.160 extends predictor coverage to dilated
 geometry. Its remaining limitation
 (one host hop for the batch-coupled normalization Jacobian) is recorded in the
 main matrix row instead. `Deconvolutional` left this table in v0.2.039: supported
-f32 activations use native forward/backward; unsupported activations retain the
-whole-network host fallback.
+f32 activations use native forward/backward; v0.2.193 adds native
+`NormalizeChannels*`, so every parsed activation stays on the device and only
+unmapped `Other` values retain the host route (config parsing rejects those).
 | `Connected` | native, but host round trip when activation is unsupported | no separate Revleaky gap since its v0.2.026 mapping to Leaky |
 | `Rnn`/`Crnn` | device, but host when activation unsupported | device kernels for the remaining activations |
 | `Moe` | device | device path for unsupported expert activations |
@@ -260,7 +261,7 @@ devices and head sizes (no native kernel at all), even though standard
 | EML | device forward, device SGD/Adam (DNOPT5), BN scale/beta gradients | BN backward CPU fallback per v71; documents disagree on later state — verify against `implemented.md` §7 before planning |
 | Recurrent | device projections/BPTT, on-device caches and gradient accumulation without BN | BN forward/cache, rolling-stat update and optimizer remain host-side; some parameter-gradient transfers still cross the host |
 | DCNv4 | bounded native f32 forward/backward through 31x31/961 points incl. rolling-stat BN and 0.9 EMA, NormalizeChannels*/Revleaky activations, device gradient accumulation and native SGD/Adam updates; learned parameter tensors persist across forwards/updates with snapshot invalidation (v0.2.030), Adam moments bridge through sidecar only at save/load (v0.2.028); two-step SGD/Adam CPU parity. Non-BN offset-projection Muon uses device-gradient staging at the optimizer boundary and snapshot-triggered cache refresh; actual-Oxide two-step CPU parity (v0.2.055) | >961/unsupported variants host; runtime SGD parity extends through 31x31; Adam parity through 23x23 without BN and 19x19 with BN; host-canonical mirrors still download after optimizer updates and rolling stats remain host-managed; compact/f16 absent; BN Muon unsupported |
-| Deconvolutional | native Oxide f32 forward, activation, input/weight/bias gradients (v0.2.039); actual-GPU CPU parity for Muon and two-step SGD/Adam updates (v0.2.040) | unmapped activations retain legacy host route; weights and gradients cross host boundary for optimizer; no f16 |
+| Deconvolutional | native Oxide f32 forward, all parsed activations incl. `NormalizeChannels*` (v0.2.193), input/weight/bias gradients (v0.2.039); actual-GPU CPU parity for Muon and two-step SGD/Adam updates (v0.2.040) | optimizer parameters/gradients cross the host boundary; no f16/compact path |
 | Shortcut (weighted) | device input/source gradients, exact normalization derivatives | per-input/per-slot weight gradient vector crosses to host; optimizer host-side |
 | Connected | device GEMM + activation, BN folded at inference | BN training and unsupported/unknown activations fall back |
 | `Crop` | device inference and training geometry/color adjustments (RGB shift, saturation, exposure) | no known crop GPU-forward rejection for configured augmentations; backward follows existing scale-only Rust contract |
