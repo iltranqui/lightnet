@@ -1806,7 +1806,7 @@ impl OxideBackend {
         // SAFETY: the checked layout bounds every source index; one thread
         // writes one complete, disjoint sample row.
         unsafe {
-            self.layers_extra.laya_act_features_f16(
+            self.laya.laya_act_features_f16(
                 &self.stream,
                 launch::elementwise(layout.batch, config),
                 &head.buf,
@@ -2146,7 +2146,7 @@ impl OxideBackend {
         // SAFETY: validated NCHW extents/storage bound all reads and each
         // thread writes one distinct half output, including ragged tails.
         unsafe {
-            self.layers_extra.marker_gather_f16(
+            self.laya.marker_gather_f16(
                 &self.stream,
                 launch::elementwise(d.output_len, config),
                 &features.buf,

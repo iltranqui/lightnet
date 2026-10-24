@@ -36,7 +36,9 @@ use kernels::bias_scale::BIAS_BACKWARD_THREADS;
 use kernels::{
     activations, amp as amp_k, batchnorm, bias_scale, conv_direct, conv_implicit, convert, dcnv4,
     deform_sample, elementwise, foveation_film, gemm, gemm_f8, gemm_f16, gemm_fp4, gemm_mma,
-    half_ops, im2col, layers_extra, muon, optim, pool, quant_fp4, resample, route,
+    half_ops, im2col, layers_extra, muon, optim, pool, quant_fp4, resample, route, wmhf, vit,
+    attention, moe, laya, dense_loss, softmax, reorg, channel_shuffle, dropout, scale_channels,
+    shortcut, recurrent, eml, normalize_channels,
 };
 use tensor::{PooledBuf, PooledBuf8};
 pub use tensor::{OxideTensorF16, OxideTensorF32};
@@ -224,6 +226,21 @@ pub struct OxideBackend {
     dcnv4_backward: dcnv4::backward::LoadedModule,
     dcnv4_projection: kernels::dcnv4_projection::kernels::LoadedModule,
     layers_extra: layers_extra::kernels::LoadedModule,
+    wmhf: wmhf::kernels::LoadedModule,
+    normalize_channels: normalize_channels::kernels::LoadedModule,
+    eml: eml::kernels::LoadedModule,
+    recurrent: recurrent::kernels::LoadedModule,
+    shortcut: shortcut::kernels::LoadedModule,
+    scale_channels: scale_channels::kernels::LoadedModule,
+    dropout: dropout::kernels::LoadedModule,
+    channel_shuffle: channel_shuffle::kernels::LoadedModule,
+    reorg: reorg::kernels::LoadedModule,
+    softmax: softmax::kernels::LoadedModule,
+    dense_loss: dense_loss::kernels::LoadedModule,
+    laya: laya::kernels::LoadedModule,
+    moe: moe::kernels::LoadedModule,
+    attention: attention::kernels::LoadedModule,
+    vit: vit::kernels::LoadedModule,
     residual_epilogue: layers_extra::residual::LoadedModule,
     conv_mode: ConvMode,
     /// FP8 formats for the dgrad / wgrad GEMMs when the FP8 backward is
@@ -670,7 +687,7 @@ impl OxideBackend {
         // its direction plane. Follow-up gathers reduce four-way overlaps and
         // channel parameter contributions.
         unsafe {
-            self.layers_extra.wmhf_scan4_backward_states(
+            self.wmhf.wmhf_scan4_backward_states(
                 &self.stream,
                 launch::elementwise(sequence_count, config),
                 &input.buf,
@@ -684,7 +701,7 @@ impl OxideBackend {
         }
         .map_err(launch_err)?;
         unsafe {
-            self.layers_extra.wmhf_scan4_backward_sequences(
+            self.wmhf.wmhf_scan4_backward_sequences(
                 &self.stream,
                 launch::elementwise(sequence_count, config),
                 &input.buf,
@@ -704,7 +721,7 @@ impl OxideBackend {
         }
         .map_err(launch_err)?;
         unsafe {
-            self.layers_extra.wmhf_scan4_backward_input(
+            self.wmhf.wmhf_scan4_backward_input(
                 &self.stream,
                 launch::elementwise(total, config),
                 &input_parts,
@@ -713,7 +730,7 @@ impl OxideBackend {
         }
         .map_err(launch_err)?;
         unsafe {
-            self.layers_extra.wmhf_scan4_backward_weights(
+            self.wmhf.wmhf_scan4_backward_weights(
                 &self.stream,
                 launch::elementwise(4 * channels, config),
                 &da_parts,
@@ -782,7 +799,7 @@ impl OxideBackend {
         // SAFETY: one thread writes each output pixel and reads its checked
         // nearest-upsampled coefficient cell.
         unsafe {
-            self.layers_extra.wmhf_high_frequency_forward(
+            self.wmhf.wmhf_high_frequency_forward(
                 &self.stream,
                 launch::elementwise(output_len, config),
                 &lh.buf,
@@ -859,7 +876,7 @@ impl OxideBackend {
         // SAFETY: one thread owns each coefficient gradient and gathers all
         // high-resolution cells mapped to that coefficient.
         unsafe {
-            self.layers_extra.wmhf_high_frequency_backward(
+            self.wmhf.wmhf_high_frequency_backward(
                 &self.stream,
                 launch::elementwise(coeff_len, config),
                 &output_grad.buf,
@@ -925,7 +942,7 @@ impl OxideBackend {
         let mut output = self.alloc_uninit(output_len)?;
         // SAFETY: each output index gathers one valid source channel/spatial index.
         unsafe {
-            self.layers_extra.wmhf_split_channels(
+            self.wmhf.wmhf_split_channels(
                 &self.stream,
                 launch::elementwise(output_len, config),
                 &input.buf,
@@ -981,7 +998,7 @@ impl OxideBackend {
         let mut output = self.alloc_uninit(output_len)?;
         // SAFETY: every output element is written once from a bounds-checked source.
         unsafe {
-            self.layers_extra.vit_patchify(
+            self.vit.vit_patchify(
                 &self.stream,
                 launch::elementwise(output_len, config),
                 &input.buf,
@@ -1018,7 +1035,7 @@ impl OxideBackend {
         let mut output = self.alloc_uninit(len)?;
         // SAFETY: one thread owns each output element.
         unsafe {
-            self.layers_extra.vit_add_pos_embed(
+            self.vit.vit_add_pos_embed(
                 &self.stream,
                 launch::elementwise(len, config),
                 &tokens.buf,
@@ -1047,7 +1064,7 @@ impl OxideBackend {
         let mut output = self.alloc_uninit(len)?;
         // SAFETY: one thread owns each output element.
         unsafe {
-            self.layers_extra.vit_clamp_feature(
+            self.vit.vit_clamp_feature(
                 &self.stream,
                 launch::elementwise(len, config),
                 &input.buf,
@@ -1083,7 +1100,7 @@ impl OxideBackend {
         let mut output = self.alloc_uninit(len)?;
         // SAFETY: one thread owns each output element.
         unsafe {
-            self.layers_extra.vit_mhc_residual(
+            self.vit.vit_mhc_residual(
                 &self.stream,
                 launch::elementwise(len, config),
                 &skip.buf,
@@ -1121,7 +1138,7 @@ impl OxideBackend {
         let mut output = self.alloc_uninit(len)?;
         // SAFETY: one thread owns each output element.
         unsafe {
-            self.layers_extra.vit_tokens_to_nchw(
+            self.vit.vit_tokens_to_nchw(
                 &self.stream,
                 launch::elementwise(len, config),
                 &input.buf,
@@ -1178,7 +1195,7 @@ impl OxideBackend {
         let mut output = self.alloc_uninit(output_len)?;
         // SAFETY: each output position selects one valid element from one validated branch.
         unsafe {
-            self.layers_extra.wmhf_concat_local(
+            self.wmhf.wmhf_concat_local(
                 &self.stream,
                 launch::elementwise(output_len, config),
                 &branch3.buf,
@@ -1231,7 +1248,7 @@ impl OxideBackend {
         let mut output = self.alloc_uninit(fuse.len())?;
         // SAFETY: each output element has one owner; all inputs have identical validated lengths.
         unsafe {
-            self.layers_extra.wmhf_apply_gate(
+            self.wmhf.wmhf_apply_gate(
                 &self.stream,
                 launch::elementwise(fuse.len(), config),
                 &fuse.buf,
@@ -1286,7 +1303,7 @@ impl OxideBackend {
         let mut shortcut_grad = self.alloc_uninit(output_grad.len())?;
         // SAFETY: each gradient element has one owner and all input extents match.
         unsafe {
-            self.layers_extra.wmhf_apply_gate_backward(
+            self.wmhf.wmhf_apply_gate_backward(
                 &self.stream,
                 launch::elementwise(output_grad.len(), config),
                 &output_grad.buf,
@@ -1374,7 +1391,7 @@ impl OxideBackend {
         // SAFETY: each sequence has a unique (batch,channel,line,direction)
         // and writes every element of its disjoint direction plane exactly once.
         unsafe {
-            self.layers_extra.wmhf_scan4_forward(
+            self.wmhf.wmhf_scan4_forward(
                 &self.stream,
                 launch::elementwise(sequence_count, config),
                 &input.buf,
@@ -1388,7 +1405,7 @@ impl OxideBackend {
         }
         .map_err(launch_err)?;
         unsafe {
-            self.layers_extra.wmhf_scan4_combine(
+            self.wmhf.wmhf_scan4_combine(
                 &self.stream,
                 launch::elementwise(total, config),
                 &directions,
@@ -1457,7 +1474,7 @@ impl OxideBackend {
         // SAFETY: one thread writes the same valid coefficient index in each
         // sub-band; all input and output extents were checked above.
         unsafe {
-            self.layers_extra.wmhf_haar_dwt(
+            self.wmhf.wmhf_haar_dwt(
                 &self.stream,
                 launch::elementwise(output_len, config),
                 &input.buf,
@@ -1577,7 +1594,7 @@ impl OxideBackend {
         // SAFETY: one thread owns each input-gradient element and only reads
         // checked sub-band elements from its corresponding Haar tile.
         unsafe {
-            self.layers_extra.wmhf_haar_dwt_backward(
+            self.wmhf.wmhf_haar_dwt_backward(
                 &self.stream,
                 launch::elementwise(input_len, config),
                 &ll_grad.buf,
@@ -1674,6 +1691,36 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load dcnv4_projection module: {err:?}")))?;
         let residual_epilogue = layers_extra::residual::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load residual epilogue module: {err:?}")))?;
+        let vit = vit::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load vit module: {err:?}")))?;
+        let attention = attention::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load attention module: {err:?}")))?;
+        let moe = moe::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load moe module: {err:?}")))?;
+        let laya = laya::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load laya module: {err:?}")))?;
+        let dense_loss = dense_loss::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load dense_loss module: {err:?}")))?;
+        let softmax = softmax::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load softmax module: {err:?}")))?;
+        let reorg = reorg::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load reorg module: {err:?}")))?;
+        let channel_shuffle = channel_shuffle::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load channel_shuffle module: {err:?}")))?;
+        let dropout = dropout::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load dropout module: {err:?}")))?;
+        let scale_channels = scale_channels::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load scale_channels module: {err:?}")))?;
+        let shortcut = shortcut::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load shortcut module: {err:?}")))?;
+        let recurrent = recurrent::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load recurrent module: {err:?}")))?;
+        let eml = eml::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load eml module: {err:?}")))?;
+        let normalize_channels = normalize_channels::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load normalize_channels module: {err:?}")))?;
+        let wmhf = wmhf::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load wmhf module: {err:?}")))?;
         let layers_extra = layers_extra::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load layers_extra module: {err:?}")))?;
         let half_scratch = half::HalfScratch::new(&stream)?;
@@ -1741,6 +1788,21 @@ impl OxideBackend {
             pool,
             resample,
             layers_extra,
+            wmhf,
+            normalize_channels,
+            eml,
+            recurrent,
+            shortcut,
+            scale_channels,
+            dropout,
+            channel_shuffle,
+            reorg,
+            softmax,
+            dense_loss,
+            laya,
+            moe,
+            attention,
+            vit,
             deform_sample,
             deform_backward,
             dsconv,
@@ -4268,7 +4330,7 @@ impl OxideBackend {
         // by the `reorg_dims` check (`hs * stride <= hb`, `ws * stride <= wb`).
         unsafe {
             if to_small {
-                self.layers_extra.reorg_to_small(
+                self.reorg.reorg_to_small(
                     &self.stream,
                     launch::elementwise(dst_len, config),
                     &src.buf,
@@ -4281,7 +4343,7 @@ impl OxideBackend {
                     d.stride,
                 )
             } else {
-                self.layers_extra.reorg_to_big(
+                self.reorg.reorg_to_big(
                     &self.stream,
                     launch::elementwise(dst_len, config),
                     &src.buf,
@@ -6587,7 +6649,7 @@ impl lightnet_cuda::DenseLossBackend for OxideBackend {
         // SAFETY: one thread per sample/group owns its candidate entries and
         // its loss/active slot.
         unsafe {
-            self.layers_extra.jev_ce_loss(
+            self.dense_loss.jev_ce_loss(
                 &self.stream,
                 launch::elementwise(work, config),
                 &logits.buf,
@@ -6678,7 +6740,7 @@ impl lightnet_cuda::DenseLossBackend for OxideBackend {
         // SAFETY: one thread per sample owns its output/truth reads and its
         // per-sample loss/suppressed slots; the delta slots are disjoint.
         unsafe {
-            self.layers_extra.segmentation_loss(
+            self.dense_loss.segmentation_loss(
                 &self.stream,
                 launch::elementwise(batch, config),
                 &output.buf,
@@ -6716,7 +6778,7 @@ impl lightnet_cuda::DenseLossBackend for OxideBackend {
         }
         // SAFETY: one thread per delta element.
         unsafe {
-            self.layers_extra.segmentation_scale_delta(
+            self.dense_loss.segmentation_scale_delta(
                 &self.stream,
                 launch::elementwise(total, config),
                 &mut delta,
@@ -7379,7 +7441,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: one thread writes each output element; shape and dimensions
         // have been validated and each thread's channel loop stays in bounds.
         unsafe {
-            self.layers_extra.normalize_channels(
+            self.normalize_channels.normalize_channels(
                 &self.stream,
                 launch::elementwise(total, config),
                 &input.buf,
@@ -7438,7 +7500,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: one thread writes each gradient element; all tensor lengths
         // and nonzero geometry were checked above.
         unsafe {
-            self.layers_extra.normalize_channels_backward(
+            self.normalize_channels.normalize_channels_backward(
                 &self.stream,
                 launch::elementwise(total, config),
                 &activation_input.buf,
@@ -7507,7 +7569,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: one thread owns each output index; input extents and shapes
         // match the validated nonempty output extent above.
         unsafe {
-            self.layers_extra.eml_convolutional_forward(
+            self.eml.eml_convolutional_forward(
                 &self.stream,
                 launch::elementwise(total, config),
                 &x.buf,
@@ -7576,7 +7638,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: each thread writes matching positions in both gradients;
         // the three input extents and shapes have been checked above.
         unsafe {
-            self.layers_extra.eml_convolutional_backward(
+            self.eml.eml_convolutional_backward(
                 &self.stream,
                 launch::elementwise(total, config),
                 &x.buf,
@@ -7654,7 +7716,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut cell_gradient = self.alloc_uninit(elements)?;
         // SAFETY: one thread owns the same element across five disjoint outputs.
         unsafe {
-            self.layers_extra.lstm_gate_backward(
+            self.recurrent.lstm_gate_backward(
                 &self.stream,
                 launch::elementwise(elements, config),
                 &hidden_gradient.buf,
@@ -7736,7 +7798,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut output = self.alloc_uninit(step_elements)?;
         // SAFETY: checked shapes and step index keep this copy within input.
         unsafe {
-            self.layers_extra.sequence_slice_step(
+            self.recurrent.sequence_slice_step(
                 &self.stream,
                 launch::elementwise(step_elements, config),
                 &input.buf,
@@ -7795,7 +7857,7 @@ impl F32TensorOpsBackend for OxideBackend {
                 .ok_or_else(|| shape_err(op, "step output offset overflow".to_owned()))?;
             // SAFETY: each ordered launch writes a distinct output slice.
             unsafe {
-                self.layers_extra.sequence_concat_step(
+                self.recurrent.sequence_concat_step(
                     &self.stream,
                     launch::elementwise(step_elements, config),
                     &input.buf,
@@ -7990,7 +8052,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: one thread owns each coefficient slot and reads only the
         // validated delta/source extents.
         unsafe {
-            self.layers_extra.shortcut_weight_gradient(
+            self.shortcut.shortcut_weight_gradient(
                 &self.stream,
                 launch::elementwise(layer_step, config),
                 &delta.buf,
@@ -8062,7 +8124,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: one thread writes each output coefficient; all input extents
         // and source-row bounds are validated above.
         unsafe {
-            self.layers_extra.shortcut_weight_gradient_accumulate(
+            self.shortcut.shortcut_weight_gradient_accumulate(
                 &self.stream,
                 launch::elementwise(total, config),
                 &accumulated.buf,
@@ -8121,7 +8183,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: one thread owns each result coefficient; input rows and slots
         // are bounded by the validated total length.
         unsafe {
-            self.layers_extra.shortcut_weight_normalized_gradient(
+            self.shortcut.shortcut_weight_normalized_gradient(
                 &self.stream,
                 launch::elementwise(total, config),
                 &raw_weights.buf,
@@ -9401,7 +9463,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut logits = self.alloc_uninit(batch * experts)?;
         // SAFETY: one thread per (sample, expert) logit, each uniquely written.
         unsafe {
-            self.layers_extra.moe_router_logits(
+            self.moe.moe_router_logits(
                 &self.stream,
                 launch::elementwise(logits.len(), config),
                 &input.buf,
@@ -9419,7 +9481,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut gates = self.alloc_uninit(batch * experts)?;
         // SAFETY: one thread per batch row, each uniquely writes `experts` gates.
         unsafe {
-            self.layers_extra.moe_router_softmax_topk(
+            self.moe.moe_router_softmax_topk(
                 &self.stream,
                 launch::elementwise(batch, config),
                 &logits,
@@ -9462,7 +9524,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut pooled = self.alloc_uninit(batch * channels)?;
         // SAFETY: one thread uniquely writes one sample/channel descriptor.
         unsafe {
-            self.layers_extra.moe_router_pool(
+            self.moe.moe_router_pool(
                 &self.stream,
                 launch::elementwise(batch * channels, config),
                 &input.buf,
@@ -9510,7 +9572,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut input_gradient = self.alloc_uninit(batch * channels * spatial)?;
         // SAFETY: one thread uniquely writes one input-gradient element.
         unsafe {
-            self.layers_extra.moe_router_pool_backward(
+            self.moe.moe_router_pool_backward(
                 &self.stream,
                 launch::elementwise(input_gradient.len(), config),
                 &pooled_gradient.buf,
@@ -9554,7 +9616,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut partial = self.alloc_uninit(batch * 256)?;
         // SAFETY: one thread owns each (sample, reduction-lane) partial.
         unsafe {
-            self.layers_extra.moe_gate_dot_partial(
+            self.moe.moe_gate_dot_partial(
                 &self.stream,
                 launch::elementwise(batch * 256, config),
                 &output_gradient.buf,
@@ -9568,7 +9630,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut dots = self.alloc_uninit(batch)?;
         // SAFETY: one thread uniquely folds each sample's 256 partial sums.
         unsafe {
-            self.layers_extra.moe_gate_dot_reduce(
+            self.moe.moe_gate_dot_reduce(
                 &self.stream,
                 launch::elementwise(batch, config),
                 &partial,
@@ -9601,7 +9663,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut column = self.alloc_uninit(batch)?;
         // SAFETY: one thread per sample reads its gate and writes one column element.
         unsafe {
-            self.layers_extra.moe_gate_column(
+            self.moe.moe_gate_column(
                 &self.stream,
                 launch::elementwise(batch, config),
                 &gates.buf,
@@ -9666,7 +9728,7 @@ impl F32TensorOpsBackend for OxideBackend {
             // SAFETY: one thread owns each (sample, reduction-lane) partial. The
             // workspace is reused on the same stream before folding this expert.
             unsafe {
-                self.layers_extra.moe_gate_dot_partial(
+                self.moe.moe_gate_dot_partial(
                     &self.stream,
                     launch::elementwise(batch * 256, config),
                     &output_gradient.buf,
@@ -9679,7 +9741,7 @@ impl F32TensorOpsBackend for OxideBackend {
             .map_err(launch_err)?;
             // SAFETY: each expert launch writes a disjoint column of the dots matrix.
             unsafe {
-                self.layers_extra.moe_gate_dot_reduce_column(
+                self.moe.moe_gate_dot_reduce_column(
                     &self.stream,
                     launch::elementwise(batch, config),
                     &partial,
@@ -9693,7 +9755,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut dlogit = self.alloc_uninit(gate_count)?;
         // SAFETY: one thread owns one complete batch row of router derivatives.
         unsafe {
-            self.layers_extra.moe_router_gate_backward(
+            self.moe.moe_router_gate_backward(
                 &self.stream,
                 launch::elementwise(batch, config),
                 &gates.buf,
@@ -11510,7 +11572,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: one thread per output element; reads stay inside `x`
         // (`i < from_len`, `b < batch`).
         unsafe {
-            self.layers_extra.shortcut_fit(
+            self.shortcut.shortcut_fit(
                 &self.stream,
                 launch::elementwise(out_len, config),
                 &x.buf,
@@ -11585,7 +11647,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: one query thread writes its unique head-channel interval in
         // `out` and its unique flattened query index in `lse`.
         unsafe {
-            self.layers_extra.flash_attention_forward(
+            self.attention.flash_attention_forward(
                 &self.stream,
                 launch::elementwise(lse_len, ElementwiseLaunchConfig::default()),
                 &qkv.buf,
@@ -11673,7 +11735,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: validated NCHW extents bound each input/type-embedding read;
         // each thread writes a distinct token feature and h=0 writes one mask.
         unsafe {
-            self.layers_extra.laya_head_prepare(
+            self.laya.laya_head_prepare(
                 &self.stream,
                 launch::elementwise(output_len, config),
                 &input.buf,
@@ -11730,7 +11792,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut output = self.alloc_uninit(expected_len)?;
         // SAFETY: checked equal lengths make the channel-major index map valid.
         unsafe {
-            self.layers_extra.laya_head_pack(
+            self.laya.laya_head_pack(
                 &self.stream,
                 launch::elementwise(expected_len, config),
                 &tokens.buf,
@@ -11787,7 +11849,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut output = self.alloc_uninit(len)?;
         // SAFETY: exact tensor extents bound the channel-major gather indices.
         unsafe {
-            self.layers_extra.laya_scorer_unpack(
+            self.laya.laya_scorer_unpack(
                 &self.stream,
                 launch::elementwise(len, config),
                 &input.buf,
@@ -11832,7 +11894,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut output = self.alloc_uninit(len)?;
         // SAFETY: logits/output lengths are equal and every thread owns one slot.
         unsafe {
-            self.layers_extra.laya_scorer_pack(
+            self.laya.laya_scorer_pack(
                 &self.stream,
                 launch::elementwise(len, config),
                 &logits.buf,
@@ -11894,7 +11956,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut mask = self.alloc_uninit(rows)?;
         // SAFETY: exact checked lengths bound each clamped id and mask read.
         unsafe {
-            self.layers_extra.laya_encoder_embed(
+            self.laya.laya_encoder_embed(
                 &self.stream,
                 launch::elementwise(len, config),
                 &input.buf,
@@ -11985,7 +12047,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut output = self.alloc_uninit(output_len)?;
         // SAFETY: validated dimensions bound every QKV, mask, RoPE and output access.
         unsafe {
-            self.layers_extra.laya_encoder_attention(
+            self.laya.laya_encoder_attention(
                 &self.stream,
                 launch::elementwise(query_heads, config),
                 &qkv.buf,
@@ -12033,7 +12095,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut output = self.alloc_uninit(output_len)?;
         // SAFETY: checked 2I input and I output rows bound every chunk access.
         unsafe {
-            self.layers_extra.laya_encoder_geglu(
+            self.laya.laya_encoder_geglu(
                 &self.stream,
                 launch::elementwise(output_len, config),
                 &input.buf,
@@ -12078,7 +12140,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut output = self.alloc_uninit(len)?;
         // SAFETY: equal checked extents bound the token/channel-major permutation.
         unsafe {
-            self.layers_extra.laya_encoder_pack(
+            self.laya.laya_encoder_pack(
                 &self.stream,
                 launch::elementwise(len, config),
                 &tokens.buf,
@@ -12161,7 +12223,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut output = self.alloc_uninit(len)?;
         // SAFETY: equal extents bound all row/channel/option transpose indices.
         unsafe {
-            self.layers_extra.laya_scorer_pack_input_grad(
+            self.laya.laya_scorer_pack_input_grad(
                 &self.stream,
                 launch::elementwise(len, config),
                 &rows.buf,
@@ -12238,7 +12300,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: checked dimensions bound every Q/K/V/mask access, and one
         // query/head thread exclusively writes its output channel interval.
         unsafe {
-            self.layers_extra.laya_head_attention_forward(
+            self.laya.laya_head_attention_forward(
                 &self.stream,
                 launch::elementwise(query_count, config),
                 &qkv_f.buf,
@@ -12323,7 +12385,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut row_dot = self.alloc_uninit(lse_len)?;
         // SAFETY: each query/head thread writes its Q row and D_i scalar.
         unsafe {
-            self.layers_extra.flash_attention_backward_dq(
+            self.attention.flash_attention_backward_dq(
                 &self.stream,
                 launch::elementwise(lse_len, ElementwiseLaunchConfig::default()),
                 &qkv_f.buf,
@@ -12342,7 +12404,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: each key/head thread writes its K and V rows, disjoint from dQ
         // and from every other key/head row in the fused gradient buffer.
         unsafe {
-            self.layers_extra.flash_attention_backward_dkdv(
+            self.attention.flash_attention_backward_dkdv(
                 &self.stream,
                 launch::elementwise(lse_len, ElementwiseLaunchConfig::default()),
                 &qkv_f.buf,
@@ -12389,7 +12451,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut out = self.alloc_uninit(x.len())?;
         // SAFETY: one thread per group, each owning its `group_size` outputs.
         unsafe {
-            self.layers_extra.softmax_forward(
+            self.softmax.softmax_forward(
                 &self.stream,
                 launch::elementwise(n_groups, config),
                 &x.buf,
@@ -12435,7 +12497,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut dx = self.alloc_uninit(output.len())?;
         // SAFETY: one thread per group, each owning its `group_size` outputs.
         unsafe {
-            self.layers_extra.softmax_backward(
+            self.softmax.softmax_backward(
                 &self.stream,
                 launch::elementwise(n_groups, config),
                 &output.buf,
@@ -12478,7 +12540,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: validated dimensions make the channel/spatial mapping valid;
         // one thread writes one disjoint output element.
         unsafe {
-            self.layers_extra.centernet_forward(
+            self.dense_loss.centernet_forward(
                 &self.stream,
                 launch::elementwise(x.len(), config),
                 &x.buf,
@@ -12521,7 +12583,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: validated dimensions make the channel/spatial mapping valid;
         // one thread writes one disjoint output element.
         unsafe {
-            self.layers_extra.modern_yolo_forward(
+            self.dense_loss.modern_yolo_forward(
                 &self.stream,
                 launch::elementwise(x.len(), config),
                 &x.buf,
@@ -12566,7 +12628,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: validated dimensions ensure one thread per batch/pixel owns
         // exactly one slot in every class plane.
         unsafe {
-            self.layers_extra.segmentation_forward(
+            self.dense_loss.segmentation_forward(
                 &self.stream,
                 launch::elementwise(pixels, config),
                 &x.buf,
@@ -12617,7 +12679,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: every sample/group owns a disjoint candidate range in the
         // selected storage layout.
         unsafe {
-            self.layers_extra.jev_ce_forward(
+            self.dense_loss.jev_ce_forward(
                 &self.stream,
                 launch::elementwise(work, config),
                 &x.buf,
@@ -12658,7 +12720,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: validated batch/options spans are disjoint; one thread owns
         // one complete sample row.
         unsafe {
-            self.layers_extra.laya_loss_forward(
+            self.dense_loss.laya_loss_forward(
                 &self.stream,
                 launch::elementwise(shape[0], config),
                 &x.buf,
@@ -12706,7 +12768,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: shape and Region layout checks establish valid input/output
         // rows; one thread writes one disjoint anchor/location row.
         unsafe {
-            self.layers_extra.region_forward(
+            self.dense_loss.region_forward(
                 &self.stream,
                 launch::elementwise(groups, config),
                 &x.buf,
@@ -12763,7 +12825,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: each anchor/location thread writes unique channel-major input
         // slots, and the output/gradient storage shapes were checked above.
         unsafe {
-            self.layers_extra.region_backward(
+            self.dense_loss.region_backward(
                 &self.stream,
                 launch::elementwise(groups, config),
                 &output.buf,
@@ -12857,7 +12919,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut out = self.alloc_uninit(x.len())?;
         // SAFETY: one thread per output element; every source index is < x.len() by the shape check.
         unsafe {
-            self.layers_extra.channel_permute(
+            self.channel_shuffle.channel_permute(
                 &self.stream,
                 launch::elementwise(x.len(), config),
                 &x.buf,
@@ -12950,7 +13012,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: dimensions/storage are checked, and each thread writes one
         // unique output element while reading only in-bounds source values.
         unsafe {
-            self.layers_extra.laya_act_cls_scatter(
+            self.laya.laya_act_cls_scatter(
                 &self.stream,
                 launch::elementwise(full_len, config),
                 &dcls_f.buf,
@@ -12991,7 +13053,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: positive checked shapes/products bound all source reads;
         // each sample thread owns an entire disjoint output row.
         unsafe {
-            self.layers_extra.laya_act_features(
+            self.laya.laya_act_features(
                 &self.stream,
                 launch::elementwise(d.batch, config),
                 &head_f.buf,
@@ -13037,7 +13099,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: checked dimensions/storage bound every feature and marker index;
         // one thread owns each output element.
         unsafe {
-            self.layers_extra.marker_gather(
+            self.laya.marker_gather(
                 &self.stream,
                 launch::elementwise(d.output_len, config),
                 &features_f.buf,
@@ -13080,7 +13142,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut dx = self.alloc_uninit(d.input_len)?;
         // SAFETY: validated layout bounds reads and one thread owns each dx.
         unsafe {
-            self.layers_extra.marker_gather_backward(
+            self.laya.marker_gather_backward(
                 &self.stream,
                 launch::elementwise(d.input_len, config),
                 &markers_f.buf,
@@ -13123,7 +13185,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut mask = self.alloc_uninit(x.len())?;
         // SAFETY: one thread per element writes its own `out` and `mask` slot.
         unsafe {
-            self.layers_extra.dropout_forward(
+            self.dropout.dropout_forward(
                 &self.stream,
                 launch::elementwise(x.len(), config),
                 &x.buf,
@@ -13162,7 +13224,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut dx = self.alloc_uninit(output_grad.len())?;
         // SAFETY: one thread per element.
         unsafe {
-            self.layers_extra.dropout_backward(
+            self.dropout.dropout_backward(
                 &self.stream,
                 launch::elementwise(dx.len(), config),
                 &output_grad.buf,
@@ -13211,7 +13273,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: stage 1 writes only its own plane of `keep` and slot of
         // `dropped`; stage 2 one `scales` slot per sample; stage 3 one element.
         unsafe {
-            self.layers_extra.dropblock_plane(
+            self.dropout.dropblock_plane(
                 &self.stream,
                 launch::elementwise(planes, config),
                 &mut keep,
@@ -13226,7 +13288,7 @@ impl F32TensorOpsBackend for OxideBackend {
         .map_err(launch_err)?;
         // SAFETY: see above.
         unsafe {
-            self.layers_extra.dropblock_scales(
+            self.dropout.dropblock_scales(
                 &self.stream,
                 launch::elementwise(n, config),
                 &dropped,
@@ -13238,7 +13300,7 @@ impl F32TensorOpsBackend for OxideBackend {
         .map_err(launch_err)?;
         // SAFETY: see above.
         unsafe {
-            self.layers_extra.dropblock_apply(
+            self.dropout.dropblock_apply(
                 &self.stream,
                 launch::elementwise(x.len(), config),
                 &x.buf,
@@ -13685,7 +13747,7 @@ impl F32TensorOpsBackend for OxideBackend {
         // SAFETY: one thread per output element; scale index is in range by
         // the layout check.
         unsafe {
-            self.layers_extra.scale_channels_forward(
+            self.scale_channels.scale_channels_forward(
                 &self.stream,
                 launch::elementwise(out.len(), config),
                 &scale.buf,
@@ -13722,7 +13784,7 @@ impl F32TensorOpsBackend for OxideBackend {
         let mut d_scale = self.alloc_uninit(scale.len())?;
         // SAFETY: one thread per `d_src` element / per scale element.
         unsafe {
-            self.layers_extra.scale_channels_dsource(
+            self.scale_channels.scale_channels_dsource(
                 &self.stream,
                 launch::elementwise(d_src.len(), config),
                 &delta.buf,
@@ -13736,7 +13798,7 @@ impl F32TensorOpsBackend for OxideBackend {
         .map_err(launch_err)?;
         // SAFETY: as above; each scale element is owned by one thread.
         unsafe {
-            self.layers_extra.scale_channels_dscale(
+            self.scale_channels.scale_channels_dscale(
                 &self.stream,
                 launch::elementwise(d_scale.len(), config),
                 &delta.buf,
