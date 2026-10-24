@@ -2621,8 +2621,9 @@ the cached pre-activation and the layer output. The whole-network CPU fallback
 now triggers only for unmapped `Other` activations, which config parsing
 rejects; every parsed deconvolution activation is native.
 
-Known limits: compact/f16 deconvolution is still unsupported, optimizer
-parameters and gradients remain host-staged, and no compiled-C++ golden exists.
+Known limits at that increment: f16 deconvolution was still unsupported
+(compact f32 landed in v0.2.194, §258), optimizer parameters and gradients
+remain host-staged, and no compiled-C++ golden exists.
 
 Evidence: `cargo xtask test deconvolutional` 9 of 9; the
 channel-normalization config test passes; `cargo xtask oxide --test
@@ -2631,3 +2632,22 @@ channel-normalization SGD parity for all three modes; `cargo xtask gpu-check`
 clean; `cargo xtask clippy` completed with pre-existing warnings only. Runs
 were uncapped (`systemd-run --user` unavailable), `-j 2`. No training run and no
 full-suite claim. Tag `v0.2.193`.
+
+## 258. Deconvolution in compact inference
+
+v0.2.194. `forward_compact` now executes `[deconvolutional]` on the native f32
+path instead of rejecting it. The compact arm uploads the layer weights, runs
+the transposed convolution, adds the filter biases, then applies either the
+activation or the matching channel-normalization kernel. It shares the existing
+f32 deconvolution and normalization primitives with the full forward, so all
+parsed activations, including `NormalizeChannels*`, stay on the device.
+
+Known limits: compact f16 deconvolution is still unsupported, optimizer
+parameters and gradients remain host-staged, and no compiled-C++ golden exists.
+
+Evidence: the new actual-Oxide `compact_deconvolution_matches_cpu` test passes
+for `linear`, `leaky`, and all three channel-normalization modes;
+`cargo xtask test deconvolutional` 9 of 9; `cargo xtask gpu-check` clean;
+`cargo xtask clippy` completed with pre-existing warnings only. Runs were
+uncapped (`systemd-run --user` unavailable), `-j 2`. No training run and no
+full-suite claim. Tag `v0.2.194`.
