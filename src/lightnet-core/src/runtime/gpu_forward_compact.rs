@@ -188,64 +188,24 @@ where
                         current_input.expect("GraphConv requires current input"),
                         launch_config,
                     )?,
-                (LayerKind::MaxPool(spec), LayerParams::None) => {
-                    let maxpool_input = current_input.expect("maxpool requires current input");
-                    if spec.depth {
-                        self.backend.maxpool_depth_f32(
-                            maxpool_input,
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.input_shape.channels,
-                            launch_config,
-                        )
-                    } else {
-                        self.backend.maxpool_f32(
-                            maxpool_input,
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.input_shape.channels,
-                            layer.input_shape.height,
-                            layer.input_shape.width,
-                            spec.size,
-                            spec.stride_x,
-                            spec.stride_y,
-                            spec.padding,
-                            launch_config,
-                        )
-                    }
-                    .map_err(|err| backend_error("maxpool", err))?
-                }
-                (LayerKind::LocalAvgPool(spec), LayerParams::None) => {
-                    if layer.output_shape.channels != layer.input_shape.channels {
-                        return Err(Error::UnsupportedLayer {
-                            layer_index: layer.index,
-                            name: "local_avgpool_depth".to_owned(),
-                        });
-                    }
-                    self.backend
-                        .local_avgpool_f32(
-                            current_input.expect("local_avgpool requires current input"),
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.input_shape.channels,
-                            layer.input_shape.height,
-                            layer.input_shape.width,
-                            spec.size,
-                            spec.stride_x,
-                            spec.stride_y,
-                            spec.padding,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("local_avgpool", err))?
-                }
-                (LayerKind::AvgPool, LayerParams::None) => self
-                    .backend
-                    .avgpool_f32(
-                        current_input.expect("avgpool requires current input"),
-                        &tensor_backend_shape(layer.output_shape),
-                        layer.input_shape.channels,
-                        layer.input_shape.height,
-                        layer.input_shape.width,
+                (LayerKind::MaxPool(spec), LayerParams::None) => self.forward_maxpool_gpu(
+                    layer,
+                    spec,
+                    current_input.expect("maxpool requires current input"),
+                    launch_config,
+                )?,
+                (LayerKind::LocalAvgPool(spec), LayerParams::None) => self
+                    .forward_local_avgpool_gpu(
+                        layer,
+                        spec,
+                        current_input.expect("local_avgpool requires current input"),
                         launch_config,
-                    )
-                    .map_err(|err| backend_error("avgpool", err))?,
+                    )?,
+                (LayerKind::AvgPool, LayerParams::None) => self.forward_avgpool_gpu(
+                    layer,
+                    current_input.expect("avgpool requires current input"),
+                    launch_config,
+                )?,
                 (LayerKind::BatchNorm(_), LayerParams::BatchNorm(params)) => self
                     .forward_batchnorm_inference_gpu(
                         current_input.expect("batchnorm requires current input"),
@@ -254,45 +214,7 @@ where
                         launch_config,
                     )?,
                 (LayerKind::Route(spec), LayerParams::None) => {
-                    let mut route_inputs = Vec::with_capacity(spec.layers.len());
-                    let mut route_channel_offsets = Vec::with_capacity(spec.layers.len());
-                    let mut route_channels = Vec::with_capacity(spec.layers.len());
-                    let mut route_total_channels = Vec::with_capacity(spec.layers.len());
-                    for raw_index in &spec.layers {
-                        let source_index = resolve_relative_layer(layer.index, *raw_index)?;
-                        let source = gpu_layer_outputs
-                            .get(source_index)
-                            .and_then(Option::as_ref)
-                            .ok_or(Error::InvalidRoute {
-                                layer_index: layer.index,
-                                reference: *raw_index,
-                            })?;
-                        let source_layer =
-                            self.network.layers.get(source_index).ok_or_else(|| {
-                                Error::InvalidConfig(format!(
-                                    "missing source layer #{source_index} for route layer #{}",
-                                    layer.index
-                                ))
-                            })?;
-                        let chunk_channels =
-                            source_layer.output_shape.channels / spec.groups.max(1);
-                        route_inputs.push(source);
-                        route_channel_offsets.push(chunk_channels * spec.group_id);
-                        route_channels.push(chunk_channels);
-                        route_total_channels.push(source_layer.output_shape.channels);
-                    }
-
-                    self.backend
-                        .route_concat_f32(
-                            &route_inputs,
-                            &route_channel_offsets,
-                            &route_channels,
-                            &route_total_channels,
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.output_shape.width * layer.output_shape.height,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("route concat", err))?
+                    self.forward_route_compact_gpu(layer, spec, &gpu_layer_outputs, launch_config)?
                 }
                 (LayerKind::LayaMarkerGather(spec), LayerParams::None) => {
                     let a_index = resolve_relative_layer(layer.index, spec.layers[0])?;
@@ -618,50 +540,20 @@ where
                         current_input.expect("Connected requires current input"),
                         launch_config,
                     )?,
-                (LayerKind::ScaleChannels(spec), LayerParams::None) => {
-                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
-                    let source = gpu_layer_outputs
-                        .get(source_index)
-                        .and_then(Option::as_ref)
-                        .ok_or(Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: spec.from,
-                        })?;
-                    let pre_activation = self
-                        .backend
-                        .scale_channels_f32(
-                            current_input.expect("ScaleChannels requires current input"),
-                            source,
-                            &tensor_backend_shape(layer.output_shape),
-                            spec.scale_wh,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("GPU ScaleChannels compact", err))?;
-                    self.backend
-                        .activation_f32(
-                            &pre_activation,
-                            gpu_activation_kind(layer.index, &spec.activation)?,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("GPU ScaleChannels compact activation", err))?
-                }
-                (LayerKind::Reorg(spec), LayerParams::None) => {
-                    if spec.stride == 0 {
-                        return Err(Error::InvalidConfig(
-                            "reorg stride cannot be zero".to_owned(),
-                        ));
-                    }
-                    self.backend
-                        .reorg_f32(
-                            current_input.expect("Reorg requires current input"),
-                            &tensor_backend_shape(layer.input_shape),
-                            &tensor_backend_shape(layer.output_shape),
-                            spec.stride,
-                            spec.reverse,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("GPU Reorg compact forward", err))?
-                }
+                (LayerKind::ScaleChannels(spec), LayerParams::None) => self
+                    .forward_scale_channels_compact_gpu(
+                        layer,
+                        spec,
+                        &gpu_layer_outputs,
+                        current_input.expect("ScaleChannels requires current input"),
+                        launch_config,
+                    )?,
+                (LayerKind::Reorg(spec), LayerParams::None) => self.forward_reorg_compact_gpu(
+                    layer,
+                    spec,
+                    current_input.expect("Reorg requires current input"),
+                    launch_config,
+                )?,
                 (LayerKind::ChannelShuffle(spec), LayerParams::None) => self
                     .backend
                     .channel_shuffle_f32(
@@ -672,28 +564,8 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("GPU ChannelShuffle compact forward", err))?,
-                (LayerKind::ChannelSlice(spec), LayerParams::None) => {
-                    let source_index = resolve_relative_layer(layer.index, spec.from)?;
-                    let source = gpu_layer_outputs
-                        .get(source_index)
-                        .and_then(Option::as_ref)
-                        .ok_or(Error::InvalidRoute {
-                            layer_index: layer.index,
-                            reference: spec.from,
-                        })?;
-                    let source_channels = self.network.layers[source_index].output_shape.channels;
-                    self.backend
-                        .route_concat_f32(
-                            &[source],
-                            &[spec.start],
-                            &[spec.end - spec.start],
-                            &[source_channels],
-                            &tensor_backend_shape(layer.output_shape),
-                            layer.output_shape.width * layer.output_shape.height,
-                            launch_config,
-                        )
-                        .map_err(|err| backend_error("GPU ChannelSlice compact forward", err))?
-                }
+                (LayerKind::ChannelSlice(spec), LayerParams::None) => self
+                    .forward_channel_slice_compact_gpu(layer, spec, &gpu_layer_outputs, launch_config)?,
                 (LayerKind::Logistic, LayerParams::None) => self
                     .backend
                     .activation_f32(

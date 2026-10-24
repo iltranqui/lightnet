@@ -2,7 +2,8 @@
 use crate::error::{Error, Result};
 use crate::model::{Layer, ScaleChannelsSpec};
 use crate::runtime::{
-    GpuExecutableNetwork, backend_error, forward_scale_channels, resolve_relative_layer,
+    GpuExecutableNetwork, backend_error, forward_scale_channels, gpu_activation_kind,
+    resolve_relative_layer,
     tensor_backend_shape,
 };
 use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
@@ -87,5 +88,43 @@ where
                 .map_err(|err| backend_error("upload scale_channels output", err))?;
             Ok((output, activation_cache))
         }
+    }
+
+    /// Compact inference forward of `[scale_channels]`.
+    pub(crate) fn forward_scale_channels_compact_gpu(
+        &self,
+        layer: &Layer,
+        spec: &ScaleChannelsSpec,
+        gpu_layer_outputs: &[Option<B::Tensor>],
+        current_input: &B::Tensor,
+        launch_config: ElementwiseLaunchConfig,
+    ) -> Result<B::Tensor> {
+        let source_index = resolve_relative_layer(layer.index, spec.from)?;
+        let source = gpu_layer_outputs
+            .get(source_index)
+            .and_then(Option::as_ref)
+            .ok_or(Error::InvalidRoute {
+                layer_index: layer.index,
+                reference: spec.from,
+            })?;
+        let pre_activation = self
+            .backend
+            .scale_channels_f32(
+                current_input,
+                source,
+                &tensor_backend_shape(layer.output_shape),
+                spec.scale_wh,
+                launch_config,
+            )
+            .map_err(|err| backend_error("GPU ScaleChannels compact", err))?;
+        let output = self
+            .backend
+            .activation_f32(
+                &pre_activation,
+                gpu_activation_kind(layer.index, &spec.activation)?,
+                launch_config,
+            )
+            .map_err(|err| backend_error("GPU ScaleChannels compact activation", err))?;
+        Ok(output)
     }
 }
