@@ -2695,3 +2695,28 @@ gradient parity check; `cargo xtask gpu-check` clean; `cargo xtask clippy`
 completed with pre-existing warnings only. Runs were uncapped
 (`systemd-run --user` unavailable), `-j 2`. No training run and no full-suite
 claim. Tag `v0.2.196`.
+
+## 261. Native Segmentation loss and delta
+
+v0.2.197. Added `DenseLossBackend::segmentation_loss_f32` and
+`GpuExecutableNetwork::compute_segmentation_training_loss_gpu`. The first kernel
+runs one thread per sample, computing per-pixel binary or softmax
+cross-entropy, the `truth - prediction` delta, `lambda_ce * ce_normalizer *
+cls_normalizer`, and the correct-pixel gate weight; it also writes per-sample
+loss and suppressed-pixel counts. The host sums those small vectors to get the
+mean loss and the gate compensation `min(total / active,
+gate_max_compensation)`. A second device kernel applies compensation and
+`max_delta` clipping to the delta. Both `classes=1` BCE and `classes>1`
+softmax CE are covered, with and without gating.
+
+Known limits: only JevCe and Segmentation are native; CenterNet, modern-YOLO
+and LayaLoss still use the host dense-loss path. The CLI's dense-head training
+entry points are not wired to the new methods yet, and no compiled-C++ golden
+exists.
+
+Evidence: `cargo xtask oxide --test oxide_runtime_chain segmentation_native`
+3 of 3, including gated binary loss/delta and seeded-backward weight/bias
+gradient parity, plus gated softmax loss/delta parity; `cargo xtask gpu-check`
+clean; `cargo xtask clippy` completed with pre-existing warnings only. Runs were
+uncapped (`systemd-run --user` unavailable), `-j 2`. No training run and no
+full-suite claim. Tag `v0.2.197`.

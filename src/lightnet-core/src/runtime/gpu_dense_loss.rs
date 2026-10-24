@@ -1,10 +1,10 @@
 use super::*;
 
-/// Device-side dense-head loss for `[jev_ce]`.
+/// Device-side dense-head loss for `[jev_ce]` and `[segmentation]`.
 ///
-/// Only the JevCe loss is native for now.  Layers without truth are skipped;
-/// any other dense-truth head with truth is rejected so the caller can use the
-/// host [`crate::dense_loss::compute_dense_training_loss`] path instead.
+/// Layers without truth are skipped; any other dense-truth head with truth is
+/// rejected so the caller can use the host
+/// [`crate::dense_loss::compute_dense_training_loss`] path instead.
 impl<B> GpuExecutableNetwork<B>
 where
     B: DenseLossBackend,
