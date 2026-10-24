@@ -1,7 +1,9 @@
 //! GPU-runtime glue for `[deconvolutional]`.
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::model::{DeconvolutionalSpec, Layer};
 use crate::runtime::{
+    GradMode,
+    GpuForwardState,
     ConvolutionalParams, GpuExecutableNetwork, activate, backend_error,
     deconvolutional_spec_is_native, gpu_activation_kind, tensor_backend_shape,
 };
@@ -192,5 +194,105 @@ where
                 )
                 .map_err(|err| backend_error("compact deconvolution activation", err))?
         })
+    }
+
+    /// Native deconvolution backward.
+    pub(crate) fn backward_deconvolutional_gpu(
+        &self,
+        layer: &Layer,
+        spec: &DeconvolutionalSpec,
+        params: &ConvolutionalParams,
+        forward: &GpuForwardState<B::Tensor>,
+        grad: B::Tensor,
+        config: ElementwiseLaunchConfig,
+        layer_output_gradients: &mut [Option<B::Tensor>],
+    ) -> Result<()> {
+        let activation_input = forward.gpu_layer_activation_inputs[layer.index]
+            .as_ref()
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing GPU activation cache for deconvolutional layer #{}",
+                    layer.index
+                ))
+            })?;
+        let delta = if let Some(normalization) =
+            spec.activation.to_channel_normalization()
+        {
+            self.backend
+                .normalize_channels_backward_f32(
+                    activation_input,
+                    &forward.gpu_layer_outputs[layer.index],
+                    &grad,
+                    &tensor_backend_shape(layer.output_shape),
+                    layer.output_shape.batch,
+                    layer.output_shape.channels,
+                    layer.output_shape.width * layer.output_shape.height,
+                    normalization,
+                    GradMode::from_env() == GradMode::Cpp,
+                    config,
+                )
+                .map_err(|err| {
+                    backend_error(
+                        "GPU deconvolution channel-normalization backward",
+                        err,
+                    )
+                })?
+        } else {
+            let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+            self.backend
+                .activation_backward_f32(activation_input, &grad, activation, config)
+                .map_err(|err| {
+                    backend_error("GPU deconvolution activation backward", err)
+                })?
+        };
+        let current_input = if layer.index == 0 {
+            &forward.input_gpu
+        } else {
+            forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing previous GPU layer output for deconvolutional layer #{}",
+                    layer.index
+                ))
+            })?
+        };
+        let weights = self
+            .backend
+            .upload_f32(
+                &[
+                    layer.input_shape.channels,
+                    spec.filters,
+                    spec.size,
+                    spec.size,
+                ],
+                &params.weights,
+            )
+            .map_err(|err| backend_error("upload deconvolutional weights", err))?;
+        let (input_grad, weight_grad, bias_grad) = self
+            .backend
+            .deconvolutional_backward_f32(
+                current_input,
+                &weights,
+                &delta,
+                &tensor_backend_shape(layer.input_shape),
+                &tensor_backend_shape(layer.output_shape),
+                spec.filters,
+                spec.size,
+                spec.stride,
+                config,
+            )
+            .map_err(|err| backend_error("GPU deconvolution backward", err))?;
+        self.accumulate_deconvolutional_host_gradients(
+            layer.index,
+            &weight_grad,
+            &bias_grad,
+            params.weights.len(),
+            params.biases.len(),
+        )?;
+        self.accumulate_previous_gpu_gradient(
+            layer.index,
+            input_grad,
+            layer_output_gradients,
+        )?;
+        Ok(())
     }
 }

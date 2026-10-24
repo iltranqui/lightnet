@@ -1,7 +1,9 @@
 //! GPU-runtime glue for `[local]`.
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::model::{Layer, LocalSpec};
 use crate::runtime::{
+    gpu_activation_kind,
+    GpuForwardState,
     GpuExecutableNetwork, LocalParams, backend_error, forward_local_with_cache,
     tensor_backend_shape,
 };
@@ -91,5 +93,84 @@ where
             }
         };
         Ok((output, activation_input_gpu))
+    }
+
+    /// Native locally-connected backward.
+    pub(crate) fn backward_local_gpu(
+        &self,
+        layer: &Layer,
+        spec: &LocalSpec,
+        params: &LocalParams,
+        forward: &GpuForwardState<B::Tensor>,
+        grad: B::Tensor,
+        config: ElementwiseLaunchConfig,
+        layer_output_gradients: &mut [Option<B::Tensor>],
+    ) -> Result<()> {
+        let activation_input = forward.gpu_layer_activation_inputs[layer.index]
+            .as_ref()
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing GPU activation cache for local layer #{}",
+                    layer.index
+                ))
+            })?;
+        let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+        let delta = self
+            .backend
+            .activation_backward_f32(activation_input, &grad, activation, config)
+            .map_err(|err| backend_error("GPU local activation backward", err))?;
+        let current_input = if layer.index == 0 {
+            &forward.input_gpu
+        } else {
+            forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing previous GPU layer output for local layer #{}",
+                    layer.index
+                ))
+            })?
+        };
+        let locations = layer.output_shape.width * layer.output_shape.height;
+        let weights = self
+            .backend
+            .upload_f32(
+                &[
+                    locations,
+                    spec.filters,
+                    layer.input_shape.channels,
+                    spec.size,
+                    spec.size,
+                ],
+                &params.weights,
+            )
+            .map_err(|err| backend_error("upload local weights", err))?;
+        let (input_grad, weight_grad, bias_grad) = self
+            .backend
+            .local_backward_f32(
+                current_input,
+                &weights,
+                &delta,
+                &tensor_backend_shape(layer.input_shape),
+                &tensor_backend_shape(layer.output_shape),
+                spec.filters,
+                spec.size,
+                spec.stride_x,
+                spec.stride_y,
+                spec.padding,
+                config,
+            )
+            .map_err(|err| backend_error("GPU local backward", err))?;
+        self.accumulate_local_host_gradients(
+            layer.index,
+            &weight_grad,
+            &bias_grad,
+            params.weights.len(),
+            params.biases.len(),
+        )?;
+        self.accumulate_previous_gpu_gradient(
+            layer.index,
+            input_grad,
+            layer_output_gradients,
+        )?;
+        Ok(())
     }
 }

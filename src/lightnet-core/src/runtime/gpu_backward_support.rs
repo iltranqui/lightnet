@@ -297,7 +297,7 @@ where
 
     /// Download and accumulate deconvolution gradients into the host optimizer
     /// buffers. The layer math stays native; the existing optimizer owns host params.
-    pub(super) fn accumulate_deconvolutional_host_gradients(
+    pub(crate) fn accumulate_deconvolutional_host_gradients(
         &self,
         layer_index: usize,
         weight_grad: &B::Tensor,
@@ -340,7 +340,7 @@ where
 
     /// Accumulate device-computed local gradients into the host optimizer
     /// buffers; each location retains its own weights and bias parameters.
-    pub(super) fn accumulate_local_host_gradients(
+    pub(crate) fn accumulate_local_host_gradients(
         &self,
         layer_index: usize,
         weight_grad: &B::Tensor,
@@ -384,7 +384,7 @@ where
     /// Accumulate a connected layer's host weight/bias gradient into its
     /// `LayerTrainBuffers` (the layer's parameters stay on the host; the
     /// optimizer's `update_cpu_fallback_weights` step consumes them).
-    pub(super) fn accumulate_connected_host_gradients(
+    pub(crate) fn accumulate_connected_host_gradients(
         &self,
         layer_index: usize,
         weight_grad: &B::Tensor,
@@ -420,7 +420,7 @@ where
         Ok(())
     }
 
-    pub(super) fn accumulate_eml_device_gradients(
+    pub(crate) fn accumulate_eml_device_gradients(
         &self,
         layer_index: usize,
         branch_slot: usize,

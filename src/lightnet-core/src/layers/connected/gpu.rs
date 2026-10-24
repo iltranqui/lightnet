@@ -2,6 +2,9 @@
 use crate::error::{Error, Result};
 use crate::model::{ConnectedSpec, Layer};
 use crate::runtime::{
+    LayerTrainBuffers,
+    validate_batchnorm_params,
+    GpuForwardState,
     BATCH_NORM_EPSILON, ConnectedParams, GpuExecutableNetwork, backend_error,
     forward_connected_with_cache, gpu_activation_kind, tensor_backend_shape,
 };
@@ -173,5 +176,210 @@ where
                 launch_config,
             )
             .map_err(|err| backend_error("compact connected activation", err))?)
+    }
+
+    /// Native fully-connected backward.
+    pub(crate) fn backward_connected_gpu(
+        &self,
+        layer: &Layer,
+        spec: &ConnectedSpec,
+        connected: &ConnectedParams,
+        forward: &GpuForwardState<B::Tensor>,
+        grad: B::Tensor,
+        config: ElementwiseLaunchConfig,
+        layer_output_gradients: &mut [Option<B::Tensor>],
+    ) -> Result<()> {
+        // The gradient chain stays on the device; only the connected
+        // GEMM itself runs on the host (`connected_backward_f32`).
+        let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+        let activation_input = forward.gpu_layer_activation_inputs[layer.index]
+            .as_ref()
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing GPU activation cache for connected layer #{}",
+                    layer.index
+                ))
+            })?;
+        let activation_delta = self
+            .backend
+            .activation_backward_f32(activation_input, &grad, activation, config)
+            .map_err(|err| backend_error("GPU connected activation backward", err))?;
+        let current_input = if layer.index == 0 {
+            &forward.input_gpu
+        } else {
+            forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing previous GPU layer output for connected layer #{}",
+                    layer.index
+                ))
+            })?
+        };
+        let inputs = layer.input_shape.element_count();
+        let weights_gpu = self
+            .backend
+            .upload_f32(&[spec.output, inputs], &connected.weights)
+            .map_err(|err| backend_error("upload connected weights", err))?;
+        let output_shape = tensor_backend_shape(layer.output_shape);
+        let (delta, bias_grad, batch_norm_scale_grad) =
+            if let Some(batch_norm) = connected.batch_norm.as_ref() {
+                validate_batchnorm_params(batch_norm, spec.output)?;
+                let batch = layer.input_shape.batch;
+                let reciprocal_std = batch_norm
+                    .rolling_variance
+                    .iter()
+                    .map(|variance| {
+                        1.0 / (variance + BATCH_NORM_EPSILON).sqrt()
+                    })
+                    .collect::<Vec<_>>();
+                let per_batch_reciprocal_std = (0..batch)
+                    .flat_map(|_| reciprocal_std.iter().copied())
+                    .collect::<Vec<_>>();
+                let centered_scale = batch_norm
+                    .rolling_mean
+                    .iter()
+                    .zip(&reciprocal_std)
+                    .map(|(mean, reciprocal)| -mean * reciprocal)
+                    .collect::<Vec<_>>();
+                let zero_bias = self
+                    .backend
+                    .zeros_f32(&[spec.output])
+                    .map_err(|err| backend_error("allocate connected raw bias", err))?;
+                let raw = self
+                    .backend
+                    .connected_f32(
+                        current_input,
+                        &weights_gpu,
+                        &zero_bias,
+                        batch,
+                        inputs,
+                        spec.output,
+                        config,
+                    )
+                    .map_err(|err| backend_error("connected raw output for BN backward", err))?;
+                let reciprocal_std_gpu = self
+                    .backend
+                    .upload_f32(&[batch, spec.output], &per_batch_reciprocal_std)
+                    .map_err(|err| backend_error("upload connected BN reciprocal std", err))?;
+                let scaled_raw = self
+                    .backend
+                    .scale_channels_f32(
+                        &reciprocal_std_gpu,
+                        &raw,
+                        &output_shape,
+                        false,
+                        config,
+                    )
+                    .map_err(|err| backend_error("connected BN scale raw", err))?;
+                let offset = self
+                    .backend
+                    .upload_f32(&[spec.output], &centered_scale)
+                    .map_err(|err| backend_error("upload connected BN center", err))?;
+                let normalized = self
+                    .backend
+                    .bias_add_f32(
+                        &scaled_raw,
+                        &offset,
+                        spec.output,
+                        1,
+                        config,
+                    )
+                    .map_err(|err| backend_error("connected BN normalization", err))?;
+                let scale_products = self
+                    .backend
+                    .vector_mul_f32(
+                        &activation_delta,
+                        &normalized,
+                        &output_shape,
+                        config,
+                    )
+                    .map_err(|err| backend_error("connected BN scale products", err))?;
+                let scale_gradient = self
+                    .backend
+                    .bias_backward_f32(&scale_products, spec.output, 1, config)
+                    .map_err(|err| backend_error("connected BN scale gradient", err))?;
+                let delta = self
+                    .backend
+                    .scale_channels_f32(
+                        &self
+                            .backend
+                            .upload_f32(
+                                &[batch, spec.output],
+                                &(0..batch)
+                                    .flat_map(|_| {
+                                        batch_norm
+                                            .scales
+                                            .iter()
+                                            .zip(&reciprocal_std)
+                                            .map(|(scale, reciprocal)| scale * reciprocal)
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                            .map_err(|err| backend_error("upload connected BN backward scales", err))?,
+                        &activation_delta,
+                        &output_shape,
+                        false,
+                        config,
+                    )
+                    .map_err(|err| backend_error("connected BN raw delta", err))?;
+                let bias_gradient = self
+                    .backend
+                    .bias_backward_f32(&activation_delta, spec.output, 1, config)
+                    .map_err(|err| backend_error("connected BN bias gradient", err))?;
+                (delta, bias_gradient, Some(scale_gradient))
+            } else {
+                (activation_delta, self.backend.zeros_f32(&[spec.output]).map_err(|err| backend_error("allocate connected bias gradient", err))?, None)
+            };
+        let (input_grad, weight_grad, computed_bias_grad) = self
+            .backend
+            .connected_backward_f32(
+                current_input,
+                &weights_gpu,
+                &delta,
+                layer.input_shape.batch,
+                inputs,
+                spec.output,
+                config,
+            )
+            .map_err(|err| backend_error("GPU connected backward", err))?;
+        let bias_grad = if connected.batch_norm.is_some() {
+            bias_grad
+        } else {
+            computed_bias_grad
+        };
+        self.accumulate_connected_host_gradients(
+            layer.index,
+            &weight_grad,
+            &bias_grad,
+            inputs,
+            spec.output,
+        )?;
+        if let Some(scale_gradient) = batch_norm_scale_grad {
+            let values = self
+                .backend
+                .download_f32(&scale_gradient)
+                .map_err(|err| backend_error("download connected BN scale gradient", err))?;
+            let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+            let Some(LayerTrainBuffers::Connected(train)) = buffers.get_mut(layer.index) else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing connected train buffers for BN layer #{}",
+                    layer.index
+                )));
+            };
+            let Some(batch_norm) = train.batch_norm.as_mut() else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing connected BN gradient buffer for layer #{}",
+                    layer.index
+                )));
+            };
+            for (slot, value) in batch_norm.scale_updates.iter_mut().zip(values) {
+                *slot += value;
+            }
+        }
+        self.accumulate_previous_gpu_gradient(
+            layer.index,
+            input_grad,
+            layer_output_gradients,
+        )?;
+        Ok(())
     }
 }

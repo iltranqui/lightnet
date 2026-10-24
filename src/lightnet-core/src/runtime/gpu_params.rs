@@ -5,7 +5,7 @@ where
     B: F32TensorOpsBackend,
     B::Error: std::fmt::Display,
 {
-    pub(super) fn batch_norm_scale_gradient_gpu(
+    pub(crate) fn batch_norm_scale_gradient_gpu(
         &self,
         raw_output: &B::Tensor,
         delta: &B::Tensor,
