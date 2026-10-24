@@ -4713,6 +4713,29 @@ pub trait F32TensorOpsBackend {
 /// from the backend's f32 tensors, so the runtime keeps one f32 source of
 /// truth (folded BN) and caches the converted f16 copy.
 #[allow(clippy::too_many_arguments)]
+/// Optional device loss kernels.  Kept separate from the core tensor-op
+/// traits so backends that only run inference do not have to implement them.
+pub trait DenseLossBackend: F32TensorOpsBackend {
+    /// Soft-target grouped cross-entropy for `[jev_ce]`: returns
+    /// `(mean_ce, scaled_delta)` over the same logits layout as the forward.
+    #[allow(clippy::too_many_arguments)]
+    fn jev_ce_loss_f32(
+        &self,
+        logits: &Self::Tensor,
+        truth: &Self::Tensor,
+        shape: &[usize],
+        groups: usize,
+        candidates: usize,
+        temperature: f32,
+        normalize: bool,
+        ignore_empty: bool,
+        label_smoothing: f32,
+        scale: f32,
+        channel_major: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(f32, Self::Tensor), Self::Error>;
+}
+
 pub trait F16TensorOpsBackend: F32TensorOpsBackend {
     /// `'static` so the runtime can cache it type-erased per layer.
     type TensorF16: Clone + 'static;
@@ -4730,6 +4753,7 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
         per_filter: usize,
     ) -> Result<Self::TensorF16, Self::Error>;
     /// `f16(activation(deconv(x, weights) + bias))`; `bias` is f32 `[filters]`.
+    #[allow(clippy::too_many_arguments)]
     fn deconvolutional_f16(
         &self,
         x: &Self::TensorF16,

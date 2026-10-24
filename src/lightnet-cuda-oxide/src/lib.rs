@@ -6346,6 +6346,92 @@ impl OxideBackend {
     }
 }
 
+impl lightnet_cuda::DenseLossBackend for OxideBackend {
+    fn jev_ce_loss_f32(
+        &self,
+        logits: &Self::Tensor,
+        truth: &Self::Tensor,
+        shape: &[usize],
+        groups: usize,
+        candidates: usize,
+        temperature: f32,
+        normalize: bool,
+        ignore_empty: bool,
+        label_smoothing: f32,
+        scale: f32,
+        channel_major: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(f32, Self::Tensor), Self::Error> {
+        let logits_f = self.f32v(logits)?;
+        let logits = &*logits_f;
+        let truth_f = self.f32v(truth)?;
+        let truth = &*truth_f;
+        const OP: &str = "jev_ce_loss_f32";
+        let batch = if shape.len() == 4 { shape[0] } else { 0 };
+        if shape.len() != 4
+            || batch == 0
+            || groups == 0
+            || candidates == 0
+            || groups
+                .checked_mul(candidates)
+                .and_then(|per_sample| per_sample.checked_mul(batch))
+                != Some(logits.len())
+            || logits.len() != truth.len()
+            || logits.shape() != shape
+            || truth.shape() != shape
+        {
+            return Err(shape_err(
+                OP,
+                format!(
+                    "incompatible JevCe shape/groups/candidates: {shape:?}, {groups}, {candidates}"
+                ),
+            ));
+        }
+        let work = batch * groups;
+        let mut delta = self.alloc_uninit(logits.len())?;
+        let mut losses = self.alloc(work)?;
+        let mut active = self.alloc(work)?;
+        // SAFETY: one thread per sample/group owns its candidate entries and
+        // its loss/active slot.
+        unsafe {
+            self.layers_extra.jev_ce_loss(
+                &self.stream,
+                launch::elementwise(work, config),
+                &logits.buf,
+                &truth.buf,
+                &mut delta,
+                &mut losses,
+                &mut active,
+                batch,
+                groups,
+                candidates,
+                temperature,
+                normalize as u32,
+                ignore_empty as u32,
+                label_smoothing,
+                scale,
+                channel_major as u32,
+            )
+        }
+        .map_err(launch_err)?;
+        let loss_host = losses.to_host_vec(&self.stream)?;
+        let active_host = active.to_host_vec(&self.stream)?;
+        let (mut sum, mut count) = (0.0f64, 0usize);
+        for (loss, active) in loss_host.iter().zip(&active_host) {
+            if *active != 0.0 {
+                sum += *loss as f64;
+                count += 1;
+            }
+        }
+        let mean = if count == 0 {
+            0.0
+        } else {
+            (sum / count as f64) as f32
+        };
+        Ok((mean, OxideTensorF32::new(delta, shape)))
+    }
+}
+
 impl F32TensorOpsBackend for OxideBackend {
     type Error = OxideError;
     type Tensor = OxideTensorF32;

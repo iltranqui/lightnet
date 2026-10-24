@@ -2437,6 +2437,154 @@ pub mod kernels {
         }
     }
 
+    /// One thread owns one `[jev_ce]` group: computes its softmax,
+    /// soft-target cross-entropy, and descent-direction delta.  `losses` and
+    /// `active` have one slot per sample/group; masked empty groups leave the
+    /// delta zero and mark `active` zero.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn jev_ce_loss(
+        input: &[f32],
+        truth: &[f32],
+        mut delta: DisjointSlice<f32>,
+        mut losses: DisjointSlice<f32>,
+        mut active: DisjointSlice<f32>,
+        batch: usize,
+        groups: usize,
+        candidates: usize,
+        temperature: f32,
+        normalize: u32,
+        ignore_empty: u32,
+        label_smoothing: f32,
+        scale: f32,
+        channel_major: u32,
+    ) {
+        let group_index = thread::index_1d().get();
+        if group_index >= batch * groups {
+            return;
+        }
+        let sample = group_index / groups;
+        let group = group_index % groups;
+        let base = sample * groups * candidates;
+        let temp = if temperature > 1.0e-6 {
+            temperature
+        } else {
+            1.0e-6
+        };
+        let index = |candidate: usize| {
+            if channel_major != 0 {
+                base + candidate * groups + group
+            } else {
+                base + group * candidates + candidate
+            }
+        };
+        let mut target_sum = 0.0f32;
+        let mut candidate = 0usize;
+        while candidate < candidates {
+            target_sum += truth[index(candidate)];
+            candidate += 1;
+        }
+        let empty = target_sum <= 1.0e-8;
+        if empty && ignore_empty != 0 {
+            candidate = 0;
+            while candidate < candidates {
+                unsafe {
+                    *delta.as_mut_ptr().add(index(candidate)) = 0.0;
+                }
+                candidate += 1;
+            }
+            if let Some(slot) = losses.get_mut(thread::index_1d()) {
+                *slot = 0.0;
+            }
+            if let Some(slot) = active.get_mut(thread::index_1d()) {
+                *slot = 0.0;
+            }
+            return;
+        }
+
+        let mut maximum = f32::NEG_INFINITY;
+        candidate = 0;
+        while candidate < candidates {
+            let value = input[index(candidate)];
+            if value > maximum {
+                maximum = value;
+            }
+            candidate += 1;
+        }
+        let mut sum = 0.0f32;
+        candidate = 0;
+        while candidate < candidates {
+            sum += ((input[index(candidate)] - maximum) / temp).exp();
+            candidate += 1;
+        }
+        let eps = if label_smoothing > 0.0 {
+            label_smoothing.min(0.999)
+        } else {
+            0.0
+        };
+        let uniform = 1.0 / candidates as f32;
+        let mut loss = 0.0f32;
+        candidate = 0;
+        while candidate < candidates {
+            let prob = ((input[index(candidate)] - maximum) / temp).exp() / sum;
+            let mut target = if empty {
+                uniform
+            } else {
+                truth[index(candidate)] / target_sum
+            };
+            if eps > 0.0 {
+                target = (1.0 - eps) * target + eps * uniform;
+            }
+            loss += -target * prob.max(1.0e-12).ln();
+            unsafe {
+                *delta.as_mut_ptr().add(index(candidate)) = (target - prob) / temp;
+            }
+            candidate += 1;
+        }
+        if normalize != 0 {
+            let mut sample_active = 0usize;
+            let mut other_group = 0usize;
+            while other_group < groups {
+                let mut other_sum = 0.0f32;
+                let mut other_candidate = 0usize;
+                while other_candidate < candidates {
+                    let other_index = if channel_major != 0 {
+                        base + other_candidate * groups + other_group
+                    } else {
+                        base + other_group * candidates + other_candidate
+                    };
+                    other_sum += truth[other_index];
+                    other_candidate += 1;
+                }
+                if other_sum > 1.0e-8 || ignore_empty == 0 {
+                    sample_active += 1;
+                }
+                other_group += 1;
+            }
+            let inv = 1.0 / sample_active.max(1) as f32;
+            candidate = 0;
+            while candidate < candidates {
+                unsafe {
+                    *delta.as_mut_ptr().add(index(candidate)) *= inv;
+                }
+                candidate += 1;
+            }
+        }
+        candidate = 0;
+        while candidate < candidates {
+            unsafe {
+                *delta.as_mut_ptr().add(index(candidate)) *= scale;
+            }
+            candidate += 1;
+        }
+        if let Some(slot) = losses.get_mut(thread::index_1d()) {
+            *slot = loss;
+        }
+        if let Some(slot) = active.get_mut(thread::index_1d()) {
+            *slot = 1.0;
+        }
+    }
+
     /// One thread owns one sample row and writes its stable K-way softmax.
     #[kernel]
     pub fn laya_loss_forward(input: &[f32], mut output: DisjointSlice<f32>, max_options: usize) {

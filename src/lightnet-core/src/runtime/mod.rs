@@ -40,8 +40,8 @@ use crate::muon_runtime::{
 };
 use crate::weights::WeightsHeader;
 use lightnet_cuda::{
-    AdamParams, AdamUpdateItem, ElementwiseLaunchConfig, F16TensorOpsBackend, F32ActivationKind,
-    F32TensorOpsBackend, NanInfMode, SgdUpdateItem, dropout_unit,
+    AdamParams, AdamUpdateItem, DenseLossBackend, ElementwiseLaunchConfig, F16TensorOpsBackend,
+    F32ActivationKind, F32TensorOpsBackend, NanInfMode, SgdUpdateItem, dropout_unit,
 };
 
 pub(crate) const BATCH_NORM_EPSILON: f32 = 0.000_01;
@@ -73,6 +73,7 @@ mod gpu_forward;
 mod gpu_forward_compact;
 mod gpu_backward;
 mod gpu_backward_support;
+mod gpu_dense_loss;
 mod gpu_params;
 mod defaults;
 mod hyperbolic_foveation;

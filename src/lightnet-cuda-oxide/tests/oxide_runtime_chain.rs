@@ -12,7 +12,7 @@
 
 use lightnet_core::{
     ConfigFile, ExecutableNetwork, GpuExecutableNetwork, LayerParams, LayerTrainBuffers, Network,
-    Tensor, TensorShape,
+    Tensor, TensorShape, compute_dense_training_loss,
 };
 use lightnet_cuda::F32TensorOpsBackend;
 use lightnet_cuda_oxide::OxideBackend;
@@ -525,6 +525,133 @@ fn assert_chain(cfg: &str, seed_layer: usize, what: &str) {
         checked += 1;
     }
     assert!(checked >= 2, "{what}: expected several convolution layers");
+}
+
+#[test]
+fn jev_ce_native_loss_and_seeded_backward_match_cpu() {
+    let net = network(
+        "[net]\nwidth=1\nheight=1\nchannels=2\nbatch=2\n\
+         [convolutional]\nfilters=6\nsize=1\nstride=1\nactivation=linear\n\
+         [jev_ce]\ngroups=2\ncandidates=3\ntemperature=1.5\nnormalize=1\n\
+         ignore_empty=1\nlabel_smoothing=0.1\nscale=1.3\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    fill_params(&mut cpu.params);
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("train buffers");
+
+    let input = patterned(cpu.network.net.input_shape());
+    let cpu_forward = cpu.forward_training(&input).expect("cpu forward");
+    let gpu_forward = gpu
+        .forward_training_device(&input)
+        .expect("oxide training forward");
+    let shape = cpu.network.layers[1].output_shape;
+    let truth_data = vec![
+        1.0, 0.0, 0.0, 0.0, 0.0, 0.0, // batch 0: group 0 supervised, group 1 empty
+        0.0, 1.0, 0.0, 0.5, 0.5, 0.0, // batch 1: both groups supervised
+    ];
+    let truth = vec![
+        None,
+        Some(Tensor::from_data(shape, truth_data).expect("jev_ce truth")),
+    ];
+    let cpu_loss = compute_dense_training_loss(&cpu.network, &cpu_forward, &input, &truth)
+        .expect("cpu dense loss");
+    let gpu_loss = gpu
+        .compute_jev_ce_training_loss_gpu(&gpu_forward, &truth)
+        .expect("native jev_ce loss");
+    close("jev_ce loss", &[cpu_loss.loss], &[gpu_loss.loss], 2e-5);
+    let cpu_seed = cpu_loss.layer_output_gradient_seeds[1]
+        .as_ref()
+        .expect("cpu seed");
+    let gpu_seed = gpu_loss.layer_output_gradient_seeds[1]
+        .as_ref()
+        .expect("gpu seed");
+    close("jev_ce delta", &cpu_seed.data, &gpu_seed.data, 2e-6);
+
+    cpu.zero_train_buffers();
+    cpu.backward_accumulate_seeded(&input, &cpu_forward, &cpu_loss.layer_output_gradient_seeds)
+        .expect("cpu backward");
+    gpu.zero_train_buffers_gpu().expect("zero gpu gradients");
+    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &gpu_loss.layer_output_gradient_seeds)
+        .expect("oxide backward");
+
+    let before = cpu.params.clone();
+    cpu.update_weights(1.0, 0.0, 0.0, 1);
+    gpu.update_weights_gpu(1.0, 0.0, 0.0, 1)
+        .expect("oxide update");
+    let (LayerParams::Convolutional(before), LayerParams::Convolutional(cpu_after)) =
+        (&before[0], &cpu.params[0])
+    else {
+        panic!("expected convolution parameters");
+    };
+    let LayerParams::Convolutional(gpu_after) = &gpu.params[0] else {
+        panic!("expected convolution parameters");
+    };
+    let delta = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| x - y)
+            .collect::<Vec<f32>>()
+    };
+    close(
+        "jev_ce weight gradient",
+        &delta(&cpu_after.weights, &before.weights),
+        &delta(&gpu_after.weights, &before.weights),
+        1e-3,
+    );
+    close(
+        "jev_ce bias gradient",
+        &delta(&cpu_after.biases, &before.biases),
+        &delta(&gpu_after.biases, &before.biases),
+        1e-3,
+    );
+}
+
+#[test]
+fn jev_ce_native_loss_channel_major_matches_cpu() {
+    let net = network(
+        "[net]\nwidth=1\nheight=1\nchannels=2\nbatch=2\n\
+         [convolutional]\nfilters=6\nsize=1\nstride=1\nactivation=linear\n\
+         [jev_ce]\ngroups=2\ncandidates=3\nlayout=cm\ntemperature=1.5\n\
+         normalize=1\nignore_empty=1\nlabel_smoothing=0.1\nscale=1.3\n",
+    );
+    let mut cpu = ExecutableNetwork::new(net.clone());
+    fill_params(&mut cpu.params);
+    let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("oxide backend"));
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().expect("train buffers");
+    let input = patterned(cpu.network.net.input_shape());
+    let cpu_forward = cpu.forward_training(&input).expect("cpu forward");
+    let gpu_forward = gpu
+        .forward_training_device(&input)
+        .expect("oxide training forward");
+    let shape = cpu.network.layers[1].output_shape;
+    let truth = vec![
+        None,
+        Some(
+            Tensor::from_data(
+                shape,
+                vec![
+                    1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.5, 0.5, 0.0,
+                ],
+            )
+            .expect("jev_ce truth"),
+        ),
+    ];
+    let cpu_loss = compute_dense_training_loss(&cpu.network, &cpu_forward, &input, &truth)
+        .expect("cpu dense loss");
+    let gpu_loss = gpu
+        .compute_jev_ce_training_loss_gpu(&gpu_forward, &truth)
+        .expect("native jev_ce loss");
+    close("jev_ce cm loss", &[cpu_loss.loss], &[gpu_loss.loss], 2e-5);
+    let cpu_seed = cpu_loss.layer_output_gradient_seeds[1]
+        .as_ref()
+        .expect("cpu seed");
+    let gpu_seed = gpu_loss.layer_output_gradient_seeds[1]
+        .as_ref()
+        .expect("gpu seed");
+    close("jev_ce cm delta", &cpu_seed.data, &gpu_seed.data, 2e-6);
 }
 
 #[test]
