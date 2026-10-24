@@ -69,4 +69,36 @@ where
             .map_err(|err| backend_error("GPU ChannelSlice compact forward", err))?;
         Ok(output)
     }
+
+    /// Channel-slice backward.
+    pub(crate) fn backward_channel_slice_gpu(
+        &self,
+        layer: &Layer,
+        spec: &ChannelSliceSpec,
+        grad: B::Tensor,
+        config: ElementwiseLaunchConfig,
+        layer_output_gradients: &mut [Option<B::Tensor>],
+    ) -> Result<()> {
+        let source_index = resolve_relative_layer(layer.index, spec.from)?;
+        let source_layer = &self.network.layers[source_index];
+        let grads = self
+            .backend
+            .route_backward_f32(
+                &grad,
+                &[tensor_backend_shape(source_layer.output_shape).to_vec()],
+                &[spec.start],
+                &[spec.end - spec.start],
+                &[source_layer.output_shape.channels],
+                layer.output_shape.width * layer.output_shape.height,
+                config,
+            )
+            .map_err(|err| backend_error("GPU channel_slice backward", err))?;
+        for source_grad in grads {
+            self.accumulate_gpu_gradient(
+                &mut layer_output_gradients[source_index],
+                source_grad,
+            )?;
+        }
+        Ok(())
+    }
 }

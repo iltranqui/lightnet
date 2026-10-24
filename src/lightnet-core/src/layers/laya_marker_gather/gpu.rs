@@ -1,7 +1,7 @@
 //! GPU-runtime glue for `[laya_marker_gather]`.
 use crate::error::{Error, Result};
 use crate::runtime::{
-    GpuForwardState,GpuExecutableNetwork, backend_error, resolve_relative_layer, tensor_backend_shape};
+    GpuExecutableNetwork, GpuForwardState, backend_error, resolve_relative_layer, tensor_backend_shape};
 use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
 
 use crate::model::{Layer, LayaMarkerGatherSpec};

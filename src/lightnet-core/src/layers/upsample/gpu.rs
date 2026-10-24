@@ -30,4 +30,34 @@ where
             )
             .map_err(|err| backend_error("upsample", err))
     }
+
+    /// Upsample backward.
+    pub(crate) fn backward_upsample_gpu(
+        &self,
+        layer: &Layer,
+        spec: &UpsampleSpec,
+        grad: B::Tensor,
+        config: ElementwiseLaunchConfig,
+        layer_output_gradients: &mut [Option<B::Tensor>],
+    ) -> Result<()> {
+        let input_grad = self
+            .backend
+            .upsample_backward_f32(
+                &grad,
+                &tensor_backend_shape(layer.input_shape),
+                layer.input_shape.channels,
+                layer.output_shape.height,
+                layer.output_shape.width,
+                spec.stride.unsigned_abs(),
+                spec.scale,
+                config,
+            )
+            .map_err(|err| backend_error("GPU upsample backward", err))?;
+        self.accumulate_previous_gpu_gradient(
+            layer.index,
+            input_grad,
+            layer_output_gradients,
+        )?;
+        Ok(())
+    }
 }

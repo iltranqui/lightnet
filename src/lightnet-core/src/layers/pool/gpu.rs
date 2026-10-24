@@ -2,7 +2,7 @@
 use crate::error::{Error, Result};
 use crate::model::{Layer, MaxPoolSpec};
 use crate::runtime::{
-    GpuForwardState,GpuExecutableNetwork, backend_error, tensor_backend_shape};
+    GpuExecutableNetwork, GpuForwardState, backend_error, tensor_backend_shape};
 use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
 
 impl<B> GpuExecutableNetwork<B>

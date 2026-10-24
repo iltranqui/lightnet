@@ -2,6 +2,8 @@
 use crate::error::{Error, Result};
 use crate::model::{Layer, SamSpec};
 use crate::runtime::{
+    gpu_activation_kind,
+    GpuForwardState,
     GpuExecutableNetwork, backend_error, forward_sam, resolve_relative_layer, tensor_backend_shape,
 };
 use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
@@ -149,5 +151,81 @@ where
                 )
                 .map_err(|err| backend_error("upload sam output", err))?
         })
+    }
+
+    /// Sam backward: gradients for the input and the source layer.
+    pub(crate) fn backward_sam_gpu(
+        &self,
+        layer: &Layer,
+        spec: &SamSpec,
+        forward: &GpuForwardState<B::Tensor>,
+        grad: B::Tensor,
+        config: ElementwiseLaunchConfig,
+        layer_output_gradients: &mut [Option<B::Tensor>],
+    ) -> Result<()> {
+        let source_index = resolve_relative_layer(layer.index, spec.from)?;
+        let source_layer = self.network.layers.get(source_index).ok_or(
+            Error::InvalidRoute {
+                layer_index: layer.index,
+                reference: spec.from,
+            },
+        )?;
+        if layer.input_shape != layer.output_shape
+            || source_layer.output_shape != layer.output_shape
+        {
+            return Err(Error::InvalidConfig(format!(
+                "sam backward shape mismatch: input {}, source {}, output {}",
+                layer.input_shape, source_layer.output_shape, layer.output_shape
+            )));
+        }
+        let activation_input = forward.gpu_layer_activation_inputs[layer.index]
+            .as_ref()
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing GPU activation cache for sam layer #{}",
+                    layer.index
+                ))
+            })?;
+        let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+        let delta = self
+            .backend
+            .activation_backward_f32(activation_input, &grad, activation, config)
+            .map_err(|err| backend_error("GPU sam activation backward", err))?;
+        let source = forward
+            .gpu_layer_outputs
+            .get(source_index)
+            .ok_or(Error::InvalidRoute {
+                layer_index: layer.index,
+                reference: spec.from,
+            })?;
+        let current_input = if layer.index == 0 {
+            &forward.input_gpu
+        } else {
+            forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing previous GPU layer output for sam layer #{}",
+                    layer.index
+                ))
+            })?
+        };
+        let shape = tensor_backend_shape(layer.output_shape);
+        let input_grad = self
+            .backend
+            .vector_mul_f32(&delta, source, &shape, config)
+            .map_err(|err| backend_error("GPU sam input gradient", err))?;
+        let source_grad = self
+            .backend
+            .vector_mul_f32(&delta, current_input, &shape, config)
+            .map_err(|err| backend_error("GPU sam source gradient", err))?;
+        self.accumulate_previous_gpu_gradient(
+            layer.index,
+            input_grad,
+            layer_output_gradients,
+        )?;
+        self.accumulate_gpu_gradient(
+            &mut layer_output_gradients[source_index],
+            source_grad,
+        )?;
+        Ok(())
     }
 }

@@ -2,6 +2,8 @@
 use crate::error::{Error, Result};
 use crate::model::{Layer, ScaleChannelsSpec};
 use crate::runtime::{
+    GradMode,
+    GpuForwardState,
     GpuExecutableNetwork, backend_error, forward_scale_channels, gpu_activation_kind,
     resolve_relative_layer,
     tensor_backend_shape,
@@ -126,5 +128,82 @@ where
             )
             .map_err(|err| backend_error("GPU ScaleChannels compact activation", err))?;
         Ok(output)
+    }
+
+    /// ScaleChannels backward: gradients for the input and the scale source.
+    pub(crate) fn backward_scale_channels_gpu(
+        &self,
+        layer: &Layer,
+        spec: &ScaleChannelsSpec,
+        forward: &GpuForwardState<B::Tensor>,
+        grad: B::Tensor,
+        config: ElementwiseLaunchConfig,
+        layer_output_gradients: &mut [Option<B::Tensor>],
+    ) -> Result<()> {
+        let source_index = resolve_relative_layer(layer.index, spec.from)?;
+        let activation = gpu_activation_kind(layer.index, &spec.activation)?;
+        let activation_input = forward.gpu_layer_activation_inputs[layer.index]
+            .as_ref()
+            .ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing GPU activation cache for scale_channels layer #{}",
+                    layer.index
+                ))
+            })?;
+        let delta = self
+            .backend
+            .activation_backward_f32(activation_input, &grad, activation, config)
+            .map_err(|err| {
+                backend_error("GPU scale_channels activation backward", err)
+            })?;
+        let current_input = if layer.index == 0 {
+            &forward.input_gpu
+        } else {
+            &forward.gpu_layer_outputs[layer.index - 1]
+        };
+        let source = forward.gpu_layer_outputs.get(source_index).ok_or(
+            Error::InvalidRoute {
+                layer_index: layer.index,
+                reference: spec.from,
+            },
+        )?;
+        let (mut input_grad, source_grad) = self
+            .backend
+            .scale_channels_backward_f32(
+                &delta,
+                current_input,
+                source,
+                &tensor_backend_shape(layer.output_shape),
+                spec.scale_wh,
+                config,
+            )
+            .map_err(|err| backend_error("GPU scale_channels backward", err))?;
+        if spec.scale_wh && GradMode::from_env() == GradMode::Cpp {
+            let channel_size =
+                (layer.output_shape.height * layer.output_shape.width) as f32;
+            let zeros = self
+                .backend
+                .zeros_f32(&[
+                    layer.output_shape.batch,
+                    1,
+                    layer.output_shape.height,
+                    layer.output_shape.width,
+                ])
+                .map_err(|err| backend_error("GPU scale_channels C++ mode", err))?;
+            input_grad = self
+                .backend
+                .saxpy_f32(1.0 / channel_size, &input_grad, &zeros, config)
+                .map_err(|err| backend_error("GPU scale_channels C++ mode", err))?;
+        }
+        self.accumulate_previous_gpu_gradient(
+            layer.index,
+            input_grad,
+            layer_output_gradients,
+        )?;
+        self.accumulate_gpu_gradient(
+            &mut layer_output_gradients[source_index],
+            source_grad,
+        )?;
+        Ok(())
     }
 }

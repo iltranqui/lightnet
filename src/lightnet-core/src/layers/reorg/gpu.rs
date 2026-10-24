@@ -59,4 +59,32 @@ where
             .map_err(|err| backend_error("GPU Reorg compact forward", err))?;
         Ok(output)
     }
+
+    /// Reorg backward.
+    pub(crate) fn backward_reorg_gpu(
+        &self,
+        layer: &Layer,
+        spec: &ReorgSpec,
+        grad: B::Tensor,
+        config: ElementwiseLaunchConfig,
+        layer_output_gradients: &mut [Option<B::Tensor>],
+    ) -> Result<()> {
+        let input_grad = self
+            .backend
+            .reorg_backward_f32(
+                &grad,
+                &tensor_backend_shape(layer.input_shape),
+                &tensor_backend_shape(layer.output_shape),
+                spec.stride,
+                spec.reverse,
+                config,
+            )
+            .map_err(|err| backend_error("GPU reorg backward", err))?;
+        self.accumulate_previous_gpu_gradient(
+            layer.index,
+            input_grad,
+            layer_output_gradients,
+        )?;
+        Ok(())
+    }
 }
