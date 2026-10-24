@@ -564,7 +564,7 @@ where
         self.cached_convolution_params_at(layer_index, 0, input_channels, spec, params)
     }
 
-    pub(super) fn cached_convolution_params_at(
+    pub(crate) fn cached_convolution_params_at(
         &self,
         layer_index: usize,
         slot: usize,
@@ -599,7 +599,7 @@ where
         self.cached_convolution_params_raw_at(layer_index, 0, input_channels, spec, params)
     }
 
-    pub(super) fn cached_convolution_params_raw_at(
+    pub(crate) fn cached_convolution_params_raw_at(
         &self,
         layer_index: usize,
         slot: usize,

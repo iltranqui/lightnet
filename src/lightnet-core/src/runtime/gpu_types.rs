@@ -164,10 +164,10 @@ pub struct GpuEmlBackwardCache<T>
 where
     T: Clone,
 {
-    pub(super) input_branch_output: T,
-    pub(super) self_branch_output: T,
-    pub(super) input_batch_norm: Option<GpuBatchNormCache<T>>,
-    pub(super) self_batch_norm: Option<GpuBatchNormCache<T>>,
+    pub(crate) input_branch_output: T,
+    pub(crate) self_branch_output: T,
+    pub(crate) input_batch_norm: Option<GpuBatchNormCache<T>>,
+    pub(crate) self_batch_norm: Option<GpuBatchNormCache<T>>,
 }
 
 /// Device-resident recurrent values retained for LSTM backward, including the

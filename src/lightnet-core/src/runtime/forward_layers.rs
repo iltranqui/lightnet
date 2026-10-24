@@ -597,7 +597,7 @@ pub(super) fn forward_dcnv4_with_cache(
     Ok((output, activation_input, cache))
 }
 
-pub(super) fn forward_convolutional_with_cache(
+pub(crate) fn forward_convolutional_with_cache(
     spec: &ConvolutionalSpec,
     params: &ConvolutionalParams,
     input: &Tensor,
