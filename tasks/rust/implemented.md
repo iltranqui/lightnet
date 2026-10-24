@@ -2642,8 +2642,9 @@ activation or the matching channel-normalization kernel. It shares the existing
 f32 deconvolution and normalization primitives with the full forward, so all
 parsed activations, including `NormalizeChannels*`, stay on the device.
 
-Known limits: compact f16 deconvolution is still unsupported, optimizer
-parameters and gradients remain host-staged, and no compiled-C++ golden exists.
+Known limits at that increment: compact f16 deconvolution was still unsupported
+(landed in v0.2.195, §259), optimizer parameters and gradients remain
+host-staged, and no compiled-C++ golden exists.
 
 Evidence: the new actual-Oxide `compact_deconvolution_matches_cpu` test passes
 for `linear`, `leaky`, and all three channel-normalization modes;
@@ -2651,3 +2652,23 @@ for `linear`, `leaky`, and all three channel-normalization modes;
 `cargo xtask clippy` completed with pre-existing warnings only. Runs were
 uncapped (`systemd-run --user` unavailable), `-j 2`. No training run and no
 full-suite claim. Tag `v0.2.194`.
+
+## 259. Deconvolution in compact f16 inference
+
+v0.2.195. `forward_compact_f16` now accepts `[deconvolutional]`. The new
+`deconv_bias_act_f16` kernel accumulates in f32 over half-storage input and
+weights, adds the f32 bias, applies the activation, and rounds once to half;
+the matching `NormalizeChannels*` modes run through the existing
+`normalize_channels_f16` kernel. Half weights use the plain
+`[channels, filters, k, k]` layout and are cached per layer like convolution
+weights, so repeated calls do not re-upload them.
+
+Known limits: deconvolution training and backward remain f32-only, optimizer
+parameters and gradients remain host-staged, and no compiled-C++ golden exists.
+
+Evidence: the new actual-Oxide `deconvolution_f16_inference_matches_f32` test
+passes for `linear`, `leaky`, and all three channel-normalization modes (worst
+relative error 1.71e-3 against the 4e-3 gate); `cargo xtask gpu-check` clean;
+`cargo xtask clippy` completed with pre-existing warnings only. Runs were
+uncapped (`systemd-run --user` unavailable), `-j 2`. No training run and no
+full-suite claim. Tag `v0.2.195`.

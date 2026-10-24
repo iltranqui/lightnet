@@ -239,7 +239,8 @@ main matrix row instead. `Deconvolutional` left this table in v0.2.039: supporte
 f32 activations use native forward/backward; v0.2.193 adds native
 `NormalizeChannels*`, so every parsed activation stays on the device and only
 unmapped `Other` values retain the host route (config parsing rejects those).
-v0.2.194 adds compact f32 inference; compact f16 remains unsupported.
+v0.2.194 adds compact f32 inference and v0.2.195 compact f16 inference;
+f16 training/backward remains unsupported.
 | `Connected` | native, but host round trip when activation is unsupported | no separate Revleaky gap since its v0.2.026 mapping to Leaky |
 | `Rnn`/`Crnn` | device, but host when activation unsupported | device kernels for the remaining activations |
 | `Moe` | device | device path for unsupported expert activations |
@@ -262,7 +263,7 @@ devices and head sizes (no native kernel at all), even though standard
 | EML | device forward, device SGD/Adam (DNOPT5), BN scale/beta gradients | BN backward CPU fallback per v71; documents disagree on later state — verify against `implemented.md` §7 before planning |
 | Recurrent | device projections/BPTT, on-device caches and gradient accumulation without BN | BN forward/cache, rolling-stat update and optimizer remain host-side; some parameter-gradient transfers still cross the host |
 | DCNv4 | bounded native f32 forward/backward through 31x31/961 points incl. rolling-stat BN and 0.9 EMA, NormalizeChannels*/Revleaky activations, device gradient accumulation and native SGD/Adam updates; learned parameter tensors persist across forwards/updates with snapshot invalidation (v0.2.030), Adam moments bridge through sidecar only at save/load (v0.2.028); two-step SGD/Adam CPU parity. Non-BN offset-projection Muon uses device-gradient staging at the optimizer boundary and snapshot-triggered cache refresh; actual-Oxide two-step CPU parity (v0.2.055) | >961/unsupported variants host; runtime SGD parity extends through 31x31; Adam parity through 23x23 without BN and 19x19 with BN; host-canonical mirrors still download after optimizer updates and rolling stats remain host-managed; compact/f16 absent; BN Muon unsupported |
-| Deconvolutional | native Oxide f32 forward, all parsed activations incl. `NormalizeChannels*` (v0.2.193), compact f32 inference (v0.2.194), input/weight/bias gradients (v0.2.039); actual-GPU CPU parity for Muon and two-step SGD/Adam updates (v0.2.040) | optimizer parameters/gradients cross the host boundary; no compact f16 path |
+| Deconvolutional | native Oxide f32 forward, all parsed activations incl. `NormalizeChannels*` (v0.2.193), compact f32 inference (v0.2.194), compact f16 inference (v0.2.195), input/weight/bias gradients (v0.2.039); actual-GPU CPU parity for Muon and two-step SGD/Adam updates (v0.2.040) | optimizer parameters/gradients cross the host boundary; f16 training/backward is unsupported |
 | Shortcut (weighted) | device input/source gradients, exact normalization derivatives | per-input/per-slot weight gradient vector crosses to host; optimizer host-side |
 | Connected | device GEMM + activation, BN folded at inference | BN training and unsupported/unknown activations fall back |
 | `Crop` | device inference and training geometry/color adjustments (RGB shift, saturation, exposure) | no known crop GPU-forward rejection for configured augmentations; backward follows existing scale-only Rust contract |
