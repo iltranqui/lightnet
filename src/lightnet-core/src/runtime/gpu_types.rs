@@ -226,7 +226,7 @@ where
     pub(super) captured_input_gradient: RefCell<Option<Tensor>>,
     /// One slot per layer; only `[deform_conv]` uses it, and only on the
     /// device-trainable path (see `DeformDeviceCache`).
-    pub(super) deform_device_caches: RefCell<Vec<Option<DeformDeviceCache<B::Tensor>>>>,
+    pub(crate) deform_device_caches: RefCell<Vec<Option<DeformDeviceCache<B::Tensor>>>>,
     /// Per-owner-layer convolution Adam moments (device), created lazily on the
     /// first Adam update.
     pub(super) adam_state: Vec<Option<GpuAdamLayerState<B::Tensor>>>,

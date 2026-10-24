@@ -522,7 +522,7 @@ where
         Ok(())
     }
 
-    pub(super) fn accumulate_device_train_buffer(
+    pub(crate) fn accumulate_device_train_buffer(
         &self,
         owner: usize,
         weight_grad: B::Tensor,
