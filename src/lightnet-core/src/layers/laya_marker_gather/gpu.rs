@@ -1,6 +1,7 @@
 //! GPU-runtime glue for `[laya_marker_gather]`.
 use crate::error::{Error, Result};
-use crate::runtime::{GpuExecutableNetwork, backend_error, resolve_relative_layer, tensor_backend_shape};
+use crate::runtime::{
+    GpuForwardState,GpuExecutableNetwork, backend_error, resolve_relative_layer, tensor_backend_shape};
 use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
 
 use crate::model::{Layer, LayaMarkerGatherSpec};
@@ -99,5 +100,49 @@ where
             )
             .map_err(|err| backend_error("GPU laya_marker_gather", err))?;
         Ok(output)
+    }
+
+    /// Marker-gather backward.
+    pub(crate) fn backward_laya_marker_gather_gpu(
+        &self,
+        layer: &Layer,
+        spec: &LayaMarkerGatherSpec,
+        forward: &GpuForwardState<B::Tensor>,
+        grad: B::Tensor,
+        config: ElementwiseLaunchConfig,
+        layer_output_gradients: &mut [Option<B::Tensor>],
+    ) -> Result<()> {
+        let a_index = resolve_relative_layer(layer.index, spec.layers[0])?;
+        let b_index = resolve_relative_layer(layer.index, spec.layers[1])?;
+        let a_layer = self.network.layers.get(a_index).ok_or(Error::InvalidRoute {
+            layer_index: layer.index,
+            reference: spec.layers[0],
+        })?;
+        let b_layer = self.network.layers.get(b_index).ok_or(Error::InvalidRoute {
+            layer_index: layer.index,
+            reference: spec.layers[1],
+        })?;
+        let markers = forward.gpu_layer_outputs.get(b_index).ok_or(Error::InvalidRoute {
+            layer_index: layer.index,
+            reference: spec.layers[1],
+        })?;
+        let source_grad = self
+            .backend
+            .marker_gather_backward_f32(
+                markers,
+                &grad,
+                &tensor_backend_shape(a_layer.output_shape),
+                &tensor_backend_shape(b_layer.output_shape),
+                spec.max_options,
+                config,
+            )
+            .map_err(|err| backend_error("GPU laya_marker_gather backward", err))?;
+        // B contains discrete indices, not differentiable features.
+        // Do not send another gradient when A and B alias.
+        self.accumulate_gpu_gradient(
+            &mut layer_output_gradients[a_index],
+            source_grad,
+        )?;
+        Ok(())
     }
 }

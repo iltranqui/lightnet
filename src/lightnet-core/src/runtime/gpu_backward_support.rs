@@ -267,7 +267,7 @@ where
         Ok(Tensor { shape, data })
     }
 
-    pub(super) fn accumulate_previous_gpu_gradient(
+    pub(crate) fn accumulate_previous_gpu_gradient(
         &self,
         layer_index: usize,
         gradient: B::Tensor,
@@ -507,7 +507,7 @@ where
         Ok(())
     }
 
-    pub(super) fn accumulate_gpu_gradient(
+    pub(crate) fn accumulate_gpu_gradient(
         &self,
         slot: &mut Option<B::Tensor>,
         gradient: B::Tensor,

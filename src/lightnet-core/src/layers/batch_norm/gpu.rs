@@ -3,6 +3,8 @@
 use crate::error::{Error, Result};
 use crate::model::{Layer, TensorShape};
 use crate::runtime::{
+    LayerTrainBuffers,
+    GpuForwardState,
     BATCH_NORM_ROLLING_KEEP, BATCH_NORM_ROLLING_KEEP_CPU, BatchNormParams, GpuBatchNormCache,
     GpuConvolutionLayerParams, GpuExecutableNetwork, backend_error,
     folded_batchnorm_inference_params, tensor_backend_shape, validate_batchnorm_params,
@@ -171,5 +173,64 @@ where
                 config,
             )
             .map_err(|err| backend_error("batchnorm inference bias", err))
+    }
+
+    /// Standalone batch-norm backward: input gradient plus scale and bias updates.
+    pub(crate) fn backward_batch_norm_gpu(
+        &self,
+        layer: &Layer,
+        forward: &GpuForwardState<B::Tensor>,
+        grad: B::Tensor,
+        config: ElementwiseLaunchConfig,
+        layer_output_gradients: &mut [Option<B::Tensor>],
+    ) -> Result<()> {
+        let cache = forward.gpu_batch_norm_caches[layer.index].as_ref().ok_or_else(|| {
+            Error::InvalidConfig(format!(
+                "missing GPU batch-norm forward cache for layer #{}",
+                layer.index
+            ))
+        })?;
+        let (input_gradient, scale_gradient, bias_gradient) = self
+            .backend
+            .batchnorm_train_backward_f32(
+                &grad,
+                &cache.x_hat,
+                &cache.variance,
+                &cache.scales,
+                &tensor_backend_shape(layer.output_shape),
+                config,
+            )
+            .map_err(|err| backend_error("standalone GPU batch-norm backward", err))?;
+        let scale_values = self
+            .backend
+            .download_f32(&scale_gradient)
+            .map_err(|err| backend_error("download standalone BN scale gradient", err))?;
+        let bias_values = self
+            .backend
+            .download_f32(&bias_gradient)
+            .map_err(|err| backend_error("download standalone BN bias gradient", err))?;
+        {
+            let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+            let Some(LayerTrainBuffers::BatchNorm(train)) =
+                buffers.get_mut(layer.index)
+            else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing standalone BN optimizer buffers for layer #{}",
+                    layer.index
+                )));
+            };
+            for (dst, src) in train.scale_updates.iter_mut().zip(scale_values) {
+                *dst += src;
+            }
+            for (dst, src) in train.bias_updates.iter_mut().zip(bias_values) {
+                *dst += src;
+            }
+        }
+        self.accumulate_previous_gpu_gradient(
+            layer.index,
+            input_gradient,
+            layer_output_gradients,
+        )?;
+        Ok(())
     }
 }

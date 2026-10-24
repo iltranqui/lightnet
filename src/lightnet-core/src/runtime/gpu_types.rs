@@ -221,7 +221,7 @@ where
     pub(super) device_dcnv4_train_buffers: RefCell<Vec<Option<GpuDcnv4TrainBuffers<B::Tensor>>>>,
     /// Reusable DCNv4 parameter uploads; snapshots detect public host edits.
     pub(crate) dcnv4_device_params: RefCell<Vec<Option<dcnv4_gpu::DeviceParameters<B::Tensor>>>>,
-    pub(super) cpu_fallback_train_buffers: RefCell<Vec<LayerTrainBuffers>>,
+    pub(crate) cpu_fallback_train_buffers: RefCell<Vec<LayerTrainBuffers>>,
     pub(super) capture_input_gradient: Cell<bool>,
     pub(super) captured_input_gradient: RefCell<Option<Tensor>>,
     /// One slot per layer; only `[deform_conv]` uses it, and only on the

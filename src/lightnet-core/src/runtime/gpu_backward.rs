@@ -601,51 +601,11 @@ where
                     )?;
                 }
                 (LayerKind::BatchNorm(_), Some(LayerParams::BatchNorm(_))) => {
-                    let cache = forward.gpu_batch_norm_caches[layer.index].as_ref().ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "missing GPU batch-norm forward cache for layer #{}",
-                            layer.index
-                        ))
-                    })?;
-                    let (input_gradient, scale_gradient, bias_gradient) = self
-                        .backend
-                        .batchnorm_train_backward_f32(
-                            &grad,
-                            &cache.x_hat,
-                            &cache.variance,
-                            &cache.scales,
-                            &tensor_backend_shape(layer.output_shape),
-                            config,
-                        )
-                        .map_err(|err| backend_error("standalone GPU batch-norm backward", err))?;
-                    let scale_values = self
-                        .backend
-                        .download_f32(&scale_gradient)
-                        .map_err(|err| backend_error("download standalone BN scale gradient", err))?;
-                    let bias_values = self
-                        .backend
-                        .download_f32(&bias_gradient)
-                        .map_err(|err| backend_error("download standalone BN bias gradient", err))?;
-                    {
-                        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
-                        let Some(LayerTrainBuffers::BatchNorm(train)) =
-                            buffers.get_mut(layer.index)
-                        else {
-                            return Err(Error::InvalidConfig(format!(
-                                "missing standalone BN optimizer buffers for layer #{}",
-                                layer.index
-                            )));
-                        };
-                        for (dst, src) in train.scale_updates.iter_mut().zip(scale_values) {
-                            *dst += src;
-                        }
-                        for (dst, src) in train.bias_updates.iter_mut().zip(bias_values) {
-                            *dst += src;
-                        }
-                    }
-                    self.accumulate_previous_gpu_gradient(
-                        layer.index,
-                        input_gradient,
+                    self.backward_batch_norm_gpu(
+                        layer,
+                        forward,
+                        grad,
+                        config,
                         &mut layer_output_gradients,
                     )?;
                 }
@@ -1005,203 +965,58 @@ where
                     )?;
                 }
                 (LayerKind::MaxPool(spec), Some(LayerParams::None)) => {
-                    let current_input = if layer.index == 0 {
-                        &forward.input_gpu
-                    } else {
-                        forward
-                            .gpu_layer_outputs
-                            .get(layer.index - 1)
-                            .ok_or_else(|| {
-                                Error::InvalidConfig(format!(
-                                    "missing previous GPU layer output for maxpool layer #{}",
-                                    layer.index
-                                ))
-                            })?
-                    };
-                    let input_grad = if spec.depth {
-                        self.backend.maxpool_depth_backward_f32(
-                            current_input,
-                            &grad,
-                            &tensor_backend_shape(layer.input_shape),
-                            layer.output_shape.channels,
-                            config,
-                        )
-                    } else {
-                        self.backend.maxpool_backward_f32(
-                            current_input,
-                            &grad,
-                            layer.input_shape.channels,
-                            layer.input_shape.height,
-                            layer.input_shape.width,
-                            spec.size,
-                            spec.stride_x,
-                            spec.stride_y,
-                            spec.padding,
-                            config,
-                        )
-                    }
-                    .map_err(|err| backend_error("GPU maxpool backward", err))?;
-                    self.accumulate_previous_gpu_gradient(
-                        layer.index,
-                        input_grad,
+                    self.backward_maxpool_gpu(
+                        layer,
+                        spec,
+                        forward,
+                        grad,
+                        config,
                         &mut layer_output_gradients,
                     )?;
                 }
                 (LayerKind::LocalAvgPool(spec), Some(LayerParams::None)) => {
-                    let input_grad = self
-                        .backend
-                        .local_avgpool_backward_f32(
-                            &grad,
-                            &tensor_backend_shape(layer.input_shape),
-                            layer.input_shape.channels,
-                            layer.input_shape.height,
-                            layer.input_shape.width,
-                            spec.size,
-                            spec.stride_x,
-                            spec.stride_y,
-                            spec.padding,
-                            config,
-                        )
-                        .map_err(|err| backend_error("GPU local_avgpool backward", err))?;
-                    self.accumulate_previous_gpu_gradient(
-                        layer.index,
-                        input_grad,
+                    self.backward_local_avgpool_gpu(
+                        layer,
+                        spec,
+                        grad,
+                        config,
                         &mut layer_output_gradients,
                     )?;
                 }
                 (LayerKind::AvgPool, Some(LayerParams::None)) => {
-                    let input_grad = self
-                        .backend
-                        .avgpool_backward_f32(
-                            &grad,
-                            &tensor_backend_shape(layer.input_shape),
-                            layer.input_shape.channels,
-                            layer.input_shape.height,
-                            layer.input_shape.width,
-                            config,
-                        )
-                        .map_err(|err| backend_error("GPU avgpool backward", err))?;
-                    self.accumulate_previous_gpu_gradient(
-                        layer.index,
-                        input_grad,
+                    self.backward_avgpool_gpu(
+                        layer,
+                        grad,
+                        config,
                         &mut layer_output_gradients,
                     )?;
                 }
                 (LayerKind::Crop(_), Some(LayerParams::None)) => {
-                    let cache = forward.cpu_forward.crop_caches[layer.index]
-                        .as_ref()
-                        .ok_or_else(|| {
-                            Error::InvalidConfig(format!(
-                                "missing crop forward cache for GPU layer #{}",
-                                layer.index
-                            ))
-                        })?;
-                    let source_x = self
-                        .backend
-                        .upload_f32(&[cache.source_x.len()], &cache.source_x)
-                        .map_err(|err| backend_error("upload crop backward source x", err))?;
-                    let source_y = self
-                        .backend
-                        .upload_f32(&[cache.source_y.len()], &cache.source_y)
-                        .map_err(|err| backend_error("upload crop backward source y", err))?;
-                    let input_scales = self
-                        .backend
-                        .upload_f32(&[cache.input_scales.len()], &cache.input_scales)
-                        .map_err(|err| backend_error("upload crop backward input scales", err))?;
-                    let input_grad = self
-                        .backend
-                        .crop_bilinear_backward_f32(
-                            &grad,
-                            &tensor_backend_shape(layer.input_shape),
-                            layer.input_shape.channels,
-                            layer.input_shape.height,
-                            layer.input_shape.width,
-                            &source_x,
-                            &source_y,
-                            &input_scales,
-                            config,
-                        )
-                        .map_err(|err| backend_error("GPU crop backward", err))?;
-                    self.accumulate_previous_gpu_gradient(
-                        layer.index,
-                        input_grad,
+                    self.backward_crop_gpu(
+                        layer,
+                        forward,
+                        grad,
+                        config,
                         &mut layer_output_gradients,
                     )?;
                 }
                 (LayerKind::Route(spec), Some(LayerParams::None)) => {
-                    let mut input_shapes = Vec::with_capacity(spec.layers.len());
-                    let mut route_channel_offsets = Vec::with_capacity(spec.layers.len());
-                    let mut route_channels = Vec::with_capacity(spec.layers.len());
-                    let mut route_total_channels = Vec::with_capacity(spec.layers.len());
-                    let mut source_indices = Vec::with_capacity(spec.layers.len());
-                    for raw_index in &spec.layers {
-                        let source_index = resolve_relative_layer(layer.index, *raw_index)?;
-                        let source_layer =
-                            self.network
-                                .layers
-                                .get(source_index)
-                                .ok_or(Error::InvalidRoute {
-                                    layer_index: layer.index,
-                                    reference: *raw_index,
-                                })?;
-                        let chunk_channels =
-                            source_layer.output_shape.channels / spec.groups.max(1);
-                        input_shapes.push(tensor_backend_shape(source_layer.output_shape).to_vec());
-                        route_channel_offsets.push(chunk_channels * spec.group_id);
-                        route_channels.push(chunk_channels);
-                        route_total_channels.push(source_layer.output_shape.channels);
-                        source_indices.push(source_index);
-                    }
-                    let grads = self
-                        .backend
-                        .route_backward_f32(
-                            &grad,
-                            &input_shapes,
-                            &route_channel_offsets,
-                            &route_channels,
-                            &route_total_channels,
-                            layer.output_shape.width * layer.output_shape.height,
-                            config,
-                        )
-                        .map_err(|err| backend_error("GPU route backward", err))?;
-                    for (source_index, source_grad) in source_indices.into_iter().zip(grads) {
-                        self.accumulate_gpu_gradient(
-                            &mut layer_output_gradients[source_index],
-                            source_grad,
-                        )?;
-                    }
+                    self.backward_route_gpu(
+                        layer,
+                        spec,
+                        grad,
+                        config,
+                        &mut layer_output_gradients,
+                    )?;
                 }
                 (LayerKind::LayaMarkerGather(spec), Some(LayerParams::None)) => {
-                    let a_index = resolve_relative_layer(layer.index, spec.layers[0])?;
-                    let b_index = resolve_relative_layer(layer.index, spec.layers[1])?;
-                    let a_layer = self.network.layers.get(a_index).ok_or(Error::InvalidRoute {
-                        layer_index: layer.index,
-                        reference: spec.layers[0],
-                    })?;
-                    let b_layer = self.network.layers.get(b_index).ok_or(Error::InvalidRoute {
-                        layer_index: layer.index,
-                        reference: spec.layers[1],
-                    })?;
-                    let markers = forward.gpu_layer_outputs.get(b_index).ok_or(Error::InvalidRoute {
-                        layer_index: layer.index,
-                        reference: spec.layers[1],
-                    })?;
-                    let source_grad = self
-                        .backend
-                        .marker_gather_backward_f32(
-                            markers,
-                            &grad,
-                            &tensor_backend_shape(a_layer.output_shape),
-                            &tensor_backend_shape(b_layer.output_shape),
-                            spec.max_options,
-                            config,
-                        )
-                        .map_err(|err| backend_error("GPU laya_marker_gather backward", err))?;
-                    // B contains discrete indices, not differentiable features.
-                    // Do not send another gradient when A and B alias.
-                    self.accumulate_gpu_gradient(
-                        &mut layer_output_gradients[a_index],
-                        source_grad,
+                    self.backward_laya_marker_gather_gpu(
+                        layer,
+                        spec,
+                        forward,
+                        grad,
+                        config,
+                        &mut layer_output_gradients,
                     )?;
                 }
                 (LayerKind::LayaActHead(_), Some(LayerParams::LayaActHead(_))) => {

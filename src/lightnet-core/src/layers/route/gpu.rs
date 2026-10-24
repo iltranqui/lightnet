@@ -1,6 +1,7 @@
 //! GPU-runtime glue for `[route]`.
 use crate::error::{Error, Result};
-use crate::runtime::{GpuExecutableNetwork, backend_error, resolve_relative_layer, tensor_backend_shape};
+use crate::runtime::{
+    GpuExecutableNetwork, backend_error, resolve_relative_layer, tensor_backend_shape};
 use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
 
 use crate::model::{Layer, RouteSpec};
@@ -104,5 +105,58 @@ where
             )
             .map_err(|err| backend_error("route concat", err))?;
         Ok(output)
+    }
+
+    /// Route backward: splits the gradient into the source layers.
+    pub(crate) fn backward_route_gpu(
+        &self,
+        layer: &Layer,
+        spec: &RouteSpec,
+        grad: B::Tensor,
+        config: ElementwiseLaunchConfig,
+        layer_output_gradients: &mut [Option<B::Tensor>],
+    ) -> Result<()> {
+        let mut input_shapes = Vec::with_capacity(spec.layers.len());
+        let mut route_channel_offsets = Vec::with_capacity(spec.layers.len());
+        let mut route_channels = Vec::with_capacity(spec.layers.len());
+        let mut route_total_channels = Vec::with_capacity(spec.layers.len());
+        let mut source_indices = Vec::with_capacity(spec.layers.len());
+        for raw_index in &spec.layers {
+            let source_index = resolve_relative_layer(layer.index, *raw_index)?;
+            let source_layer =
+                self.network
+                    .layers
+                    .get(source_index)
+                    .ok_or(Error::InvalidRoute {
+                        layer_index: layer.index,
+                        reference: *raw_index,
+                    })?;
+            let chunk_channels =
+                source_layer.output_shape.channels / spec.groups.max(1);
+            input_shapes.push(tensor_backend_shape(source_layer.output_shape).to_vec());
+            route_channel_offsets.push(chunk_channels * spec.group_id);
+            route_channels.push(chunk_channels);
+            route_total_channels.push(source_layer.output_shape.channels);
+            source_indices.push(source_index);
+        }
+        let grads = self
+            .backend
+            .route_backward_f32(
+                &grad,
+                &input_shapes,
+                &route_channel_offsets,
+                &route_channels,
+                &route_total_channels,
+                layer.output_shape.width * layer.output_shape.height,
+                config,
+            )
+            .map_err(|err| backend_error("GPU route backward", err))?;
+        for (source_index, source_grad) in source_indices.into_iter().zip(grads) {
+            self.accumulate_gpu_gradient(
+                &mut layer_output_gradients[source_index],
+                source_grad,
+            )?;
+        }
+        Ok(())
     }
 }
