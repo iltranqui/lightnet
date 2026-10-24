@@ -550,232 +550,29 @@ where
                             && (graph_conv_spec_needs_host(spec)
                                 || self.requires_cpu_backward_fallback()
                                 || has_host_only_deform(&self.network)));
-                    if graph_conv_host_fallback {
-                        let current_host = if layer.index == 0 {
-                            input
-                        } else {
-                            layer_outputs.get(layer.index - 1).ok_or_else(|| {
-                                Error::InvalidConfig(format!(
-                                    "missing host input for GraphConv fallback layer #{}",
-                                    layer.index
-                                ))
-                            })?
-                        };
-                        let (host_output, host_activation, cache) = forward_graph_conv_with_cache(
+                    let forward = if graph_conv_host_fallback {
+                        self.forward_graph_conv_host_gpu(
+                            layer,
                             spec,
                             params,
-                            current_host,
-                            layer.output_shape,
+                            input,
+                            &layer_outputs,
                             training,
-                        )?;
-                        graph_conv_cache = Some(cache);
-                        activation_input_gpu = Some(
-                            self.backend
-                                .upload_f32(
-                                    &tensor_backend_shape(layer.output_shape),
-                                    &host_activation.data,
-                                )
-                                .map_err(|err| {
-                                    backend_error("upload GraphConv fallback activation", err)
-                                })?,
-                        );
-                        self.backend
-                            .upload_f32(
-                                &tensor_backend_shape(layer.output_shape),
-                                &host_output.data,
-                            )
-                            .map_err(|err| backend_error("upload GraphConv fallback output", err))?
+                        )?
                     } else {
-                        let geometry = graph_conv_aggregation_geometry(
+                        self.forward_graph_conv_device_gpu(
+                            layer,
                             spec,
-                            layer.input_shape,
-                            layer.output_shape,
-                        );
-                        let groups = spec.groups.max(1);
-                        let aggregate = if spec.edge_mode == 0 {
-                            self.backend
-                                .graph_conv_aggregate_f32(current_input, geometry, launch_config)
-                                .map_err(|err| {
-                                    backend_error("GraphConv uniform aggregation", err)
-                                })?
-                        } else {
-                            let edge_kernel_values =
-                                params.edge_kernel.as_deref().ok_or_else(|| {
-                                    Error::InvalidConfig(
-                                        "GraphConv learned edge kernel is missing".to_owned(),
-                                    )
-                                })?;
-                            let edge_bias_values =
-                                params.edge_biases.as_deref().ok_or_else(|| {
-                                    Error::InvalidConfig(
-                                        "GraphConv learned edge biases are missing".to_owned(),
-                                    )
-                                })?;
-                            let edge_kernel = self
-                                .backend
-                                .upload_f32(&[edge_kernel_values.len()], edge_kernel_values)
-                                .map_err(|err| {
-                                    backend_error("upload GraphConv edge kernel", err)
-                                })?;
-                            let edge_biases = self
-                                .backend
-                                .upload_f32(&[edge_bias_values.len()], edge_bias_values)
-                                .map_err(|err| {
-                                    backend_error("upload GraphConv edge biases", err)
-                                })?;
-                            self.backend
-                                .graph_conv_learned_aggregate_f32(
-                                    current_input,
-                                    &edge_kernel,
-                                    &edge_biases,
-                                    geometry,
-                                    groups,
-                                    launch_config,
-                                )
-                                .map_err(|err| {
-                                    backend_error("GraphConv learned aggregation", err)
-                                })?
-                        };
-                        let weight_shape =
-                            [spec.filters, layer.input_shape.channels / groups, 1, 1];
-                        let weights = self
-                            .backend
-                            .upload_f32(&weight_shape, &params.projection.weights)
-                            .map_err(|err| {
-                                backend_error("upload GraphConv projection weights", err)
-                            })?;
-                        let raw = self
-                            .backend
-                            .conv2d_f32(
-                                &aggregate,
-                                &weights,
-                                &tensor_backend_shape(layer.output_shape),
-                                layer.input_shape.channels,
-                                layer.output_shape.height,
-                                layer.output_shape.width,
-                                spec.filters,
-                                1,
-                                1,
-                                1,
-                                1,
-                                0,
-                                groups,
-                                launch_config,
-                            )
-                            .map_err(|err| backend_error("GraphConv pointwise projection", err))?;
-                        let raw = if spec.use_self {
-                            let reference = self
-                                .backend
-                                .graph_conv_reference_f32(current_input, geometry, launch_config)
-                                .map_err(|err| {
-                                    backend_error("GraphConv center-reference gather", err)
-                                })?;
-                            let self_values = params.self_weights.as_deref().ok_or_else(|| {
-                                Error::InvalidConfig(
-                                    "GraphConv self weights are missing".to_owned(),
-                                )
-                            })?;
-                            let self_weights = self
-                                .backend
-                                .upload_f32(&weight_shape, self_values)
-                                .map_err(|err| {
-                                    backend_error("upload GraphConv self weights", err)
-                                })?;
-                            let self_raw = self
-                                .backend
-                                .conv2d_f32(
-                                    &reference,
-                                    &self_weights,
-                                    &tensor_backend_shape(layer.output_shape),
-                                    layer.input_shape.channels,
-                                    layer.output_shape.height,
-                                    layer.output_shape.width,
-                                    spec.filters,
-                                    1,
-                                    1,
-                                    1,
-                                    1,
-                                    0,
-                                    groups,
-                                    launch_config,
-                                )
-                                .map_err(|err| backend_error("GraphConv self projection", err))?;
-                            self.backend
-                                .shortcut_add_f32(&raw, &self_raw, launch_config)
-                                .map_err(|err| backend_error("GraphConv projection sum", err))?
-                        } else {
-                            raw
-                        };
-                        let biased = if spec.batch_normalize && training {
-                            let batch_norm =
-                                params.projection.batch_norm.as_ref().ok_or_else(|| {
-                                    Error::InvalidConfig(
-                                        "GraphConv batch-norm parameters are missing".to_owned(),
-                                    )
-                                })?;
-                            let (normalized, cache) = self
-                                .forward_batchnorm_training_gpu_from_host_params(
-                                    &raw,
-                                    &params.projection.biases,
-                                    batch_norm,
-                                    layer.output_shape,
-                                    launch_config,
-                                )?;
-                            batch_norm_cache = Some(cache);
-                            normalized
-                        } else if spec.batch_normalize {
-                            let mut batch_norm =
-                                params.projection.batch_norm.clone().ok_or_else(|| {
-                                    Error::InvalidConfig(
-                                        "GraphConv batch-norm parameters are missing".to_owned(),
-                                    )
-                                })?;
-                            batch_norm.biases.clone_from(&params.projection.biases);
-                            self.forward_batchnorm_inference_gpu(
-                                &raw,
-                                layer.output_shape,
-                                &batch_norm,
-                                launch_config,
-                            )?
-                        } else {
-                            let biases = self
-                                .backend
-                                .upload_f32(&[spec.filters], &params.projection.biases)
-                                .map_err(|err| {
-                                    backend_error("upload GraphConv projection biases", err)
-                                })?;
-                            self.backend
-                                .bias_add_f32(
-                                    &raw,
-                                    &biases,
-                                    spec.filters,
-                                    layer.output_shape.width * layer.output_shape.height,
-                                    launch_config,
-                                )
-                                .map_err(|err| backend_error("GraphConv projection bias", err))?
-                        };
-                        activation_input_gpu = Some(biased.clone());
-                        if let Some(normalization) = spec.activation.to_channel_normalization() {
-                            self.backend
-                                .normalize_channels_f32(
-                                    &biased,
-                                    &tensor_backend_shape(layer.output_shape),
-                                    layer.output_shape.batch,
-                                    layer.output_shape.channels,
-                                    layer.output_shape.width * layer.output_shape.height,
-                                    normalization,
-                                    launch_config,
-                                )
-                                .map_err(|err| {
-                                    backend_error("GraphConv channel normalization", err)
-                                })?
-                        } else {
-                            let activation = gpu_activation_kind(layer.index, &spec.activation)?;
-                            self.backend
-                                .activation_f32(&biased, activation, launch_config)
-                                .map_err(|err| backend_error("GraphConv activation", err))?
-                        }
-                    }
+                            params,
+                            current_input,
+                            training,
+                            launch_config,
+                        )?
+                    };
+                    graph_conv_cache = forward.host_cache;
+                    batch_norm_cache = forward.batch_norm_cache;
+                    activation_input_gpu = Some(forward.activation_input);
+                    forward.output
                 }
                 (LayerKind::Dcnv4(spec), LayerParams::Dcnv4(params)) => {
                     if deform_device {

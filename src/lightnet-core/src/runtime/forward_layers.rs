@@ -65,7 +65,7 @@ pub(super) fn forward_dsconv_with_cache(
     Ok((output, activation_input, DsConvRuntimeCache { math }))
 }
 
-pub(super) fn graph_conv_aggregation_geometry(
+pub(crate) fn graph_conv_aggregation_geometry(
     spec: &GraphConvSpec,
     input: TensorShape,
     output: TensorShape,
@@ -85,7 +85,7 @@ pub(super) fn graph_conv_aggregation_geometry(
     }
 }
 
-pub(super) fn forward_graph_conv_with_cache(
+pub(crate) fn forward_graph_conv_with_cache(
     spec: &GraphConvSpec,
     params: &GraphConvParams,
     input: &Tensor,
