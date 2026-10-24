@@ -338,7 +338,7 @@ pub(super) fn vit_update_clip_scale(
     }
 }
 
-pub(super) fn accumulate_vec(dst: &mut [f32], src: &[f32]) -> Result<()> {
+pub(crate) fn accumulate_vec(dst: &mut [f32], src: &[f32]) -> Result<()> {
     if dst.len() != src.len() {
         return Err(Error::InvalidConfig(format!(
             "gradient accumulation length mismatch: expected {}, got {}",

@@ -1,6 +1,7 @@
 use crate::error::{Error, Result};
-use crate::model::{LayerKind, Network};
+use crate::model::{Layer, LayerKind, Network};
 use crate::runtime::*;
+use crate::runtime::accumulate_vec;
 
 pub(crate) fn hyperbolic_foveation_predictor_initial_biases(
     spec: &crate::model::HyperbolicFoveationSpec,
@@ -586,4 +587,197 @@ pub(crate) fn backward_hyperbolic_foveation(
         gradient,
         constrained_seed,
     ))
+}
+
+impl<B> GpuExecutableNetwork<B>
+where
+    B: lightnet_cuda::F32TensorOpsBackend,
+    B::Error: std::fmt::Display,
+{
+
+    /// Native hyperbolic-foveation backward, folding in any FoveationFilm auxiliary gradient.
+    pub(crate) fn backward_hyperbolic_foveation_gpu(
+        &self,
+        layer: &Layer,
+        spec: &crate::model::HyperbolicFoveationSpec,
+        params: &HyperbolicFoveationParams,
+        foveation_hf_auxiliary_gradients: &[Option<Vec<f32>>],
+        forward: &GpuForwardState<B::Tensor>,
+        grad: B::Tensor,
+        config: lightnet_cuda::ElementwiseLaunchConfig,
+        layer_output_gradients: &mut [Option<B::Tensor>],
+    ) -> Result<()> {
+        let cache = forward
+            .cpu_forward
+            .hyperbolic_foveation_caches
+            .get(layer.index)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| Error::InvalidConfig(format!(
+                "missing [hyperbolic_foveation] forward cache for layer #{}",
+                layer.index
+            )))?;
+        let network_input = self.download_tensor(
+            &forward.input_gpu,
+            self.network.net.input_shape(),
+        ).map_err(|err| backend_error("download HF network input", err))?;
+        let previous_input = if layer.index == 0 {
+            &network_input
+        } else {
+            forward.cpu_forward.layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                Error::InvalidConfig(format!(
+                    "missing host input for hyperbolic_foveation layer #{}",
+                    layer.index
+                ))
+            })?
+        };
+        let warp_input = match spec.warp_source {
+            crate::model::HfWarpSource::Previous => previous_input,
+            crate::model::HfWarpSource::NetworkInput => &network_input,
+        };
+        let output_gradient = self.download_tensor(&grad, layer.output_shape)
+            .map_err(|err| backend_error("download HF output gradient", err))?;
+        let warp_input_gpu = match spec.warp_source {
+            crate::model::HfWarpSource::Previous if layer.index > 0 => {
+                forward.gpu_layer_outputs.get(layer.index - 1).ok_or_else(|| {
+                    Error::InvalidConfig(format!(
+                        "missing GPU warp source for hyperbolic_foveation layer #{}",
+                        layer.index
+                    ))
+                })?
+            }
+            _ => &forward.input_gpu,
+        };
+        let grid_gpu = self.backend.upload_f32(
+            &[warp_input.shape.batch, warp_input.shape.height, warp_input.shape.width, 2],
+            &cache.grid,
+        ).map_err(|err| backend_error("upload HF backward grid", err))?;
+        let (native_warp_gradient, native_grid_gradient) = self.backend
+            .hyperbolic_foveation_warp_backward_f32(
+                warp_input_gpu,
+                &grid_gpu,
+                &grad,
+                &tensor_backend_shape(warp_input.shape),
+                config,
+            )
+            .map_err(|err| backend_error("native HF warp backward", err))?;
+        let batch = warp_input.shape.batch;
+        let param_count = spec.param_count();
+        let params_gpu = self.backend.upload_f32(
+            &[batch, param_count], &cache.params_per_batch,
+        ).map_err(|err| backend_error("upload HF inverse parameters", err))?;
+        let shape = tensor_backend_shape(warp_input.shape);
+        let native_semantic_gradient = self.backend
+            .hyperbolic_foveation_inverse_param_grad_f32(
+                &params_gpu, &native_grid_gradient, &shape, param_count,
+                spec.alpha, spec.p_exp, spec.nr_iters, spec.nr_eta,
+                spec.inverse_method == crate::model::HfInverseMethod::Newton, config,
+            )
+            .map_err(|err| backend_error("native HF inverse parameter adjoint", err))?
+            .map(|semantic| self.backend.download_f32(&semantic)
+                .map_err(|err| backend_error("download HF semantic parameter gradients", err)))
+            .transpose()?;
+        let native_grid_gradient = self.backend.download_f32(&native_grid_gradient)
+            .map_err(|err| backend_error("download native HF grid gradient", err))?;
+        let auxiliary = foveation_hf_auxiliary_gradients
+            .get(layer.index)
+            .and_then(Option::as_deref);
+        let (_host_warp_gradient, mut predictor_gradient, mut param_gradient, constrained_seed) =
+            backward_hyperbolic_foveation(
+                spec, params, warp_input, &output_gradient, cache, auxiliary,
+                Some(&native_grid_gradient), native_semantic_gradient.as_deref(),
+                true,
+            )?;
+        if spec.pred_hidden > 0 {
+            let predictor = cache.predictor.as_ref().ok_or_else(|| Error::InvalidConfig(
+                "missing HF predictor cache for native backward".to_owned(),
+            ))?;
+            let batch = warp_input.shape.batch;
+            let input_dim = predictor.pooled.len() / batch;
+            let pooled = self.backend.upload_f32(&[batch, input_dim], &predictor.pooled)
+                .map_err(|err| backend_error("upload HF predictor pooled cache", err))?;
+            let preactivation = self.backend.upload_f32(&[batch, spec.pred_hidden], &predictor.hidden_preactivation)
+                .map_err(|err| backend_error("upload HF predictor preactivation cache", err))?;
+            let hidden = self.backend.upload_f32(&[batch, spec.pred_hidden], &predictor.hidden)
+                .map_err(|err| backend_error("upload HF predictor hidden cache", err))?;
+            let raw = self.backend.upload_f32(&[batch, spec.param_count()], &predictor.raw_output)
+                .map_err(|err| backend_error("upload HF predictor raw cache", err))?;
+            let seed = self.backend.upload_f32(&[batch, spec.param_count()], &constrained_seed)
+                .map_err(|err| backend_error("upload HF predictor adjoint seed", err))?;
+            let w1 = self.backend.upload_f32(&[spec.pred_hidden, input_dim], &params.pred_w1)
+                .map_err(|err| backend_error("upload HF predictor w1", err))?;
+            let w2 = self.backend.upload_f32(&[spec.param_count(), spec.pred_hidden], &params.pred_w2)
+                .map_err(|err| backend_error("upload HF predictor w2", err))?;
+            let (source_gradient, w1_and_b1, w2_and_b2) = self.backend
+                .hyperbolic_foveation_predictor_backward_f32(
+                    &pooled, &preactivation, &hidden, &raw, &seed, &w1, &w2,
+                    &tensor_backend_shape(spec.pred_input_shape), spec.downsample,
+                    spec.pred_hidden, spec.param_count(), config,
+                )
+                .map_err(|err| backend_error("native HF predictor backward", err))?;
+            let w1_and_b1 = self.backend.download_f32(&w1_and_b1)
+                .map_err(|err| backend_error("download HF predictor w1/b1 gradients", err))?;
+            let w2_and_b2 = self.backend.download_f32(&w2_and_b2)
+                .map_err(|err| backend_error("download HF predictor w2/b2 gradients", err))?;
+            let w1_count = param_gradient.pred_w1.len();
+            let w2_count = param_gradient.pred_w2.len();
+            if w1_and_b1.len() != w1_count + param_gradient.pred_b1.len()
+                || w2_and_b2.len() != w2_count + param_gradient.pred_b2.len() {
+                return Err(Error::InvalidConfig("native HF predictor gradient lengths mismatch".to_owned()));
+            }
+            param_gradient.pred_w1.copy_from_slice(&w1_and_b1[..w1_count]);
+            param_gradient.pred_b1.copy_from_slice(&w1_and_b1[w1_count..]);
+            param_gradient.pred_w2.copy_from_slice(&w2_and_b2[..w2_count]);
+            param_gradient.pred_b2.copy_from_slice(&w2_and_b2[w2_count..]);
+            let source_gradient = self.backend.download_f32(&source_gradient)
+                .map_err(|err| backend_error("download HF predictor source gradient", err))?;
+            predictor_gradient = Some((
+                spec.pred_source_layer,
+                Tensor::from_data(spec.pred_input_shape, source_gradient)?,
+            ));
+        }
+        {
+            let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+            let Some(LayerTrainBuffers::HyperbolicFoveation(train)) =
+                buffers.get_mut(layer.index)
+            else {
+                return Err(Error::InvalidConfig(format!(
+                    "missing hyperbolic_foveation train buffers for layer #{}",
+                    layer.index
+                )));
+            };
+            accumulate_vec(&mut train.hf_param_updates, &param_gradient.hf_params)?;
+            accumulate_vec(&mut train.pred_w1_updates, &param_gradient.pred_w1)?;
+            accumulate_vec(&mut train.pred_b1_updates, &param_gradient.pred_b1)?;
+            accumulate_vec(&mut train.pred_w2_updates, &param_gradient.pred_w2)?;
+            accumulate_vec(&mut train.pred_b2_updates, &param_gradient.pred_b2)?;
+        }
+        if spec.warp_source == crate::model::HfWarpSource::Previous {
+            self.accumulate_previous_gpu_gradient(
+                layer.index,
+                native_warp_gradient,
+                layer_output_gradients,
+            )?;
+        }
+        if let Some((source_layer, source_gradient)) = predictor_gradient {
+            let source_gradient = self.backend.upload_f32(
+                &tensor_backend_shape(source_gradient.shape),
+                &source_gradient.data,
+            ).map_err(|err| backend_error("upload HF predictor source gradient", err))?;
+            if let Some(source_layer) = source_layer {
+                let Some(destination) = layer_output_gradients.get_mut(source_layer) else {
+                    return Err(Error::InvalidConfig(format!(
+                        "HF predictor source layer #{source_layer} is unavailable during backward"
+                    )));
+                };
+                self.accumulate_gpu_gradient(destination, source_gradient)?;
+            } else {
+                self.accumulate_previous_gpu_gradient(
+                    layer.index,
+                    source_gradient,
+                    layer_output_gradients,
+                )?;
+            }
+        }
+        Ok(())
+    }
 }
