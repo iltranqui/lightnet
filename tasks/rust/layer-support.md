@@ -127,7 +127,7 @@ with the command given rather than trusting the number.
 | `LayaMarkerGather` | yes | none | fwd | exact | pin | native | device | yes |
 | `LayaActHead` | yes | C++ | fwd | exact (CPU path) | pin | native | cpu (primitive native) | yes (compact inference; training unsupported) |
 | `LayaLoss` | yes | none | head | head | pin | native f32 full + compact row-softmax (loss on host) | head | no |
-| `JevCe` | alias | none | head | head | T2 | native f32 full + compact grouped softmax (loss on host) | head | yes (f16 inference; both layouts) |
+| `JevCe` | alias | none | head | head | T2 | native f32 full + compact grouped softmax; native loss/delta via `compute_jev_ce_training_loss_gpu` (v0.2.196) | head (native delta seeds the existing backward) | yes (f16 inference; both layouts) |
 | `Segmentation` | alias | none | head | head | T2 | native f32 full + compact activation (loss on host) | head | no |
 | `OmdLoss` | alias | none | pass + head | head | T2 | native f32 identity full + compact | head | yes (inference) |
 | `Contrastive` | yes | none | pass + head | head | T2 | pass | head | no |

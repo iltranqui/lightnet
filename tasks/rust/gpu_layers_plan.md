@@ -657,15 +657,16 @@ preserves the open Stage-1 multi-template and axis/layout work.
 ## Remaining scope
 
 Act-head runtime backward/update/file loading, other LAYA/transformer layers,
-CenterNet, modern-YOLO, Segmentation, JevCe and LayaLoss host-owned head
+CenterNet, modern-YOLO, Segmentation and LayaLoss host-owned head
 loss/backward (native full/compact f32 activation forwards landed unversioned
-in §§224–228), DCNv4 Adam and
+in §§224–228; native JevCe loss/delta landed in v0.2.196, §260), DCNv4 Adam and
 excluded-variant host fallbacks,
 batch-normalized DeformConv host fallback, CPU-only layer GPU paths and
 other matrix-family GPU Muon remain open. Dilated non-BN DeformConv
 predictor/runtime coverage landed in
 v0.2.160; native deconvolution `NormalizeChannels*` landed in v0.2.193 and
 compact f32 deconvolution inference in v0.2.194 and compact f16 inference in
-v0.2.195; see `implemented.md` §§199, 257–259. Each layer needs device forward/backward/update tests as
+v0.2.195, and native JevCe loss/delta in v0.2.196; see `implemented.md` §§199,
+257–260. Each layer needs device forward/backward/update tests as
 applicable and explicit limits. CPU/config/axis gaps remain open. No green full-
 host/corpus/full-Oxide suite is established; sparse MoE stays unstarted.

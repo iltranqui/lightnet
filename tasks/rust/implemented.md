@@ -2672,3 +2672,26 @@ relative error 1.71e-3 against the 4e-3 gate); `cargo xtask gpu-check` clean;
 `cargo xtask clippy` completed with pre-existing warnings only. Runs were
 uncapped (`systemd-run --user` unavailable), `-j 2`. No training run and no
 full-suite claim. Tag `v0.2.195`.
+
+## 260. Native JevCe loss and delta
+
+v0.2.196. Added `DenseLossBackend` plus a device `[jev_ce]` loss kernel and
+`GpuExecutableNetwork::compute_jev_ce_training_loss_gpu`. One thread owns a
+sample/group, computes the temperature softmax, soft-target cross-entropy with
+label smoothing, the masked-empty-group rule, per-sample normalization, and the
+scaled descent direction. Losses and active flags come back in small host
+vectors so the mean matches the CPU `active` count; the delta stays a device
+tensor until the runtime downloads it as the backward seed. Both `layout=group`
+and `layout=cm` are covered.
+
+Known limits: only JevCe is native; CenterNet, modern-YOLO, Segmentation and
+LayaLoss still use the host dense-loss path. The CLI's dense-head training
+entry points are not wired to the new method yet, and no compiled-C++ golden
+exists.
+
+Evidence: `cargo xtask oxide --test oxide_runtime_chain jev_ce_native` 3 of 3,
+including loss/delta parity for both layouts and a seeded-backward weight/bias
+gradient parity check; `cargo xtask gpu-check` clean; `cargo xtask clippy`
+completed with pre-existing warnings only. Runs were uncapped
+(`systemd-run --user` unavailable), `-j 2`. No training run and no full-suite
+claim. Tag `v0.2.196`.
