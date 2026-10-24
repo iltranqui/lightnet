@@ -606,7 +606,7 @@ where
         Ok(())
     }
 
-    pub(super) fn accumulate_device_moe_train_buffer(
+    pub(crate) fn accumulate_device_moe_train_buffer(
         &self,
         layer_index: usize,
         router_weight_gradient: &B::Tensor,

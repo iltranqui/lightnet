@@ -19,7 +19,7 @@ pub(crate) fn deconvolutional_spec_is_native(spec: &DeconvolutionalSpec) -> bool
 /// Native GraphConv training forward/backward covers edge modes 0/1 and
 /// supported activations, including batch-statistics BN; compact inference also
 /// supports BN affine using rolling statistics.
-pub(super) fn graph_conv_spec_needs_host(spec: &GraphConvSpec) -> bool {
+pub(crate) fn graph_conv_spec_needs_host(spec: &GraphConvSpec) -> bool {
     !matches!(spec.edge_mode, 0 | 1)
         || (spec.activation.to_channel_normalization().is_none()
             && spec.activation.to_cuda_f32_kind().is_none())
