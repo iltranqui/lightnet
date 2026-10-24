@@ -6430,6 +6430,116 @@ impl lightnet_cuda::DenseLossBackend for OxideBackend {
         };
         Ok((mean, OxideTensorF32::new(delta, shape)))
     }
+
+    fn segmentation_loss_f32(
+        &self,
+        output: &Self::Tensor,
+        truth: &Self::Tensor,
+        shape: &[usize],
+        classes: usize,
+        spatial: usize,
+        softmax_loss: bool,
+        scale: f32,
+        gate_strength: f32,
+        gate_t_correct: f32,
+        gate_max_compensation: f32,
+        max_delta: f32,
+        clipping: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(f32, Self::Tensor), Self::Error> {
+        let output_f = self.f32v(output)?;
+        let output = &*output_f;
+        let truth_f = self.f32v(truth)?;
+        let truth = &*truth_f;
+        const OP: &str = "segmentation_loss_f32";
+        let batch = if shape.len() == 4 { shape[0] } else { 0 };
+        let expected_spatial = if shape.len() == 4 {
+            shape[2] * shape[3]
+        } else {
+            0
+        };
+        if shape.len() != 4
+            || batch == 0
+            || classes == 0
+            || spatial == 0
+            || spatial != expected_spatial
+            || classes
+                .checked_mul(spatial)
+                .and_then(|per_sample| per_sample.checked_mul(batch))
+                != Some(output.len())
+            || output.len() != truth.len()
+            || output.shape() != shape
+            || truth.shape() != shape
+        {
+            return Err(shape_err(
+                OP,
+                format!(
+                    "incompatible segmentation shape/classes/spatial: {shape:?}, {classes}, {spatial}"
+                ),
+            ));
+        }
+        let total = output.len();
+        let mut delta = self.alloc_uninit(total)?;
+        let mut partial_loss = self.alloc(batch)?;
+        let mut suppressed = self.alloc(batch)?;
+        // SAFETY: one thread per sample owns its output/truth reads and its
+        // per-sample loss/suppressed slots; the delta slots are disjoint.
+        unsafe {
+            self.layers_extra.segmentation_loss(
+                &self.stream,
+                launch::elementwise(batch, config),
+                &output.buf,
+                &truth.buf,
+                &mut delta,
+                &mut partial_loss,
+                &mut suppressed,
+                batch,
+                classes,
+                spatial,
+                softmax_loss as u32,
+                scale,
+                gate_strength,
+                gate_t_correct,
+            )
+        }
+        .map_err(launch_err)?;
+        let partial_host = partial_loss.to_host_vec(&self.stream)?;
+        let suppressed_host = suppressed.to_host_vec(&self.stream)?;
+        let mut loss_sum = 0.0f32;
+        let mut suppressed_total = 0.0f32;
+        for (loss, count) in partial_host.iter().zip(&suppressed_host) {
+            loss_sum += *loss;
+            suppressed_total += *count;
+        }
+        let total_pixels = batch * spatial;
+        let active = total_pixels as f32 - suppressed_total;
+        let mut compensation = if active > 0.0 && active < total_pixels as f32 {
+            (total_pixels as f32 / active).min(gate_max_compensation)
+        } else {
+            1.0
+        };
+        if compensation <= 1.0 {
+            compensation = 1.0;
+        }
+        // SAFETY: one thread per delta element.
+        unsafe {
+            self.layers_extra.segmentation_scale_delta(
+                &self.stream,
+                launch::elementwise(total, config),
+                &mut delta,
+                compensation,
+                max_delta,
+                clipping as u32,
+            )
+        }
+        .map_err(launch_err)?;
+        let mean = if total_pixels == 0 {
+            0.0
+        } else {
+            loss_sum / total_pixels as f32
+        };
+        Ok((mean, OxideTensorF32::new(delta, shape)))
+    }
 }
 
 impl F32TensorOpsBackend for OxideBackend {

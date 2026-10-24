@@ -4734,6 +4734,26 @@ pub trait DenseLossBackend: F32TensorOpsBackend {
         channel_major: bool,
         config: ElementwiseLaunchConfig,
     ) -> Result<(f32, Self::Tensor), Self::Error>;
+
+    /// Per-pixel segmentation cross-entropy with the correct-pixel gate,
+    /// compensation and clip.  Returns `(mean_loss, scaled_delta)`.
+    #[allow(clippy::too_many_arguments)]
+    fn segmentation_loss_f32(
+        &self,
+        output: &Self::Tensor,
+        truth: &Self::Tensor,
+        shape: &[usize],
+        classes: usize,
+        spatial: usize,
+        softmax_loss: bool,
+        scale: f32,
+        gate_strength: f32,
+        gate_t_correct: f32,
+        gate_max_compensation: f32,
+        max_delta: f32,
+        clipping: bool,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(f32, Self::Tensor), Self::Error>;
 }
 
 pub trait F16TensorOpsBackend: F32TensorOpsBackend {

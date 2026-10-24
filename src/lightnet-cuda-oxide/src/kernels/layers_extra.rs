@@ -2380,6 +2380,138 @@ pub mod kernels {
         }
     }
 
+    /// One thread owns one segmentation sample: computes the per-element
+    /// cross-entropy and `truth - prediction` delta, applies `lambda_ce` and
+    /// the correct-pixel gate weight, and writes per-sample loss and suppressed
+    /// pixel counts for the host reduction.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn segmentation_loss(
+        output: &[f32],
+        truth: &[f32],
+        mut delta: DisjointSlice<f32>,
+        mut partial_loss: DisjointSlice<f32>,
+        mut suppressed: DisjointSlice<f32>,
+        batch: usize,
+        classes: usize,
+        spatial: usize,
+        softmax_loss: u32,
+        scale: f32,
+        gate_strength: f32,
+        t_correct: f32,
+    ) {
+        let sample = thread::index_1d().get();
+        if sample >= batch {
+            return;
+        }
+        let base = sample * classes * spatial;
+        let mut sample_loss = 0.0f32;
+        let mut suppressed_count = 0usize;
+        let mut location = 0usize;
+        while location < spatial {
+            let (is_match, p_y) = if classes == 1 {
+                let p = output[base + location];
+                let y = truth[base + location];
+                ((p > 0.5) == (y > 0.5), if y > 0.5 { p } else { 1.0 - p })
+            } else {
+                let mut y_class = 0usize;
+                let mut pred_class = 0usize;
+                let mut max_truth = truth[base + location];
+                let mut max_pred = output[base + location];
+                let mut class = 1usize;
+                while class < classes {
+                    let index = base + class * spatial + location;
+                    if truth[index] > max_truth {
+                        max_truth = truth[index];
+                        y_class = class;
+                    }
+                    if output[index] > max_pred {
+                        max_pred = output[index];
+                        pred_class = class;
+                    }
+                    class += 1;
+                }
+                (pred_class == y_class, output[base + y_class * spatial + location])
+            };
+            let gated = gate_strength > 0.0 && is_match && p_y >= t_correct;
+            let weight = if gated { 1.0 - gate_strength } else { 1.0 };
+            if gated {
+                suppressed_count += 1;
+            }
+            let mut class = 0usize;
+            while class < classes {
+                let index = base + class * spatial + location;
+                let t = truth[index];
+                let p = output[index];
+                let (error, d) = if softmax_loss != 0 {
+                    let pc = if p < 1.0e-12 {
+                        1.0e-12
+                    } else if p > 1.0 {
+                        1.0
+                    } else {
+                        p
+                    };
+                    (if t != 0.0 { -pc.ln() } else { 0.0 }, t - p)
+                } else {
+                    let pc = if p < 1.0e-12 {
+                        1.0e-12
+                    } else if p > 1.0 - 1.0e-12 {
+                        1.0 - 1.0e-12
+                    } else {
+                        p
+                    };
+                    (
+                        -t * pc.ln() - (1.0 - t) * (1.0 - pc).ln(),
+                        t - p,
+                    )
+                };
+                let mut l = error * scale * weight;
+                if !l.is_finite() {
+                    l = 0.0;
+                }
+                let d = d * scale * weight;
+                unsafe {
+                    *delta.as_mut_ptr().add(index) = d;
+                }
+                sample_loss += l;
+                class += 1;
+            }
+            location += 1;
+        }
+        if let Some(slot) = partial_loss.get_mut(thread::index_1d()) {
+            *slot = sample_loss;
+        }
+        if let Some(slot) = suppressed.get_mut(thread::index_1d()) {
+            *slot = suppressed_count as f32;
+        }
+    }
+
+    /// Applies the gate compensation and `max_delta` clip to a segmentation
+    /// delta buffer in place.
+    #[kernel]
+    pub fn segmentation_scale_delta(
+        mut delta: DisjointSlice<f32>,
+        compensation: f32,
+        max_delta: f32,
+        clipping: u32,
+    ) {
+        let idx = thread::index_1d();
+        if let Some(slot) = delta.get_mut(idx) {
+            let mut value = *slot * compensation;
+            if !value.is_finite() {
+                value = 0.0;
+            }
+            if clipping != 0 {
+                if value > max_delta {
+                    value = max_delta;
+                } else if value < -max_delta {
+                    value = -max_delta;
+                }
+            }
+            *slot = value;
+        }
+    }
+
     /// One thread owns a complete `[jev_ce]` group and writes its softmax row.
     #[kernel]
     pub fn jev_ce_forward(
