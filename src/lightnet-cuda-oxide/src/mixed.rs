@@ -78,11 +78,6 @@ pub(crate) fn amp_format_from_env() -> Option<HalfFormat> {
     parse_amp_format(&std::env::var("LIGHTNET_OXIDE_AMP").unwrap_or_default())
 }
 
-/// True when `LIGHTNET_OXIDE_AMP` selects either 16-bit format.
-pub(crate) fn amp_from_env() -> bool {
-    amp_format_from_env().is_some()
-}
-
 /// One cached f16 copy of an f32 master-weight tensor.
 pub(crate) struct W16Entry {
     key: Weak<PooledBuf>,

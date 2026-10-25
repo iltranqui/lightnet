@@ -108,8 +108,6 @@ pub(crate) const FP8_HIST_KEYS: usize = 4096;
 /// across training steps instead of restarting whenever a tensor is reallocated.
 const FP8_SITE_FORWARD_A: u64 = 0x4650_0001;
 const FP8_SITE_FORWARD_B: u64 = 0x4650_0002;
-const FP8_SITE_DGRAD_A: u64 = 0x4650_0003;
-const FP8_SITE_DGRAD_B: u64 = 0x4650_0004;
 const FP8_SITE_WGRAD_A: u64 = 0x4650_0005;
 const FP8_SITE_WGRAD_B: u64 = 0x4650_0006;
 const FP8_SITE_WEIGHTS_B: u64 = 0x4650_0007;
@@ -342,8 +340,6 @@ fn fp8_backward_from_env() -> Option<(Fp8Format, Fp8Format)> {
 /// Which conv backward GEMM a call belongs to; decides where `dy` sits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BackwardRole {
-    /// `dy` is operand B.
-    Dgrad,
     /// `dy` is operand A.
     Wgrad,
 }
@@ -1918,11 +1914,9 @@ impl OxideBackend {
         match self.bwd_fp8 {
             Some((fx, fdy)) => {
                 let (fa, fb) = match role {
-                    BackwardRole::Dgrad => (fx, fdy),
                     BackwardRole::Wgrad => (fdy, fx),
                 };
                 let (key_a, key_b) = match role {
-                    BackwardRole::Dgrad => (FP8_SITE_DGRAD_A, FP8_SITE_DGRAD_B),
                     BackwardRole::Wgrad => (FP8_SITE_WGRAD_A, FP8_SITE_WGRAD_B),
                 };
                 self.gemm_f32_via_fp8_fmt(a, b, c, g, fa, fb, key_a, key_b)
