@@ -78,7 +78,8 @@ fn mambavision_native_runtime_accumulation_and_two_updates_match_cpu() {
         (3, 4, 1, 1, ""), (4, 4, 0, 1, "muon=1\ndecoupled_decay=1\n"),
     ] {
         let text = format!("[net]\nbatch=2\nwidth=3\nheight=2\nchannels={channels}\n{optimizer}\n[mambavision]\nfilters={filters}\nstate=2\nconv_size=3\ndt_rank=2\nffn_ratio=2\nactivation=gelu\ncausal={causal}\nmsa={msa}\nmsa_heads=2\nmsa_block_size=2\nmsa_topk=2\n");
-        let network = Network::from_config(ConfigFile::parse_str("mamba-native.cfg", &text).unwrap()).unwrap();
+        let mut network = Network::from_config(ConfigFile::parse_str("mamba-native.cfg", &text).unwrap()).unwrap();
+        network.net.decay=0.0005;
         let mut cpu = ExecutableNetwork::new(network.clone());
         if let LayerParams::MambaVision(p) = &mut cpu.params[0] {
             p.values = values(p.values.len(), 3.0);
@@ -108,9 +109,12 @@ fn mambavision_native_runtime_accumulation_and_two_updates_match_cpu() {
                     .unwrap().expect("native Mamba input gradient");
                 close("input gradient", &actual.data, &reference.input_gradient.data, 8e-4);
             }
+            gpu.synchronize_resident_parameter_gradients().unwrap();
             close("accumulated parameter gradients", updates(&gpu.host_fallback_train_buffers()[0]),
                 updates(&cpu.train_buffers[0]), 8e-4);
-            cpu.update_weights(0.003, 0.9, 0.0005, 2);
+            if cpu.network.net.muon {cpu.update_weights_muon(0.003,2).unwrap();}
+            else if cpu.network.net.adam {cpu.update_weights_adam(0.003,2).unwrap();}
+            else {cpu.update_weights(0.003, 0.9, 0.0005, 2);}
             gpu.update_weights_gpu(0.003, 0.9, 0.0005, 2).unwrap();
             close("updated parameters", blob(&gpu.params[0]), blob(&cpu.params[0]), 8e-4);
         }

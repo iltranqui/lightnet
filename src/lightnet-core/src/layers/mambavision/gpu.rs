@@ -1,13 +1,14 @@
 //! Native MambaVision composition and exact input/parameter adjoints.
 //! Parameters and update directions retain the CPU serialized block order.
-//! Optimizer updates remain host-staged; derivative-boundary flags are read
-//! at backward entry rather than downloading activations for CPU math.
+//! Native SGD/Adam retain parameters, gradients and moments on device. Muon
+//! keeps its explicit hybrid path. Boundary flags are read at backward entry.
 use std::ops::Range;
 use super::cpu::{MambaOffsets, MambaVisionGeometry};
 use crate::layers::vit::gpu::device_activation;
 use crate::error::{Error, Result};
 use crate::model::{Layer, MambaVisionSpec};
-use crate::runtime::{GpuExecutableNetwork, LayerTrainBuffers, backend_error, tensor_backend_shape};
+use crate::runtime::{GpuExecutableNetwork, LayerTrainBuffers, ResidentParameterRange,
+    backend_error, tensor_backend_shape};
 use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
 use lightnet_cuda::mambavision::{MambaScanForward, MambaScanGeometry};
 
@@ -20,6 +21,7 @@ pub(crate) fn supported(layer: &Layer, spec: &MambaVisionSpec) -> bool {
 pub(crate) struct DeviceCache<T> {
     geometry: MambaVisionGeometry,
     parameters: Vec<T>,
+    resident_generation: Option<u64>,
     tokens: T,
     ln1: T,
     projected: T,
@@ -105,13 +107,20 @@ where
         let be = &self.backend;
         let err = |e| backend_error("GPU MambaVision forward", e);
         let o = offsets(&g)?;
-        let mut p = Vec::with_capacity(22);
-        for range in ranges(&o) {
-            // The absent residual block gets a one-element unused sentinel,
-            // avoiding zero-length device allocations.
-            p.push(if range.is_empty() { be.zeros_f32(&[1]).map_err(err)? }
-                else { be.upload_f32(&[range.len()], &params.values[range]).map_err(err)? });
-        }
+        let (p,resident_generation) = if self.resident_parameter_path_enabled() {
+            let layout = super::mambavision_param_blocks(params).map_err(Error::InvalidConfig)?
+                .into_iter().map(|b|ResidentParameterRange{range:b.range,decay:b.decay}).collect();
+            let (p,generation) = self.resident_parameter_slices(layer.index,&params.values,
+                layout,&ranges(&o),config)?;
+            (p,Some(generation))
+        } else {
+            let mut p = Vec::with_capacity(22);
+            for range in ranges(&o) {
+                p.push(if range.is_empty() { be.zeros_f32(&[1]).map_err(err)? }
+                    else { be.upload_f32(&[range.len()], &params.values[range]).map_err(err)? });
+            }
+            (p,None)
+        };
         let lin = |x: &B::Tensor, w: usize, bias: Option<usize>, ins: usize, outs: usize| {
             let zero;
             let bias = if let Some(i) = bias { &p[i] }
@@ -154,7 +163,7 @@ where
         let output = be.residual_bias_f32(&residual, &ffn_out, None,
             &[rows, n], rows, n, config).map_err(err)?;
         let output = be.vit_tokens_to_nchw_f32(&output, b, g.height, g.width, n, config).map_err(err)?;
-        let cache = training.then(|| DeviceCache { geometry: g, parameters: p, tokens,
+        let cache = training.then(|| DeviceCache { geometry: g, parameters: p, resident_generation, tokens,
             ln1, projected, x_pre, x, z_pre, selective, scan, initial_state,
             msa, mixer, residual, ln2, ffn_pre, ffn_act });
         Ok((output, cache))
@@ -254,6 +263,13 @@ where
         parameter_grads.extend([(LN1_G, dg), (LN1_B, db)]);
         d_tokens = add(&d_tokens, &dx, c)?;
         let dx = be.vit_tokens_to_nchw_f32(&d_tokens, b, g.height, g.width, c, config).map_err(err)?;
+        if let Some(generation) = cache.resident_generation {
+            let gradients = parameter_grads.into_iter()
+                .map(|(block,tensor)|(descriptions[block].clone(),tensor)).collect();
+            self.accumulate_resident_parameter_gradients(layer.index,generation,gradients,config)?;
+            drop(caches);
+            return self.accumulate_previous_gpu_gradient(layer.index,dx,layer_output_gradients);
+        }
         // Stage complete gradients before mutating accumulation buffers.
         let mut updates = vec![0.0; o.total];
         for (block, tensor) in parameter_grads {

@@ -235,6 +235,24 @@ fn mambavision_host_adam_updates_match_fake_backend() {
 }
 
 #[test]
+fn mambavision_optimizer_accumulator_is_negative_mathematical_gradient() {
+    let network=Network::from_config(ConfigFile::parse_str("mamba-descent.cfg",
+        "[net]\nwidth=1\nheight=1\nchannels=2\nbatch=1\n[mambavision]\nfilters=2\nstate=1\nconv_size=1\ndt_rank=1\nffn_ratio=1\nactivation=linear\n").unwrap()).unwrap();
+    let mut cpu=ExecutableNetwork::new(network);
+    let input=Tensor::from_data(cpu.network.net.input_shape(),vec![0.2,-0.4]).unwrap();
+    let forward=cpu.forward_training(&input).unwrap();
+    let output=forward.final_output().unwrap();
+    let seed=Tensor::from_data(output.shape,vec![0.3,-0.7]).unwrap();
+    let backward=cpu.backward_accumulate_seeded(&input,&forward,&[Some(seed)]).unwrap();
+    let LayerParams::MambaVision(grad)=&backward.param_gradients[0]else{panic!("Mamba gradient")};
+    let LayerTrainBuffers::MambaVision(train)=&cpu.train_buffers[0]else{panic!("Mamba buffers")};
+    assert!(grad.values.iter().any(|x|x.abs()>1e-4));
+    for(i,(&direction,&derivative))in train.updates.iter().zip(&grad.values).enumerate(){
+        assert!((direction+derivative).abs()<1e-6,"parameter {i}: direction {direction}, derivative {derivative}");
+    }
+}
+
+#[test]
 fn tucker_attention_host_adam_and_fake_backend_updates_match() {
     let network = Network::from_config(
         ConfigFile::parse_str(

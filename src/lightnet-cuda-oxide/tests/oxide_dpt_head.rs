@@ -31,7 +31,8 @@ fn dpt_native_four_tap_forward_backward_accumulation_and_updates_match_cpu() {
     // and all four fusion branches. Two batches pin tap channel routing.
     for (width, height, optimizer) in [(3, 2, ""), (3, 3, "adam=1\n"), (2, 3, "muon=1\ndecoupled_decay=1\n")] {
         let cfg = format!("[net]\nwidth={width}\nheight={height}\nchannels=4\nbatch=2\n{optimizer}\n[dpt_head]\nembed_dim=1\nfusion=2\nhead_hidden=2\npatch_size=1\ntaps=4\nneck=1,1,1,1\nreassemble=4,2,1,0\n");
-        let network = Network::from_config(ConfigFile::parse_str("native-dpt.cfg", &cfg).unwrap()).unwrap();
+        let mut network = Network::from_config(ConfigFile::parse_str("native-dpt.cfg", &cfg).unwrap()).unwrap();
+        network.net.decay=0.0005;
         let mut cpu = ExecutableNetwork::new(network.clone());
         let LayerParams::DptHead(p) = &mut cpu.params[0] else { panic!("DPT params") };
         p.values = values(p.values.len());
@@ -56,7 +57,9 @@ fn dpt_native_four_tap_forward_backward_accumulation_and_updates_match_cpu() {
                 close("input gradient", &actual.data, &expected.input_gradient.data, 1e-3);
             }
             close("parameter accumulation", updates(&gpu.host_fallback_train_buffers()[0]), updates(&cpu.train_buffers[0]), 1e-3);
-            cpu.update_weights(0.003, 0.9, 0.0005, 2);
+            if cpu.network.net.muon {cpu.update_weights_muon(0.003,2).unwrap();}
+            else if cpu.network.net.adam {cpu.update_weights_adam(0.003,2).unwrap();}
+            else {cpu.update_weights(0.003, 0.9, 0.0005, 2);}
             gpu.update_weights_gpu(0.003, 0.9, 0.0005, 2).unwrap();
             close("updated weights", weights(&gpu.params[0]), weights(&cpu.params[0]), 1e-3);
         }

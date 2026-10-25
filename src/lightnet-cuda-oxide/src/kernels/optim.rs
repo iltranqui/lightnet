@@ -495,4 +495,29 @@ pub mod kernels {
             }
         }
     }
+
+    /// A short serial chunk per GPU thread avoids floating-point atomics and
+    /// never downloads the inspected parameter/gradient tensor.
+    #[kernel]
+    pub fn nonfinite_partial(input: &[f32], mut flags: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        let chunk = idx.get();
+        if chunk >= flags.len() { return; }
+        let start = chunk * 256;
+        let count = (input.len() - start).min(256);
+        let mut found = 0.0;
+        for offset in 0..count {
+            if !input[start + offset].is_finite() { found = 1.0; break; }
+        }
+        if let Some(dst) = flags.get_mut(idx) { *dst = found; }
+    }
+
+    #[kernel]
+    pub fn nonfinite_reduce(flags: &[f32], mut output: DisjointSlice<f32>) {
+        let idx = thread::index_1d();
+        if idx.get() != 0 { return; }
+        let mut found = 0.0;
+        for i in 0..flags.len() { if flags[i] != 0.0 { found = 1.0; break; } }
+        if let Some(dst) = output.get_mut(idx) { *dst = found; }
+    }
 }

@@ -275,6 +275,7 @@ where
             eml_train_buffers.push(buffers);
         }
         *self.device_eml_train_buffers.get_mut() = eml_train_buffers;
+        self.reset_resident_parameter_gradients()?;
         Ok(())
     }
 
@@ -329,6 +330,7 @@ where
     /// Refreshes host convolution, EML branch, and MoE expert weights/biases/BN
     /// stats after deferred device updates.
     pub fn sync_host_weights_from_device(&mut self) -> Result<()> {
+        self.synchronize_resident_parameter_state()?;
         if !self.host_weights_stale {
             return Ok(());
         }
@@ -998,6 +1000,9 @@ where
         sync_host_weights: bool,
     ) -> Result<()> {
         reject_gpu_stage1_cpu_layers(&self.network, "optimizer updates")?;
+        if !self.resident_parameter_path_enabled() {
+            self.retire_resident_parameter_banks()?;
+        }
         if self.network.net.muon {
             if !sync_host_weights {
                 return Err(Error::InvalidConfig(
@@ -1310,6 +1315,7 @@ where
                 )?;
             }
         }
+        self.update_resident_parameters(&step, sync_host_weights, config)?;
         if sync_host_weights {
             self.host_weights_stale = false;
         }
@@ -1349,13 +1355,15 @@ where
     ) -> Result<()> {
         let iteration_num = self.train_iteration as i64 + 1;
         let burn_in = self.network.net.burn_in;
+        let resident_layers = self.resident_parameter_banks.borrow().iter().map(Option::is_some).collect::<Vec<_>>();
         let mut moments_all = self.host_adam_state.borrow_mut();
         if moments_all.len() != self.network.layers.len() {
             *moments_all = (0..self.network.layers.len()).map(|_| None).collect();
         }
         let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
         for (index, layer) in self.network.layers.iter().enumerate() {
-            if matches!(layer.kind, LayerKind::Convolutional(_))
+            if resident_layers.get(index).copied().unwrap_or(false)
+                || matches!(layer.kind, LayerKind::Convolutional(_))
                 || (matches!(layer.kind, LayerKind::Moe(_))
                     && device_moe_layers.get(index).copied().unwrap_or(false))
                 || (matches!(layer.kind, LayerKind::EmlConvolutional(_))
@@ -1933,6 +1941,7 @@ where
     ) -> Result<()> {
         let iteration_num = self.train_iteration as i64 + 1;
         let burn_in = self.network.net.burn_in;
+        let resident_layers = self.resident_parameter_banks.borrow().iter().map(Option::is_some).collect::<Vec<_>>();
         let train_buffers = self.cpu_fallback_train_buffers.get_mut();
         for (layer_index, ((params, train), layer)) in self
             .params
@@ -1941,7 +1950,8 @@ where
             .zip(&self.network.layers)
             .enumerate()
         {
-            if matches!(layer.kind, LayerKind::Convolutional(_))
+            if resident_layers.get(layer_index).copied().unwrap_or(false)
+                || matches!(layer.kind, LayerKind::Convolutional(_))
                 || (matches!(layer.kind, LayerKind::Dcnv4(_))
                     && preserve_device_dcnv4_params
                         .get(layer_index)

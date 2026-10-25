@@ -70,7 +70,8 @@ fn blob(p: &LayerParams) -> Vec<f32> {
 fn kimi_native_runtime_two_step_outputs_gradients_and_updates_match_cpu() {
     for (topk, optimizer) in [(0, ""), (1, "adam=1\n"), (2, "muon=1\ndecoupled_decay=1\n")] {
         let text = format!("[net]\nbatch=2\nwidth=3\nheight=2\nchannels=3\n{optimizer}\n[kimi_kda]\nfilters=3\nrank=2\nexperts=3\ntop_k={topk}\nhidden=4\ntemperature=0.7\nload_balance=0.03\nactivation=gelu\n");
-        let network = Network::from_config(ConfigFile::parse_str("native-kimi.cfg", &text).unwrap()).unwrap();
+        let mut network = Network::from_config(ConfigFile::parse_str("native-kimi.cfg", &text).unwrap()).unwrap();
+        network.net.decay=0.0005;
         let mut cpu = ExecutableNetwork::new(network.clone());
         let LayerParams::KimiKda(p) = &mut cpu.params[0] else { panic!("Kimi params") };
         p.weights = values(p.weights.len(), 3.0);
@@ -96,7 +97,9 @@ fn kimi_native_runtime_two_step_outputs_gradients_and_updates_match_cpu() {
                 close("input gradient", &got.data, &expected.input_gradient.data, 1e-3);
             }
             close("parameter accumulation", &updates(&gpu.host_fallback_train_buffers()[0]), &updates(&cpu.train_buffers[0]), 1e-3);
-            cpu.update_weights(0.003, 0.9, 0.0005, 2);
+            if cpu.network.net.muon {cpu.update_weights_muon(0.003,2).unwrap();}
+            else if cpu.network.net.adam {cpu.update_weights_adam(0.003,2).unwrap();}
+            else {cpu.update_weights(0.003, 0.9, 0.0005, 2);}
             gpu.update_weights_gpu(0.003, 0.9, 0.0005, 2).unwrap();
             close("parameters", &blob(&gpu.params[0]), &blob(&cpu.params[0]), 1e-3);
         }

@@ -7061,6 +7061,22 @@ impl F32TensorOpsBackend for OxideBackend {
     type Error = OxideError;
     type Tensor = OxideTensorF32;
 
+    fn any_non_finite_f32(&self, tensor: &Self::Tensor) -> Result<bool, Self::Error> {
+        let input = self.f32v(tensor)?;
+        if input.len() == 0 { return Ok(false); }
+        let chunks = input.len().div_ceil(256);
+        let mut flags = self.alloc_uninit(chunks)?;
+        let mut scalar = self.alloc_uninit(1)?;
+        let config = ElementwiseLaunchConfig::default();
+        // SAFETY: exactly ceil(len/256) chunk owners, then one scalar owner.
+        // The launches share a stream and the reduction only sees written flags.
+        unsafe { self.optim.nonfinite_partial(&self.stream, launch::elementwise(chunks, config),
+            &input.buf, &mut flags) }.map_err(launch_err)?;
+        unsafe { self.optim.nonfinite_reduce(&self.stream, launch::elementwise(1, config),
+            &flags, &mut scalar) }.map_err(launch_err)?;
+        Ok(scalar.to_host_vec(&self.stream)?[0] != 0.0)
+    }
+
     fn depth_tap_clamp_f32(&self, raw: &Self::Tensor, gradient: Option<&Self::Tensor>,
         shape: &[usize], clip: f32, config: ElementwiseLaunchConfig) -> Result<Self::Tensor, Self::Error> {
         let grad = self.f32v(gradient.unwrap_or(raw))?;

@@ -44,6 +44,10 @@ where
         host_copies: bool,
     ) -> Result<GpuForwardState<B::Tensor>> {
         reject_gpu_stage1_cpu_layers(&self.network, "execution")?;
+        if !self.resident_parameter_path_enabled()
+            && self.resident_parameter_banks.borrow().iter().flatten().any(|s|s.dirty) {
+            return Err(Error::InvalidConfig("synchronize deferred resident parameters before switching to CPU/hybrid execution".into()));
+        }
         let has_batch_normalized_recurrent = self.network.layers.iter().any(|layer| {
             matches!(&layer.kind, LayerKind::Rnn(spec) if spec.batch_normalize)
                 || matches!(&layer.kind, LayerKind::Lstm(spec) if spec.batch_normalize)

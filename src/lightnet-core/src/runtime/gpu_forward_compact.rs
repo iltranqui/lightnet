@@ -9,6 +9,10 @@ where
         // Compact f32 has its own dispatch coverage. The stricter shared
         // half-storage guard remains in forward_compact_f16.
         reject_gpu_stage1_cpu_layers(&self.network, "compact inference")?;
+        if !self.resident_parameter_path_enabled()
+            && self.resident_parameter_banks.borrow().iter().flatten().any(|s|s.dirty) {
+            return Err(Error::InvalidConfig("synchronize deferred resident parameters before switching to CPU/hybrid execution".into()));
+        }
         if self.network.layers.iter().any(|layer| matches!(layer.kind,
             LayerKind::HyperbolicFoveation(_) | LayerKind::FoveationFilm(_))) {
             reject_gpu_hyperbolic_foveation(&self.network, "compact inference")?;

@@ -145,6 +145,7 @@ where
         if train_buffers_uninitialized {
             self.init_train_buffers_gpu()?;
         }
+        self.retire_resident_parameter_banks()?;
         let input = self
             .download_tensor(&forward.input_gpu, self.network.net.input_shape())
             .map_err(|err| backend_error("download CPU fallback input", err))?;

@@ -959,7 +959,9 @@ impl ExecutableNetwork {
                             layer.index
                         )));
                     };
-                    accumulate_vec(&mut train.updates, &gradient.values)?;
+                    // Mamba returns mathematical dL/dp, while Darknet's
+                    // optimizer adds descending update directions to weights.
+                    accumulate_negative_vec(&mut train.updates, &gradient.values)?;
                 }
                 (LayerKind::KimiKda(_), LayerParams::KimiKda(gradient)) => {
                     let Some(LayerTrainBuffers::KimiKda(train)) =

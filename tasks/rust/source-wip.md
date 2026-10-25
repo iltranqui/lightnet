@@ -69,6 +69,19 @@ remain outside this checkpoint.
   oxide_depth_anything exercise layout, state adjoints, routing, repeated
   accumulation, input/parameter gradients and updates. Existing depth host
   dispatch tests now expect native f32 support and keep half inference rejected.
+- Residency continuation: native Mamba SGD/Adam use a flat serialized device
+  parameter bank, device-sliced forward weights and device-packed gradient
+  accumulation. Weights, SGD momentum and Adam moments survive deferred steps.
+  Eager steps and explicit synchronization materialize host mirrors; saving
+  DNOPT materializes current device moments, and loading state refreshes caches.
+  Public edits to stale mirrors and backward after a parameter-generation
+  change return errors. Muon keeps its existing hybrid path. Corrected CPU
+  Mamba accumulation to negate mathematical gradients before additive updates.
+  Existing unrun parity fixtures now select the CPU Adam/Muon entry points.
+  Added oxide_resident_params fixtures for loss-scaled accumulated backward,
+  SGD/Adam/AdamW, update gates, deferred inference, sidecar resume, reset,
+  stale mirrors and stale training caches. Oxide finiteness diagnostics reduce
+  on device and transfer one scalar flag, not the inspected gradient tensor.
 
 ## Evidence and remaining work
 
@@ -82,9 +95,11 @@ coverage, host optimizer transfers/residency, native Muon eligibility and
 the rest of the AGENTS.md queue remain open. Existing ViT/Swin/WMHF/Clifford
 WIP commits are also unvalidated and do not certify completion.
 
-Mamba/Kimi/DPT parameters are uploaded for forward and parameter gradients
-downloaded for the existing optimizer boundary; SGD/Adam state/final updates
-are host-managed and Muon uses the existing hybrid path. Kimi key-floor
+Kimi/DPT parameters are uploaded for forward and parameter gradients
+downloaded for the existing optimizer boundary; their SGD/Adam state/final
+updates are host-managed and Muon uses the existing hybrid path. Mamba native
+SGD/Adam now retain device state, while Muon and CPU-fallback networks keep
+their host-managed update path. Kimi key-floor
 diagnostics, Mamba clamp/MSA flags and Kimi gradient-finiteness inspection
 still synchronize with the host. These are explicit residency gaps, with no
 speed claim. Compact half inference is still rejected for these new paths.

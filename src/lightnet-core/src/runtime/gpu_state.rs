@@ -44,6 +44,7 @@ where
             device_dcnv4_train_buffers,
             dcnv4_device_params,
             cpu_fallback_train_buffers,
+            resident_parameter_banks: RefCell::new(Vec::new()),
             clifford_device_caches: RefCell::new(Vec::new()),
             capture_input_gradient: Cell::new(false),
             captured_input_gradient: RefCell::new(None),
@@ -114,6 +115,10 @@ where
     /// buffer is non-finite, for dynamic loss scaling. Other host-only layer
     /// families are not inspected.
     pub fn gradients_non_finite(&self) -> Result<bool> {
+        for state in self.resident_parameter_banks.borrow().iter().flatten() {
+            if self.backend.any_non_finite_f32(&state.updates)
+                .map_err(|e|backend_error("resident gradient finiteness",e))? { return Ok(true); }
+        }
         for entry in self.device_train_buffers.borrow().iter().flatten() {
             if self
                 .backend
@@ -383,6 +388,7 @@ where
             self.write_moments(&mut file, state.scales.as_ref(), &filter_shape)?;
         }
         let mut host_states = self.host_adam_state.borrow().clone();
+        self.materialize_resident_optimizer_states(&mut host_states)?;
         for (index, device_state) in self.dcnv4_adam_state.iter().enumerate() {
             let Some(device_state) = device_state else {
                 continue;
@@ -739,6 +745,8 @@ where
                 }
             }
         }
+        self.synchronize_resident_parameter_state()?;
+        self.resident_parameter_banks.get_mut().clear();
         *self.host_adam_state.get_mut() = host_state;
         self.adam_state = state;
         self.moe_adam_state = moe_state;
@@ -1009,6 +1017,7 @@ where
     }
 
     pub fn load_weights_file(&mut self, path: impl AsRef<Path>) -> Result<WeightsHeader> {
+        self.retire_resident_parameter_banks()?;
         let header = load_weights_into_params(&self.network, &mut self.params, path)?;
         self.clear_device_conv_params();
         self.clear_device_train_buffers();

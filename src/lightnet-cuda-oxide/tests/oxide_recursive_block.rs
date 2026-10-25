@@ -49,7 +49,8 @@ fn static_recursive_body_shares_gradients_across_loops_and_accumulated_backwards
         let (w,h,c,body)=if connected{(1,1,3,"[connected]\noutput=3\nactivation=tanh\n[connected]\noutput=3\nactivation=linear\n")}
             else{(3,2,2,"[convolutional]\nfilters=2\nsize=3\npad=1\nactivation=leaky\n[convolutional]\nfilters=2\nsize=1\nactivation=tanh\n")};
         let text=format!("[net]\nbatch=2\nwidth={w}\nheight={h}\nchannels={c}\n{optimizer}\n[recursive_block]\nbody=2\nloops=3\ninjection={injection}\nbody_scale=0.4\nresidual_scale=0.3\ninjection_scale=0.2\n{body}");
-        let network=Network::from_config(ConfigFile::parse_str("native-recursive.cfg",&text).unwrap()).unwrap();
+        let mut network=Network::from_config(ConfigFile::parse_str("native-recursive.cfg",&text).unwrap()).unwrap();
+        network.net.decay=0.0005;
         let mut cpu=ExecutableNetwork::new(network.clone());
         let LayerParams::RecursiveBlock(p)=&mut cpu.params[0]else{panic!("recursive params")};
         for body in &mut p.body{initialize(body);}
@@ -73,7 +74,10 @@ fn static_recursive_body_shares_gradients_across_loops_and_accumulated_backwards
                 close("input adjoint",&got.data,&expected.input_gradient.data);
             }
             close("shared parameter accumulation",&updates(&gpu.host_fallback_train_buffers()[0]),&updates(&cpu.train_buffers[0]));
-            cpu.update_weights(0.003,0.9,0.0005,2);gpu.update_weights_gpu(0.003,0.9,0.0005,2).unwrap();
+            if cpu.network.net.muon {cpu.update_weights_muon(0.003,2).unwrap();}
+            else if cpu.network.net.adam {cpu.update_weights_adam(0.003,2).unwrap();}
+            else {cpu.update_weights(0.003,0.9,0.0005,2);}
+            gpu.update_weights_gpu(0.003,0.9,0.0005,2).unwrap();
             close("updates",&params(&gpu.params[0]),&params(&cpu.params[0]));
         }
     }

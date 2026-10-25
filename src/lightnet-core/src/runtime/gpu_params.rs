@@ -483,6 +483,7 @@ where
     }
 
     pub(super) fn clear_device_conv_params(&mut self) {
+        self.resident_parameter_banks.get_mut().clear();
         // Callers replace the host params right before; nothing is stale then.
         self.host_weights_stale = false;
         for slots in self.device_conv_params.get_mut().iter_mut() {
