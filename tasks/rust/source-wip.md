@@ -56,6 +56,15 @@ remain outside this checkpoint.
   for documented unsupported variants. Half-storage guards remain separate.
   Source fixtures compare CPU/full/compact outputs and place compact inference
   between training forward/backward to pin preservation of training caches.
+- RecursiveBlock continuation: add bounded native full/compact f32 forward and
+  backward for static non-BN convolution/connected bodies, including input
+  injection, residual/body scales and all shared-weight loop adjoints. Stage
+  gradients into existing nested SGD/Adam/hybrid-Muon arms. Controllers,
+  lattice, BN and other body layers now use an explicit host fallback rather
+  than a hard GPU rejection. Their native coverage remains open. Host math
+  still lives in runtime/exec_accumulate.rs; co-location is not complete.
+  oxide_recursive_block fixtures cover three loops, two backward accumulations,
+  two updates, compact inference and both convolution and connected bodies.
 - Source fixtures: oxide_mambavision, oxide_kimi_kda, oxide_dpt_head and
   oxide_depth_anything exercise layout, state adjoints, routing, repeated
   accumulation, input/parameter gradients and updates. Existing depth host
@@ -67,7 +76,7 @@ Source diff inspection only; whitespace validation uses git diff --check.
 All new fixtures are unrun. No successful compilation or numeric parity is
 claimed. References are hand-derived Rust/C++ source, no compiled-C++ golden.
 
-This is not every layer completed. RecursiveBlock runtime, yolo_3d CPU loss
+This is not every layer completed. Remaining RecursiveBlock variants, yolo_3d CPU loss
 and device path, remaining native variants/controller paths, remaining compact f32/f16
 coverage, host optimizer transfers/residency, native Muon eligibility and
 the rest of the AGENTS.md queue remain open. Existing ViT/Swin/WMHF/Clifford

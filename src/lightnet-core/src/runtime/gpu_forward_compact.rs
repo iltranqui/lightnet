@@ -69,18 +69,6 @@ where
                     .to_owned(),
             });
         }
-        if let Some(layer) = self
-            .network
-            .layers
-            .iter()
-            .find(|layer| matches!(layer.kind, LayerKind::RecursiveBlock(_)))
-        {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "[recursive_block] compact GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path"
-                    .to_owned(),
-            });
-        }
         if self.network.layers.iter().any(|layer| {
             matches!(
                 layer.kind,
@@ -108,6 +96,7 @@ where
                     if spec.activation.to_cuda_f32_kind().is_none()
             )
         }) || self.network.layers.iter().any(|layer| match &layer.kind {
+            LayerKind::RecursiveBlock(spec) => !crate::layers::recursive_block::gpu::supported(spec),
             LayerKind::Vit(spec) => !vit_gpu::supported(&vit_geometry(layer, spec)),
             LayerKind::Swin(spec) => !crate::layers::swin::gpu::supported(
                 &crate::layers::swin::gpu::geometry(layer, spec)),
@@ -159,6 +148,8 @@ where
             };
 
             let output_gpu = match (&layer.kind, params) {
+                (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(weights)) => self.forward_recursive_block_gpu(
+                    layer, spec, weights, current_input.expect("recursive requires current input"), launch_config, false)?.0,
                 (LayerKind::Vit(spec), LayerParams::Vit(weights)) => vit_gpu::forward(
                     &self.backend, &vit_geometry(layer, spec), weights,
                     current_input.expect("ViT requires current input"), layer.output_shape, launch_config)?,

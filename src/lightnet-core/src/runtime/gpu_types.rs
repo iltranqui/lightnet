@@ -250,6 +250,8 @@ where
         RefCell<Vec<Option<crate::layers::dpt_head::gpu::DeviceCache<B::Tensor>>>>,
     pub(crate) depth_anything_device_caches:
         RefCell<Vec<Option<crate::layers::depth_anything::gpu::DeviceCache<B::Tensor>>>>,
+    pub(crate) recursive_block_device_caches:
+        RefCell<Vec<Option<crate::layers::recursive_block::gpu::DeviceCache<B::Tensor>>>>,
     /// Native Clifford intermediates, populated by the training forward.
     pub(crate) clifford_device_caches:
         RefCell<Vec<Option<crate::layers::clifford::gpu::DeviceCache<B::Tensor>>>>,

@@ -51,6 +51,7 @@ Per layer directory under `src/lightnet-core/src/layers/`: which files hold the 
 | `moe_conv` | yes | yes | - | - |
 | `omd_loss` | yes | - | - | - |
 | `pool` | - | yes | `pool.rs` | `oxide_pool_parity` |
+| `recursive_block` | host in runtime | yes | shared convolution, connected and elementwise | `oxide_recursive_block` (unrun WIP) |
 | `region` | - | yes | - | - |
 | `reorg` | - | yes | `reorg.rs` | - |
 | `rnn` | - | yes | - | - |

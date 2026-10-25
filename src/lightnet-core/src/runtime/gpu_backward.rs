@@ -101,6 +101,9 @@ where
             };
 
             match (&layer.kind, self.params.get(layer.index)) {
+                (LayerKind::RecursiveBlock(spec), Some(LayerParams::RecursiveBlock(_))) => {
+                    self.backward_recursive_block_gpu(layer, spec, grad, config, &mut layer_output_gradients)?;
+                }
                 (LayerKind::FoveationFilm(spec), Some(LayerParams::FoveationFilm(params))) => {
                     self.backward_foveation_film_gpu(
                         layer,

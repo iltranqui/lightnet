@@ -18,6 +18,9 @@ where
                     }
                 }
                 LayerKind::Lstm(_) => {}
+                LayerKind::RecursiveBlock(spec) => {
+                    if !crate::layers::recursive_block::gpu::supported(spec) { return true; }
+                }
                 LayerKind::Clifford(spec) => {
                     if crate::layers::clifford::gpu::needs_host(spec) {
                         return true;

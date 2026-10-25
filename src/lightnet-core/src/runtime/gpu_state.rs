@@ -56,6 +56,7 @@ where
             kimi_kda_device_caches: RefCell::new(Vec::new()),
             dpt_head_device_caches: RefCell::new(Vec::new()),
             depth_anything_device_caches: RefCell::new(Vec::new()),
+            recursive_block_device_caches: RefCell::new(Vec::new()),
             adam_state: Vec::new(),
             moe_adam_state,
             eml_adam_state,

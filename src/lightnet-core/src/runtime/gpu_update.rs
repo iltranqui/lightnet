@@ -435,6 +435,7 @@ where
                         | (LayerKind::KimiKda(_), LayerParams::KimiKda(_))
                         | (LayerKind::DptHead(_), LayerParams::DptHead(_))
                         | (LayerKind::DepthAnything(_), LayerParams::DepthAnything(_))
+                        | (LayerKind::RecursiveBlock(_), LayerParams::RecursiveBlock(_))
                         | (LayerKind::GraphConv(_), LayerParams::GraphConv(_))
                         | (LayerKind::Dcnv4(_), LayerParams::Dcnv4(_))
                         | (LayerKind::DeformConv(_), LayerParams::DeformConv(_))
@@ -1005,18 +1006,6 @@ where
             }
             return self.update_weights_gpu_muon(lr, decay, batch);
         }
-        if let Some(layer) = self
-            .network
-            .layers
-            .iter()
-            .find(|layer| matches!(layer.kind, LayerKind::RecursiveBlock(_)))
-        {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "[recursive_block] GPU updates are not implemented in the Stage-1 CPU port"
-                    .to_owned(),
-            });
-        }
         let config = ElementwiseLaunchConfig::default();
         self.defer_host_sync = !sync_host_weights;
         let net = self.network.net.clone();
@@ -1045,6 +1034,7 @@ where
                         | LayerParams::KimiKda(_)
                         | LayerParams::DptHead(_)
                         | LayerParams::DepthAnything(_)
+                        | LayerParams::RecursiveBlock(_)
                         | LayerParams::Rnn(_)
                         | LayerParams::Lstm(_)
                         | LayerParams::Crnn(_)
@@ -1899,6 +1889,10 @@ where
                     apply_host_adam_convolutional(params, train, moments, adam)?;
                 }
                 (LayerParams::None, _) | (LayerParams::Convolutional(_), _) => {}
+                (params @ LayerParams::RecursiveBlock(_), train @ LayerTrainBuffers::RecursiveBlock(_)) => {
+                    let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam_layer(&layer.kind, layer.input_shape, params, train, moments, adam)?;
+                }
                 (LayerParams::DepthAnything(_), LayerTrainBuffers::None) => {}
                 _ => {
                     return Err(Error::InvalidConfig(format!(
@@ -2119,6 +2113,13 @@ where
                         return Err(Error::InvalidConfig("DPT optimizer layer kind mismatch".into()));
                     };
                     update_dpt_head_sgd(spec, layer.input_shape, params, train,
+                        lr * layer.train.learning_rate_scale, momentum, decay, batch);
+                }
+                (LayerParams::RecursiveBlock(params), LayerTrainBuffers::RecursiveBlock(train)) => {
+                    let LayerKind::RecursiveBlock(spec) = &layer.kind else {
+                        return Err(Error::InvalidConfig("recursive optimizer layer kind mismatch".into()));
+                    };
+                    update_recursive_block_sgd(spec, params, train,
                         lr * layer.train.learning_rate_scale, momentum, decay, batch);
                 }
                 (

@@ -2333,7 +2333,7 @@ fn recursive_block_adam_state_round_trips_and_rejects_wrong_body_shapes() {
 }
 
 #[test]
-fn recursive_block_muon_maps_controller_and_body_matrices_and_rejects_gpu() {
+fn recursive_block_muon_maps_controller_and_body_matrices_and_keeps_gpu_host_fallback() {
     let network = recursive_test_network(
         1,
         1,
@@ -2371,20 +2371,10 @@ fn recursive_block_muon_maps_controller_and_body_matrices_and_rejects_gpu() {
 
     let gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
     let input = Tensor::from_data(network.net.input_shape(), vec![0.1; 2]).unwrap();
-    assert!(
-        gpu.forward(&input)
-            .unwrap_err()
-            .to_string()
-            .contains("[recursive_block] GPU execution is not implemented in the Stage-1 CPU port")
-    );
-    assert!(
-        gpu.forward_compact(&input)
-            .unwrap_err()
-            .to_string()
-            .contains(
-                "[recursive_block] compact GPU execution is not implemented in the Stage-1 CPU port"
-            )
-    );
+    assert!(gpu.requires_cpu_backward_fallback(),"controller remains a host variant");
+    let full=gpu.forward(&input).unwrap().final_output().unwrap().clone();
+    let compact=gpu.forward_compact(&input).unwrap().final_output.unwrap();
+    assert_eq!(full,compact);
     let gpu_update_network = recursive_test_network(
         1,
         1,
@@ -2393,10 +2383,6 @@ fn recursive_block_muon_maps_controller_and_body_matrices_and_rejects_gpu() {
         "",
     );
     let mut gpu = GpuExecutableNetwork::new(gpu_update_network, FakeBackend);
-    assert!(
-        gpu.update_weights_gpu(0.01, 0.9, 0.0, 1)
-            .unwrap_err()
-            .to_string()
-            .contains("[recursive_block] GPU updates are not implemented in the Stage-1 CPU port")
-    );
+    gpu.init_train_buffers_gpu().unwrap();
+    gpu.update_weights_gpu(0.01, 0.9, 0.0, 1).unwrap();
 }

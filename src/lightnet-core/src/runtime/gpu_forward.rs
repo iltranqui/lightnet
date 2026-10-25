@@ -84,18 +84,6 @@ where
             .network
             .layers
             .iter()
-            .find(|layer| matches!(layer.kind, LayerKind::RecursiveBlock(_)))
-        {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "[recursive_block] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path"
-                    .to_owned(),
-            });
-        }
-        if let Some(layer) = self
-            .network
-            .layers
-            .iter()
             .find(|layer| matches!(layer.kind, LayerKind::ObbRefine(_)))
         {
             let message = if training {
@@ -152,6 +140,8 @@ where
         let mut dpt_head_caches = Vec::with_capacity(self.network.layers.len());
         let mut depth_anything_caches = Vec::with_capacity(self.network.layers.len());
         let mut depth_anything_device_caches = Vec::with_capacity(self.network.layers.len());
+        let mut recursive_block_caches = Vec::with_capacity(self.network.layers.len());
+        let mut recursive_block_device_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches: Vec<Option<crate::vit::VitForwardCache>> =
             Vec::with_capacity(self.network.layers.len());
         let mut swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>> =
@@ -204,6 +194,8 @@ where
             let mut dpt_head_cache = None;
             let mut depth_anything_cache = None;
             let mut depth_anything_device_cache = None;
+            let mut recursive_block_cache = None;
+            let mut recursive_block_device_cache = None;
             let mut dcnv4_cache = None;
             let mut gpu_dcnv4_cache = None;
             let mut deform_conv_cache = None;
@@ -219,6 +211,22 @@ where
             let mut hyperbolic_foveation_cache = None;
             let mut foveation_film_cache = None;
             let output_gpu = match (&layer.kind, params) {
+                (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(params)) => {
+                    if (!training || deform_device) && crate::layers::recursive_block::gpu::supported(spec) {
+                        let (output, cache) = self.forward_recursive_block_gpu(layer, spec, params,
+                            current_input, launch_config, training)?;
+                        recursive_block_device_cache = cache;
+                        output
+                    } else {
+                        let input = self.download_tensor(current_input, layer.input_shape)
+                            .map_err(|e| backend_error("download recursive fallback input", e))?;
+                        let (output, cache) = forward_recursive_block(&self.network, self.train_iteration,
+                            layer, spec, params, &input, training)?;
+                        recursive_block_cache = Some(cache);
+                        self.backend.upload_f32(&tensor_backend_shape(output.shape), &output.data)
+                            .map_err(|e| backend_error("upload recursive fallback output", e))?
+                    }
+                }
                 (
                     LayerKind::HyperbolicFoveation(spec),
                     LayerParams::HyperbolicFoveation(params),
@@ -1176,6 +1184,8 @@ where
             dpt_head_caches.push(dpt_head_cache);
             depth_anything_caches.push(depth_anything_cache);
             depth_anything_device_caches.push(depth_anything_device_cache);
+            recursive_block_caches.push(recursive_block_cache);
+            recursive_block_device_caches.push(recursive_block_device_cache);
             hyperbolic_foveation_caches.push(hyperbolic_foveation_cache);
             foveation_film_caches.push(foveation_film_cache);
         }
@@ -1190,6 +1200,7 @@ where
         *self.kimi_kda_device_caches.borrow_mut() = kimi_kda_device_caches;
         *self.dpt_head_device_caches.borrow_mut() = dpt_head_device_caches;
         *self.depth_anything_device_caches.borrow_mut() = depth_anything_device_caches;
+        *self.recursive_block_device_caches.borrow_mut() = recursive_block_device_caches;
         Ok(GpuForwardState {
             input_gpu,
             gpu_layer_outputs,
@@ -1215,7 +1226,7 @@ where
                 graph_conv_caches,
                 wmhf_caches,
                 clifford_caches,
-                recursive_block_caches: vec![None; self.network.layers.len()],
+                recursive_block_caches,
                 hyperbolic_foveation_caches,
                 foveation_film_caches,
                 vit_caches,
