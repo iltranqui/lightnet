@@ -68,7 +68,7 @@ tasks/
 - [x] Write flat resident parameters/gradients/moments and native Mamba SGD/Adam integration (uncompiled).
 - [x] Write reset, diagnostics, host synchronization and DNOPT state restoration.
 - [x] Write native finiteness reduction and unrun end-to-end fixtures.
-- [ ] Review source diffs, document limits and create a local WIP commit.
+- [x] Review source diffs, document limits and create local WIP commit `c9feefb` (no Cargo validation).
 - [ ] Continue full native updates/Muon, remaining backward variants and FP16 coverage.
 - [ ] Deferred by user: compile and execute host/Oxide parity gates before certification.
 
