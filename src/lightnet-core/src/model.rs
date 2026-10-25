@@ -1830,35 +1830,35 @@ impl AxisPin {
 /// evidence, this table is what the test checks.
 pub const AXIS_PINS: &[AxisPin] = &[
     AxisPin::Open("Tier 1: nested-body geometry and per-pass lattice"),
-    AxisPin::Open("Tier 4: FiLM parameter block to channel mapping"),
-    AxisPin::Open("Tier 4: warp samples (x,y) from (w,h)"),
+    AxisPin::Pinned("foveation_film_axis_layout_maps_batch_hf_embedding_and_channel_affines"),
+    AxisPin::Pinned("hyperbolic_foveation_axis_layout_keeps_batch_channel_hw_and_grid_xy"),
     AxisPin::Pinned("convolutional_axis_layout_pins_dilated_extent_and_groups"),
     AxisPin::Pinned("deconvolutional_axis_layout_maps_input_channels_to_filters_and_batch"),
     AxisPin::Pinned("connected_axis_layout_keeps_batch_rows_and_output_weight_axes"),
     AxisPin::Pinned("maxpool_axis_layout_pins_depth_channel_batch_and_spatial_order"),
     AxisPin::Pinned("local_avgpool_axis_layout_pins_window_and_batch_order"),
     AxisPin::Pinned("avgpool_axis_layout_reduces_spatial_per_channel_and_batch"),
-    AxisPin::Open("Tier 1: groups split, relative index, concat order"),
+    AxisPin::Pinned("route_axis_layout_pins_named_source_order_group_slice_and_delta_scatter"),
     AxisPin::Pinned("shortcut_axis_layout_uses_nchw_channel_slots_per_batch"),
-    AxisPin::Open("Tier 1: per-axis stride and reverse/downsample"),
+    AxisPin::Pinned("upsample_axis_layout_pins_forward_repeat_reverse_sum_and_adjoint"),
     AxisPin::Open("Tier 2: anchor, entry and cell (y,x) layout"),
     AxisPin::Open("Tier 2: raptor six-coordinate per-entry order"),
     AxisPin::Open("Tier 2: proposal row to output row mapping"),
     AxisPin::Open("Tier 2: mean/variance channel placement"),
     AxisPin::Pinned("region_axis_layout_matches_cpp_flatten_objectness_and_classes"),
-    AxisPin::Open("Tier 1: reorg (c,h,w) to (c*s*s,h/s,w/s) order"),
+    AxisPin::Pinned("reorg_axis_layout_pins_batch_channel_offset_and_adjoint"),
     AxisPin::Pinned("slice_axis_layout_preserves_batch_channel_and_spatial_order"),
-    AxisPin::Open("Tier 1: group interleave order"),
-    AxisPin::Open("Tier 1: per-group channel reduction"),
+    AxisPin::Pinned("shuffle_axis_layout_preserves_batch_spatial_planes_and_group_interleave"),
+    AxisPin::Pinned("softmax_axis_layout_pins_per_batch_contiguous_groups_and_adjoint"),
     AxisPin::Open("Tier 1: masked/smooth reduction axis and scale"),
-    AxisPin::Open("Tier 2: raptor logistic_layer.cpp row mapping"),
+    AxisPin::Pinned("logistic_axis_layout_keeps_batch_channel_hw_order"),
     AxisPin::Open("Tier 2: fog regression_layer.cpp target layout"),
     AxisPin::Pinned("jev_ce_axis_layout_pins_cpp_batch_group_candidate_and_layout_order"),
     AxisPin::Open("Tier 2: per-pixel channel softmax and mask index"),
     AxisPin::Pinned("omd_axis_layout_pins_cpp_nchw_sample_rows_pairs_and_scatter"),
     AxisPin::Open("Tier 1: per-sample mask, no shared mask across batch"),
-    AxisPin::Open("Tier 1: broadcast vs crop/pad slot math"),
-    AxisPin::Open("Tier 1: element-wise multiply over C*H*W"),
+    AxisPin::Pinned("scale_channels_axis_layout_pins_named_source_and_channel_or_spatial_broadcast"),
+    AxisPin::Pinned("sam_axis_layout_pins_elementwise_nchw_source_and_adjoint"),
     AxisPin::Pinned("contrastive_axis_layout_pins_cpp_batch_rows_and_embedding_features"),
     AxisPin::Open("Tier 2: modern head class/obj/box channel split"),
     AxisPin::Open("Tier 2: DFL bin axis"),
@@ -1870,7 +1870,7 @@ pub const AXIS_PINS: &[AxisPin] = &[
     AxisPin::Pinned("loss_axis_layout_excludes_padding_rows_from_batch_mean"),
     AxisPin::Pinned("encoder_axis_layout_keeps_batch_and_token_rows_independent"),
     AxisPin::Pinned("head_axis_layout_preserves_batch_sequence_and_qtype_channels"),
-    AxisPin::Open("Tier 4: DINOv2 patch token order"),
+    AxisPin::Pinned("depth_anything_axis_layout_pins_cpp_patch_tokens_cls_and_nchw_batches"),
     AxisPin::Pinned(
         "dpt_head_axis_layout_batched_nchw_forward_matches_independent_non_square_samples",
     ),
@@ -1881,12 +1881,12 @@ pub const AXIS_PINS: &[AxisPin] = &[
     AxisPin::Pinned("axis_layout_keeps_nchw_raster_scans_independent_per_batch"),
     AxisPin::Pinned("cpu_moe_convolutional_axis_layout_keeps_router_and_blend_per_batch"),
     AxisPin::Pinned("eml_convolutional_axis_layout_preserves_batch_channel_and_spatial_order"),
-    AxisPin::Open("Tier 4: neighbor index order and group split"),
+    AxisPin::Pinned("graph_conv_axis_layout_pins_cpp_batch_group_neighbor_raster_and_nchw"),
     AxisPin::Pinned("offset_axis_layout_reads_dx_then_dy_and_keeps_batches_nchw"),
-    AxisPin::Open("Tier 4: offset (dy,dx) channel order"),
-    AxisPin::Open("Tier 4: snake offset axis and morph branch split"),
-    AxisPin::Open("Tier 4: wavelet sub-band split order"),
-    AxisPin::Open("Tier 4: Clifford block order and spatial axis"),
+    AxisPin::Pinned("deform_conv_axis_layout_pins_cpp_offset_mask_groups_and_batch_nchw"),
+    AxisPin::Pinned("dsconv_axis_layout_pins_cpp_snake_branches_batch_channels_and_nchw_outputs"),
+    AxisPin::Pinned("wmhf_axis_layout_pins_cpp_batch_channel_spatial_and_subband_order"),
+    AxisPin::Pinned("clifford_axis_layout_pins_cpp_nchw_token_channel_normalization"),
     AxisPin::Pinned("rnn_axis_layout_pins_cpp_step_batch_and_input_channels"),
     AxisPin::RustOnly("not in any ELayerType; pin Rust gate/state order"),
     AxisPin::Pinned("lstm_axis_layout_pins_cpp_gate_blocks_steps_and_samples"),
@@ -11630,8 +11630,8 @@ output=2
             }
         }
 
-        assert_eq!(pinned.len(), 30, "pinned variants");
-        assert_eq!(open, 30, "C++-backed variants without an axis pin");
+        assert_eq!(pinned.len(), 46, "pinned variants");
+        assert_eq!(open, 14, "C++-backed variants without an axis pin");
         assert_eq!(rust_only, 6, "Rust-only variants plus Unsupported");
 
         // The pinned set is the contract: renaming one of these tests must be a
@@ -11667,6 +11667,22 @@ output=2
             "eml_convolutional_axis_layout_preserves_batch_channel_and_spatial_order",
             "offset_axis_layout_reads_dx_then_dy_and_keeps_batches_nchw",
             "region_axis_layout_matches_cpp_flatten_objectness_and_classes",
+            "foveation_film_axis_layout_maps_batch_hf_embedding_and_channel_affines",
+            "hyperbolic_foveation_axis_layout_keeps_batch_channel_hw_and_grid_xy",
+            "route_axis_layout_pins_named_source_order_group_slice_and_delta_scatter",
+            "upsample_axis_layout_pins_forward_repeat_reverse_sum_and_adjoint",
+            "reorg_axis_layout_pins_batch_channel_offset_and_adjoint",
+            "shuffle_axis_layout_preserves_batch_spatial_planes_and_group_interleave",
+            "softmax_axis_layout_pins_per_batch_contiguous_groups_and_adjoint",
+            "logistic_axis_layout_keeps_batch_channel_hw_order",
+            "scale_channels_axis_layout_pins_named_source_and_channel_or_spatial_broadcast",
+            "sam_axis_layout_pins_elementwise_nchw_source_and_adjoint",
+            "depth_anything_axis_layout_pins_cpp_patch_tokens_cls_and_nchw_batches",
+            "graph_conv_axis_layout_pins_cpp_batch_group_neighbor_raster_and_nchw",
+            "deform_conv_axis_layout_pins_cpp_offset_mask_groups_and_batch_nchw",
+            "dsconv_axis_layout_pins_cpp_snake_branches_batch_channels_and_nchw_outputs",
+            "wmhf_axis_layout_pins_cpp_batch_channel_spatial_and_subband_order",
+            "clifford_axis_layout_pins_cpp_nchw_token_channel_normalization",
         ]
         .into_iter()
         .collect();
@@ -11723,7 +11739,9 @@ output=2
         .expect("route builds");
         assert_eq!(
             route.layers[1].kind.axis_pin(),
-            AxisPin::Open("Tier 1: groups split, relative index, concat order"),
+            AxisPin::Pinned(
+                "route_axis_layout_pins_named_source_order_group_slice_and_delta_scatter",
+            ),
             "route must map to its own AXIS_PINS entry"
         );
     }

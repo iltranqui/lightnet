@@ -5,7 +5,7 @@ contract and the named test that pins it. This is the evidence file for the
 "axis alignment" half of the v0.1 scope; `plan-open-items.md` owns the work
 queue, `STATUS.md` owns the version log.
 
-Measured 2026-10-18 against `model.rs` (65 represented variants plus
+Measured 2026-10-24 against `model.rs` (65 represented variants plus
 `Unsupported`), `Jev_laya:src-lib/darknet_enums.hpp` and the `depth_3d`
 YOLO-3D source. Represented does not imply a complete layer port:
 
@@ -287,6 +287,19 @@ which does not match the ordinary NCHW plane offset `(b*filters + f)*spatial + i
 for general `batch, filters`. Without a compiled-C++ oracle, the DropBlock
 batch/channel mapping is unresolved; do not treat host DropBlock fixtures as
 C++ parity evidence.
+
+### F4: axis registry drift — resolved
+
+`AXIS_PINS` had sixteen variants marked `Open` even though their named
+`*axis_layout*` tests existed and this ledger already listed them as pinned:
+`Logistic`, `Route`, `Upsample`, `Reorg`, `ChannelShuffle`, `Softmax`,
+`ScaleChannels`, `Sam`, `FoveationFilm`, `HyperbolicFoveation`, `DeformConv`,
+`GraphConv`, `Wmhf`, `Clifford`, `DsConv`, and `DepthAnything`. The coverage
+test hardcoded the stale `30 pinned / 30 open / 6 Rust-only` counts, so it could
+not detect the mismatch with this ledger's `46 / 14 / 5` (plus `Unsupported`).
+The registry now points those sixteen variants at their existing pins and the
+test asserts `46 pinned / 14 open / 6 Rust-only` (the six include
+`Unsupported`). `every_layer_kind_has_an_axis_pin_decision` passes.
 
 ## Adding a pin
 
