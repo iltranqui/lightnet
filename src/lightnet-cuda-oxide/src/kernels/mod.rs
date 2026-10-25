@@ -48,4 +48,7 @@ pub mod moe;
 pub mod attention;
 pub mod vit;
 pub mod swin;
+pub mod mambavision;
+pub mod kimi_kda;
+pub mod tucker_attention;
 pub(crate) mod unroll;

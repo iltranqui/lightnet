@@ -25,8 +25,8 @@ Per layer directory under `src/lightnet-core/src/layers/`: which files hold the 
 | `dcnv4` | yes | yes | `dcnv4.rs` | `oxide_dcnv4_aggregate`, `oxide_dcnv4_bn`, `oxide_dcnv4_chain`, `oxide_dcnv4_normalization` |
 | `deconvolutional` | yes | yes | `deconvolutional.rs` | `oxide_deconvolutional` |
 | `deform_conv` | yes | yes | - | `oxide_deform_conv_accumulate`, `oxide_deform_conv_backward_chain`, `oxide_deform_conv_chain` |
-| `depth_anything` | yes | - | - | - |
-| `dpt_head` | yes | - | - | - |
+| `depth_anything` | yes | yes | shared `vit.rs`, convolution and attention | `oxide_depth_anything` (unrun WIP) |
+| `dpt_head` | yes | yes | shared convolution, deconvolution and bilinear gather | `oxide_dpt_head` (unrun WIP) |
 | `dropout` | - | yes | `dropout.rs` | - |
 | `dsconv` | yes | yes | `dsconv.rs` | `oxide_dsconv` |
 | `eml_conv_math` | yes | - | - | - |
@@ -36,7 +36,7 @@ Per layer directory under `src/lightnet-core/src/layers/`: which files hold the 
 | `gru` | - | yes | - | - |
 | `hyperbolic_foveation` | yes | yes | - | `oxide_hyperbolic_foveation` |
 | `jev_ce` | yes | - | - | - |
-| `kimi_kda` | yes | yes | - | - |
+| `kimi_kda` | yes | yes | `kimi_kda.rs` | `oxide_kimi_kda` (unrun WIP) |
 | `laya_act_head` | yes | yes | - | - |
 | `laya_encoder` | yes | yes | - | `oxide_laya_encoder_forward` |
 | `laya_head` | yes | yes | - | `oxide_laya_head_attention`, `oxide_laya_head_forward` |
@@ -45,7 +45,7 @@ Per layer directory under `src/lightnet-core/src/layers/`: which files hold the 
 | `laya_scorer` | yes | yes | - | `oxide_laya_scorer_forward` |
 | `local` | - | yes | `local.rs` | `oxide_local` |
 | `lstm` | - | yes | - | - |
-| `mambavision` | yes | yes | - | - |
+| `mambavision` | yes | yes | `mambavision.rs` | `oxide_mambavision` (unrun WIP) |
 | `maxpool_depth` | yes | - | - | - |
 | `modern_yolo` | yes | - | - | - |
 | `moe_conv` | yes | yes | - | - |
@@ -62,7 +62,7 @@ Per layer directory under `src/lightnet-core/src/layers/`: which files hold the 
 | `shortcut_weights` | yes | - | - | - |
 | `softmax` | - | yes | `softmax.rs` | - |
 | `swin` | yes | yes | - | - |
-| `tucker_attention` | yes | yes | - | - |
+| `tucker_attention` | yes | yes | `tucker_attention.rs` | - (unrun WIP) |
 | `upsample` | - | yes | - | - |
 | `vc_attention` | yes | - | - | - |
 | `vit` | yes | yes | `vit.rs` | `oxide_vit` |

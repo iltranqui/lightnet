@@ -460,45 +460,19 @@ fn depth_anything_sequential_network_weights_round_trip_type_major() {
 }
 
 #[test]
-fn depth_anything_gpu_execution_backward_and_updates_reject_explicitly() {
+fn depth_anything_native_f32_execution_keeps_weights_frozen() {
     let network = depth_network("", "");
     let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
     let input = Tensor::from_data(network.net.input_shape(), vec![0.0; 6]).unwrap();
-    for error in [
-        gpu.forward(&input).unwrap_err().to_string(),
-        gpu.forward_with_state(&input).unwrap_err().to_string(),
-        gpu.forward_compact(&input).unwrap_err().to_string(),
-        gpu.update_weights_gpu(0.1, 0.0, 0.0, 1)
-            .unwrap_err()
-            .to_string(),
-        gpu.update_weights_gpu_deferred(0.1, 0.0, 0.0, 1)
-            .unwrap_err()
-            .to_string(),
-    ] {
-        assert!(error.contains("[depth_anything] GPU"), "{error}");
-        assert!(error.contains("Stage-1 CPU support"), "{error}");
-    }
-
-    let dummy_forward = super::super::GpuForwardState {
-        input_gpu: FakeTensor {
-            shape: Vec::new(),
-            data: Vec::new(),
-        },
-        gpu_layer_outputs: Vec::new(),
-        gpu_layer_activation_inputs: Vec::new(),
-        gpu_batch_norm_caches: Vec::new(),
-        gpu_rnn_caches: Vec::new(),
-        gpu_crnn_caches: Vec::new(),
-        gpu_lstm_caches: Vec::new(),
-        gpu_moe_caches: Vec::new(),
-        gpu_eml_caches: Vec::new(),
-        gpu_dcnv4_caches: Vec::new(),
-        cpu_forward: ForwardResult::from_heads(Vec::new(), Vec::new()),
-    };
-    let backward_error = gpu
-        .backward_accumulate_seeded_gpu(&dummy_forward, &[])
-        .unwrap_err()
-        .to_string();
-    assert!(backward_error.contains("[depth_anything] GPU"));
-    assert!(backward_error.contains("Stage-1 CPU support"));
+    assert!(!gpu.requires_cpu_backward_fallback());
+    let frozen = gpu.params.clone();
+    gpu.init_train_buffers_gpu().unwrap();
+    let forward = gpu.forward_training_device(&input).unwrap();
+    let shape = network.layers[0].output_shape;
+    let seeds = [Some(Tensor::from_data(shape, vec![1.0;shape.batch*shape.element_count()]).unwrap())];
+    gpu.backward_accumulate_seeded_gpu(&forward, &seeds).unwrap();
+    gpu.update_weights_gpu(0.1, 0.0, 0.0, 1).unwrap();
+    assert_eq!(gpu.params, frozen);
+    let error = gpu.forward_compact(&input).unwrap_err().to_string();
+    assert!(error.contains("Stage-1 CPU support"), "{error}");
 }

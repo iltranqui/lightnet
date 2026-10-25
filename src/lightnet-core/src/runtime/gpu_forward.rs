@@ -145,6 +145,13 @@ where
         let mut clifford_device_caches = vec![None; self.network.layers.len()];
         let mut vit_device_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_device_caches = Vec::with_capacity(self.network.layers.len());
+        let mut tucker_attention_device_caches = Vec::with_capacity(self.network.layers.len());
+        let mut mambavision_device_caches = Vec::with_capacity(self.network.layers.len());
+        let mut kimi_kda_device_caches = Vec::with_capacity(self.network.layers.len());
+        let mut dpt_head_device_caches = Vec::with_capacity(self.network.layers.len());
+        let mut dpt_head_caches = Vec::with_capacity(self.network.layers.len());
+        let mut depth_anything_caches = Vec::with_capacity(self.network.layers.len());
+        let mut depth_anything_device_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches: Vec<Option<crate::vit::VitForwardCache>> =
             Vec::with_capacity(self.network.layers.len());
         let mut swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>> =
@@ -188,8 +195,15 @@ where
             let mut swin_device_cache = None;
             let mut swin_cache = None;
             let mut tucker_attention_cache = None;
+            let mut tucker_attention_device_cache = None;
             let mut mambavision_cache = None;
+            let mut mambavision_device_cache = None;
             let mut kimi_kda_cache = None;
+            let mut kimi_kda_device_cache = None;
+            let mut dpt_head_device_cache = None;
+            let mut dpt_head_cache = None;
+            let mut depth_anything_cache = None;
+            let mut depth_anything_device_cache = None;
             let mut dcnv4_cache = None;
             let mut gpu_dcnv4_cache = None;
             let mut deform_conv_cache = None;
@@ -682,10 +696,29 @@ where
                     swin_cache = Some(cache);
                     output
                 }
+                (LayerKind::TuckerAttention(spec), LayerParams::TuckerAttention(weights))
+                    if (!training || deform_device)
+                        && crate::layers::tucker_attention::gpu::supported(
+                            &crate::layers::tucker_attention::gpu::geometry(layer, spec)) =>
+                {
+                    let (output, cache) = self.forward_tucker_attention_gpu(
+                        layer, spec, weights, current_input, launch_config, training)?;
+                    tucker_attention_device_cache = cache;
+                    output
+                }
                 (LayerKind::TuckerAttention(spec), LayerParams::TuckerAttention(weights)) => {
                     let (output, cache) =
                         self.forward_tucker_attention_host(layer, spec, weights, current_input)?;
                     tucker_attention_cache = Some(cache);
+                    output
+                }
+                (LayerKind::MambaVision(spec), LayerParams::MambaVision(weights))
+                    if (!training || deform_device)
+                        && crate::layers::mambavision::gpu::supported(layer, spec) =>
+                {
+                    let (output, cache) = self.forward_mambavision_gpu(
+                        layer, spec, weights, current_input, launch_config, training)?;
+                    mambavision_device_cache = cache;
                     output
                 }
                 (LayerKind::MambaVision(spec), LayerParams::MambaVision(weights)) => {
@@ -694,11 +727,52 @@ where
                     mambavision_cache = Some(cache);
                     output
                 }
+                (LayerKind::KimiKda(spec), LayerParams::KimiKda(weights))
+                    if (!training || deform_device)
+                        && crate::layers::kimi_kda::gpu::supported(layer, spec) =>
+                {
+                    let (output, cache) = self.forward_kimi_kda_gpu(
+                        layer, spec, weights, current_input, launch_config, training)?;
+                    kimi_kda_device_cache = cache;
+                    output
+                }
                 (LayerKind::KimiKda(spec), LayerParams::KimiKda(weights)) => {
                     let (output, cache) =
                         self.forward_kimi_kda_host(layer, spec, weights, current_input)?;
                     kimi_kda_cache = Some(cache);
                     output
+                }
+                (LayerKind::DepthAnything(spec), LayerParams::DepthAnything(weights)) => {
+                    if (!training || deform_device) && crate::layers::depth_anything::gpu::supported(layer, spec) {
+                        let (output, cache) = self.forward_depth_anything_gpu(layer, spec, weights,
+                            current_input, launch_config, training)?;
+                        depth_anything_device_cache = cache;
+                        output
+                    } else {
+                        let input = self.download_tensor(current_input, layer.input_shape)
+                            .map_err(|e| backend_error("download DepthAnything fallback input", e))?;
+                        let (output, cache) = crate::depth_anything::forward(&input.data, weights,
+                            &spec.geometry(layer.input_shape)).map_err(Error::InvalidConfig)?;
+                        depth_anything_cache = Some(cache);
+                        self.backend.upload_f32(&tensor_backend_shape(layer.output_shape), &output)
+                            .map_err(|e| backend_error("upload DepthAnything fallback output", e))?
+                    }
+                }
+                (LayerKind::DptHead(spec), LayerParams::DptHead(weights)) => {
+                    if !training || deform_device {
+                        let (output, cache) = self.forward_dpt_head_gpu(
+                            layer, spec, weights, current_input, launch_config, training)?;
+                        dpt_head_device_cache = cache;
+                        output
+                    } else {
+                        let input = self.download_tensor(current_input, layer.input_shape)
+                            .map_err(|e| backend_error("download DPT fallback input", e))?;
+                        let (output, cache) = crate::dpt_head::forward(&input.data, weights,
+                            spec.geometry(layer.input_shape))?;
+                        dpt_head_cache = Some(cache);
+                        self.backend.upload_f32(&tensor_backend_shape(layer.output_shape), &output)
+                            .map_err(|e| backend_error("upload DPT fallback output", e))?
+                    }
                 }
                 (LayerKind::LayaEncoder(spec), LayerParams::LayaEncoder(weights)) => {
                     laya_encoder_gpu::forward(
@@ -1093,8 +1167,15 @@ where
             swin_device_caches.push(swin_device_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
+            tucker_attention_device_caches.push(tucker_attention_device_cache);
             mambavision_caches.push(mambavision_cache);
+            mambavision_device_caches.push(mambavision_device_cache);
             kimi_kda_caches.push(kimi_kda_cache);
+            kimi_kda_device_caches.push(kimi_kda_device_cache);
+            dpt_head_device_caches.push(dpt_head_device_cache);
+            dpt_head_caches.push(dpt_head_cache);
+            depth_anything_caches.push(depth_anything_cache);
+            depth_anything_device_caches.push(depth_anything_device_cache);
             hyperbolic_foveation_caches.push(hyperbolic_foveation_cache);
             foveation_film_caches.push(foveation_film_cache);
         }
@@ -1104,6 +1185,11 @@ where
         *self.vit_device_caches.borrow_mut() = vit_device_caches;
         *self.wmhf_device_caches.borrow_mut() = wmhf_device_caches;
         *self.swin_device_caches.borrow_mut() = swin_device_caches;
+        *self.tucker_attention_device_caches.borrow_mut() = tucker_attention_device_caches;
+        *self.mambavision_device_caches.borrow_mut() = mambavision_device_caches;
+        *self.kimi_kda_device_caches.borrow_mut() = kimi_kda_device_caches;
+        *self.dpt_head_device_caches.borrow_mut() = dpt_head_device_caches;
+        *self.depth_anything_device_caches.borrow_mut() = depth_anything_device_caches;
         Ok(GpuForwardState {
             input_gpu,
             gpu_layer_outputs,
@@ -1133,8 +1219,8 @@ where
                 hyperbolic_foveation_caches,
                 foveation_film_caches,
                 vit_caches,
-                depth_anything_caches: vec![None; self.network.layers.len()],
-                dpt_head_caches: vec![None; self.network.layers.len()],
+                depth_anything_caches,
+                dpt_head_caches,
                 swin_caches,
                 tucker_attention_caches,
                 mambavision_caches,

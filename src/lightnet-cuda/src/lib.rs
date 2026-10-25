@@ -9,6 +9,8 @@
 
 pub mod host_ops;
 pub mod laya_act;
+pub mod mambavision;
+pub mod kimi_kda;
 pub use host_ops::bilinear_gather::BilinearGatherGeometry;
 pub use host_ops::{AdamParams, NanInfMode, dropout_unit};
 pub use laya_act::{LayaActBackwardInputs, LayaActHeadGrad};
@@ -2938,6 +2940,21 @@ pub trait F32TensorOpsBackend {
         let out = host_ops::vit_add_pos_embed(&host, &table);
         self.upload_f32(&[out.len()], &out)
     }
+    /// Depth tap clamp, preserving NaNs in forward and the CPU reference's
+    /// inclusive boundary derivative in backward. None selects forward.
+    fn depth_tap_clamp_f32(&self, raw: &Self::Tensor, gradient: Option<&Self::Tensor>,
+        shape: &[usize], clip: f32, config: ElementwiseLaunchConfig) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert!(clip > 0.0 && clip.is_finite());
+        let x = self.download_f32(raw)?;
+        let out = if let Some(gradient) = gradient {
+            let dy = self.download_f32(gradient)?;
+            assert_eq!(x.len(), dy.len());
+            x.iter().zip(dy).map(|(&x, dy)| if x < -clip || x > clip { 0.0 } else { dy }).collect()
+        } else { x.iter().map(|x| x.clamp(-clip, clip)).collect::<Vec<f32>>() };
+        self.upload_f32(shape, &out)
+    }
+
     /// ViT feature guard: clamp finite values to `[-clip, clip]`, map the rest to 0.
     fn vit_clamp_feature_f32(
         &self,
@@ -5088,6 +5105,162 @@ pub trait F32TensorOpsBackend {
             self.upload_f32(shape, &d_source)?,
         ))
     }
+    /// Kimi causal delta-rule, including exact piecewise key normalization.
+    fn kimi_scan_f32(
+        &self, q: &Self::Tensor, k: &Self::Tensor, v: &Self::Tensor,
+        beta: &Self::Tensor, decay: &Self::Tensor, g: kimi_kda::KdaGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<kimi_kda::KdaForward<Self::Tensor>, Self::Error> {
+        let _ = config;
+        let out = kimi_kda::scan(&self.download_f32(q)?, &self.download_f32(k)?,
+            &self.download_f32(v)?, &self.download_f32(beta)?, &self.download_f32(decay)?, g);
+        let rows = g.batch * g.tokens;
+        Ok(kimi_kda::KdaForward {
+            output: self.upload_f32(&[rows, g.channels], &out.output)?,
+            keys: self.upload_f32(&[rows, g.rank], &out.keys)?,
+            inverse: self.upload_f32(&[rows], &out.inverse)?,
+            norm_squared: self.upload_f32(&[rows], &out.norm_squared)?,
+            states: self.upload_f32(&[rows, g.rank, g.channels], &out.states)?,
+        })
+    }
+
+    fn kimi_scan_backward_f32(
+        &self, q: &Self::Tensor, v: &Self::Tensor, beta: &Self::Tensor, decay: &Self::Tensor,
+        forward: &kimi_kda::KdaForward<Self::Tensor>, dy: &Self::Tensor,
+        g: kimi_kda::KdaGeometry, config: ElementwiseLaunchConfig,
+    ) -> Result<kimi_kda::KdaGrad<Self::Tensor>, Self::Error> {
+        let _ = config;
+        let host = kimi_kda::KdaForward {
+            output: Vec::new(), keys: self.download_f32(&forward.keys)?,
+            inverse: self.download_f32(&forward.inverse)?,
+            norm_squared: self.download_f32(&forward.norm_squared)?,
+            states: self.download_f32(&forward.states)?,
+        };
+        let out = kimi_kda::backward(&self.download_f32(q)?, &self.download_f32(v)?,
+            &self.download_f32(beta)?, &self.download_f32(decay)?, &host, &self.download_f32(dy)?, g);
+        let rows = g.batch * g.tokens;
+        Ok(kimi_kda::KdaGrad {
+            q: self.upload_f32(&[rows, g.rank], &out.q)?,
+            k: self.upload_f32(&[rows, g.rank], &out.k)?,
+            v: self.upload_f32(&[rows, g.channels], &out.v)?,
+            beta: self.upload_f32(&[rows, g.rank], &out.beta)?,
+            decay: self.upload_f32(&[rows, g.rank], &out.decay)?,
+        })
+    }
+
+    fn kimi_router_gates_f32(
+        &self, logits: &Self::Tensor, rows: usize, experts: usize, top_k: usize,
+        temperature: f32, config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let out = kimi_kda::gates(&self.download_f32(logits)?, rows, experts, top_k, temperature);
+        self.upload_f32(&[rows, experts], &out)
+    }
+
+    /// MambaVision depthwise convolution plus stable SiLU. Input is `[B*T,2D]`,
+    /// branch is 0 or 1; returns `(pre, activated)` in `[B,D,T]` storage.
+    fn mambavision_depthwise_f32(
+        &self, input: &Self::Tensor, weights: &Self::Tensor, bias: &Self::Tensor,
+        batch: usize, tokens: usize, channels: usize, branch: usize, kernel: usize,
+        causal: bool, config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let (pre, out) = mambavision::depthwise(&self.download_f32(input)?,
+            &self.download_f32(weights)?, &self.download_f32(bias)?,
+            batch, tokens, channels, branch, kernel, causal);
+        let shape = [batch, channels, tokens];
+        Ok((self.upload_f32(&shape, &pre)?, self.upload_f32(&shape, &out)?))
+    }
+
+    /// Exact depthwise/SiLU adjoint `(d_projected, d_weights, d_bias)`.
+    fn mambavision_depthwise_backward_f32(
+        &self, input: &Self::Tensor, weights: &Self::Tensor, pre: &Self::Tensor,
+        grad: &Self::Tensor, batch: usize, tokens: usize, channels: usize,
+        branch: usize, kernel: usize, causal: bool, config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let (dx, dw, db) = mambavision::depthwise_backward(&self.download_f32(input)?,
+            &self.download_f32(weights)?, &self.download_f32(pre)?, &self.download_f32(grad)?,
+            batch, tokens, channels, branch, kernel, causal);
+        Ok((self.upload_f32(&[batch * tokens, 2 * channels], &dx)?,
+            self.upload_f32(&[channels, kernel], &dw)?, self.upload_f32(&[channels], &db)?))
+    }
+
+    /// Positive low-rank dt and diagonal selective scan, with incoming state.
+    fn mambavision_scan_f32(
+        &self, x: &Self::Tensor, projection: &Self::Tensor, dt_weights: &Self::Tensor,
+        dt_bias: &Self::Tensor, a_log: &Self::Tensor, d_skip: &Self::Tensor,
+        state_in: &Self::Tensor, g: mambavision::MambaScanGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<mambavision::MambaScanForward<Self::Tensor>, Self::Error> {
+        let _ = config;
+        let out = mambavision::scan(&self.download_f32(x)?, &self.download_f32(projection)?,
+            &self.download_f32(dt_weights)?, &self.download_f32(dt_bias)?,
+            &self.download_f32(a_log)?, &self.download_f32(d_skip)?, &self.download_f32(state_in)?, g);
+        Ok(mambavision::MambaScanForward {
+            output: self.upload_f32(&[g.batch, g.channels, g.tokens], &out.output)?,
+            dt_pre: self.upload_f32(&[g.batch, g.channels, g.tokens], &out.dt_pre)?,
+            states: self.upload_f32(&[g.batch, g.channels, g.tokens, g.state], &out.states)?,
+            state_out: self.upload_f32(&[g.batch, g.channels, g.state], &out.state_out)?,
+            boundary: self.upload_f32(&[g.batch, g.channels], &out.boundary)?,
+        })
+    }
+
+    /// Scan adjoint including dt projection, A_log, skip and incoming state.
+    /// The caller rejects `forward.boundary` before differentiating a seam.
+    fn mambavision_scan_backward_f32(
+        &self, x: &Self::Tensor, projection: &Self::Tensor, dt_weights: &Self::Tensor,
+        a_log: &Self::Tensor, d_skip: &Self::Tensor, state_in: &Self::Tensor,
+        dt_pre: &Self::Tensor, states: &Self::Tensor, grad: &Self::Tensor,
+        state_grad: &Self::Tensor, g: mambavision::MambaScanGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<mambavision::MambaScanGrad<Self::Tensor>, Self::Error> {
+        let _ = config;
+        let out = mambavision::scan_backward(&self.download_f32(x)?, &self.download_f32(projection)?,
+            &self.download_f32(dt_weights)?, &self.download_f32(a_log)?, &self.download_f32(d_skip)?,
+            &self.download_f32(state_in)?, &self.download_f32(dt_pre)?, &self.download_f32(states)?,
+            &self.download_f32(grad)?, &self.download_f32(state_grad)?, g);
+        Ok(mambavision::MambaScanGrad {
+            input: self.upload_f32(&[g.batch, g.channels, g.tokens], &out.input)?,
+            projection: self.upload_f32(&[g.batch * g.tokens, g.width()], &out.projection)?,
+            dt_weights: self.upload_f32(&[g.channels, g.rank], &out.dt_weights)?,
+            dt_bias: self.upload_f32(&[g.channels], &out.dt_bias)?,
+            a_log: self.upload_f32(&[g.channels, g.state], &out.a_log)?,
+            d_skip: self.upload_f32(&[g.channels], &out.d_skip)?,
+            state_in: self.upload_f32(&[g.batch, g.channels, g.state], &out.state_in)?,
+        })
+    }
+
+    /// Block-top-k self-attention: `(output, probabilities, score_active, undefined)`.
+    fn mambavision_msa_f32(
+        &self, input: &Self::Tensor, batch: usize, tokens: usize, channels: usize,
+        heads: usize, block: usize, topk: usize, config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let (out, prob, active, undefined) = mambavision::msa_forward(&self.download_f32(input)?,
+            batch, tokens, channels, heads, block, topk).expect("MambaVision MSA geometry");
+        let active: Vec<f32> = active.iter().map(|&a| if a { 1.0 } else { 0.0 }).collect();
+        Ok((self.upload_f32(&[batch * tokens, channels], &out)?,
+            self.upload_f32(&[batch, heads, tokens, tokens], &prob)?,
+            self.upload_f32(&[batch, heads, tokens, tokens], &active)?,
+            self.upload_f32(&[batch * heads * tokens],
+                &vec![if undefined { 1.0 } else { 0.0 }; batch * heads * tokens])?))
+    }
+
+    /// MSA adjoint sums the query, key and value contributions to the same input.
+    fn mambavision_msa_backward_f32(
+        &self, input: &Self::Tensor, probabilities: &Self::Tensor, active: &Self::Tensor,
+        grad: &Self::Tensor, batch: usize, tokens: usize, channels: usize,
+        heads: usize, config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let active: Vec<bool> = self.download_f32(active)?.iter().map(|&a| a != 0.0).collect();
+        let out = mambavision::msa_backward(&self.download_f32(input)?,
+            &self.download_f32(probabilities)?, &active, &self.download_f32(grad)?,
+            batch, tokens, channels, heads).expect("MambaVision MSA gradient");
+        self.upload_f32(&[batch * tokens, channels], &out)
+    }
+
     /// One Clifford rolling block in NCHW order. `pooled` context is `[B,C]`;
     /// otherwise it has the state shape. Inner blocks apply SiLU to the product.
     fn clifford_interaction_f32(
@@ -5212,6 +5385,35 @@ pub trait F32TensorOpsBackend {
         }
         Ok((self.upload_f32(&[batch, channels, 1, spatial], &dm)?,
             self.upload_f32(&[channels], &ds)?))
+    }
+
+    /// Tucker window attention, returning `(context, probabilities, finite_scores)`.
+    fn tucker_attention_f32(
+        &self, q: &Self::Tensor, k: &Self::Tensor, v: &Self::Tensor,
+        geometry: host_ops::tucker_attention::AttentionGeometry, config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let (context, probabilities, active) = host_ops::tucker_attention::forward(
+            &self.download_f32(q)?, &self.download_f32(k)?, &self.download_f32(v)?, geometry);
+        let g = geometry;
+        let score_shape = [g.windows, g.heads, g.tokens, g.tokens];
+        Ok((self.upload_f32(&[g.windows * g.tokens, g.channels], &context)?,
+            self.upload_f32(&score_shape, &probabilities)?, self.upload_f32(&score_shape, &active)?))
+    }
+
+    /// Exact attention adjoint on the routes retained by the forward.
+    fn tucker_attention_backward_f32(
+        &self, q: &Self::Tensor, k: &Self::Tensor, v: &Self::Tensor,
+        probabilities: &Self::Tensor, active: &Self::Tensor, grad: &Self::Tensor,
+        geometry: host_ops::tucker_attention::AttentionGeometry, config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let (dq, dk, dv) = host_ops::tucker_attention::backward(
+            &self.download_f32(q)?, &self.download_f32(k)?, &self.download_f32(v)?,
+            &self.download_f32(probabilities)?, &self.download_f32(active)?,
+            &self.download_f32(grad)?, geometry);
+        let shape = [geometry.windows * geometry.tokens, geometry.channels];
+        Ok((self.upload_f32(&shape, &dq)?, self.upload_f32(&shape, &dk)?, self.upload_f32(&shape, &dv)?))
     }
 
     /// Connected layer pre-activation `out[b, o] = x[b, :] . w[o, :] + bias[o]`

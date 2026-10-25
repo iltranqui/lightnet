@@ -13,6 +13,7 @@ does not imply runtime optimizer integration.
 
 ## Contents
 
+- [Unvalidated source continuation](#unvalidated-source-continuation)
 - [How this file was derived](#how-this-file-was-derived)
 - [Legend](#legend)
 - [Counts](#counts)
@@ -26,6 +27,16 @@ does not imply runtime optimizer integration.
 - [Blocked, not plannable](#blocked-not-plannable)
 - [Defects found while deriving this matrix](#defects-found-while-deriving-this-matrix)
 - [Maintenance](#maintenance)
+
+## Unvalidated source continuation
+
+2026-10-25: WIP source now wires native f32 TuckerAttention, MambaVision,
+KimiKDA, DepthAnything and DPT paths. See [source-wip.md](source-wip.md) for
+scope and limits. The older matrix/counts below have not been promoted to
+verified status: the user prohibited Cargo check/build/test/run. Mamba/Kimi/DPT
+updates remain host-staged; DepthAnything is frozen. Half-storage inference,
+remaining variants and full device residency are still open. No layer is
+certified complete by this continuation.
 
 ## How this file was derived
 

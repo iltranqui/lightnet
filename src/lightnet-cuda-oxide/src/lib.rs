@@ -8,6 +8,9 @@ mod dcnv4_native;
 mod deconvolutional;
 mod graph_conv;
 mod swin;
+mod mambavision;
+mod kimi_kda;
+mod tucker_attention;
 pub use dcnv4_native::Dcnv4NativeGradients;
 pub mod fp4;
 pub mod fp8;
@@ -242,6 +245,9 @@ pub struct OxideBackend {
     attention: attention::kernels::LoadedModule,
     vit: vit::kernels::LoadedModule,
     swin: kernels::swin::kernels::LoadedModule,
+    mambavision: kernels::mambavision::kernels::LoadedModule,
+    kimi_kda: kernels::kimi_kda::kernels::LoadedModule,
+    tucker_attention: kernels::tucker_attention::kernels::LoadedModule,
     clifford: kernels::clifford::kernels::LoadedModule,
     residual_epilogue: layers_extra::residual::LoadedModule,
     conv_mode: ConvMode,
@@ -1936,6 +1942,12 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load vit module: {err:?}")))?;
         let swin = kernels::swin::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load swin module: {err:?}")))?;
+        let mambavision = kernels::mambavision::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load mambavision module: {err:?}")))?;
+        let kimi_kda = kernels::kimi_kda::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load kimi_kda module: {err:?}")))?;
+        let tucker_attention = kernels::tucker_attention::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load tucker_attention module: {err:?}")))?;
         let clifford = kernels::clifford::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load clifford module: {err:?}")))?;
         let attention = attention::kernels::load(&ctx)
@@ -2049,6 +2061,9 @@ impl OxideBackend {
             attention,
             vit,
             swin,
+            mambavision,
+            kimi_kda,
+            tucker_attention,
             deform_sample,
             deform_backward,
             dsconv,
@@ -7046,6 +7061,100 @@ impl F32TensorOpsBackend for OxideBackend {
     type Error = OxideError;
     type Tensor = OxideTensorF32;
 
+    fn depth_tap_clamp_f32(&self, raw: &Self::Tensor, gradient: Option<&Self::Tensor>,
+        shape: &[usize], clip: f32, config: ElementwiseLaunchConfig) -> Result<Self::Tensor, Self::Error> {
+        let grad = self.f32v(gradient.unwrap_or(raw))?;
+        let raw = self.f32v(raw)?;
+        let len = shape.iter().try_fold(1usize, |n, &v| n.checked_mul(v))
+            .ok_or_else(|| OxideError::Shape("depth clamp shape overflow".into()))?;
+        if raw.len() != len || grad.len() != len || !clip.is_finite() || clip <= 0.0 {
+            return Err(OxideError::Shape("depth clamp geometry mismatch".into()));
+        }
+        let mut out = self.alloc_uninit(len)?;
+        // SAFETY: one writer per element; both input buffers have checked length.
+        unsafe { self.vit.depth_tap_clamp(&self.stream, launch::elementwise(len, config),
+            &raw.buf, &grad.buf, &mut out, clip, gradient.is_some()) }.map_err(launch_err)?;
+        Ok(OxideTensorF32::new(out, shape))
+    }
+
+    fn kimi_scan_f32(
+        &self, q: &Self::Tensor, k: &Self::Tensor, v: &Self::Tensor,
+        beta: &Self::Tensor, decay: &Self::Tensor, g: lightnet_cuda::kimi_kda::KdaGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<lightnet_cuda::kimi_kda::KdaForward<Self::Tensor>, Self::Error> {
+        self.kimi_scan_native(q, k, v, beta, decay, g, config)
+    }
+
+    fn kimi_scan_backward_f32(
+        &self, q: &Self::Tensor, v: &Self::Tensor, beta: &Self::Tensor, decay: &Self::Tensor,
+        forward: &lightnet_cuda::kimi_kda::KdaForward<Self::Tensor>, dy: &Self::Tensor,
+        g: lightnet_cuda::kimi_kda::KdaGeometry, config: ElementwiseLaunchConfig,
+    ) -> Result<lightnet_cuda::kimi_kda::KdaGrad<Self::Tensor>, Self::Error> {
+        self.kimi_scan_backward_native(q, v, beta, decay, forward, dy, g, config)
+    }
+
+    fn kimi_router_gates_f32(
+        &self, logits: &Self::Tensor, rows: usize, experts: usize, top_k: usize,
+        temperature: f32, config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        self.kimi_router_native(logits, rows, experts, top_k, temperature, config)
+    }
+
+    fn mambavision_depthwise_f32(
+        &self, input: &Self::Tensor, weights: &Self::Tensor, bias: &Self::Tensor,
+        batch: usize, tokens: usize, channels: usize, branch: usize, kernel: usize,
+        causal: bool, config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        self.mambavision_depthwise_native(input, weights, bias, batch, tokens,
+            channels, branch, kernel, causal, config)
+    }
+
+    fn mambavision_depthwise_backward_f32(
+        &self, input: &Self::Tensor, weights: &Self::Tensor, pre: &Self::Tensor,
+        grad: &Self::Tensor, batch: usize, tokens: usize, channels: usize,
+        branch: usize, kernel: usize, causal: bool, config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        self.mambavision_depthwise_backward_native(input, weights, pre, grad,
+            batch, tokens, channels, branch, kernel, causal, config)
+    }
+
+    fn mambavision_scan_f32(
+        &self, x: &Self::Tensor, projection: &Self::Tensor, dt_weights: &Self::Tensor,
+        dt_bias: &Self::Tensor, a_log: &Self::Tensor, d_skip: &Self::Tensor,
+        state_in: &Self::Tensor, g: lightnet_cuda::mambavision::MambaScanGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<lightnet_cuda::mambavision::MambaScanForward<Self::Tensor>, Self::Error> {
+        self.mambavision_scan_native(x, projection, dt_weights, dt_bias, a_log,
+            d_skip, state_in, g, config)
+    }
+
+    fn mambavision_scan_backward_f32(
+        &self, x: &Self::Tensor, projection: &Self::Tensor, dt_weights: &Self::Tensor,
+        a_log: &Self::Tensor, d_skip: &Self::Tensor, state_in: &Self::Tensor,
+        dt_pre: &Self::Tensor, states: &Self::Tensor, grad: &Self::Tensor,
+        state_grad: &Self::Tensor, g: lightnet_cuda::mambavision::MambaScanGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<lightnet_cuda::mambavision::MambaScanGrad<Self::Tensor>, Self::Error> {
+        self.mambavision_scan_backward_native(x, projection, dt_weights, a_log,
+            d_skip, state_in, dt_pre, states, grad, state_grad, g, config)
+    }
+
+    fn mambavision_msa_f32(
+        &self, input: &Self::Tensor, batch: usize, tokens: usize, channels: usize,
+        heads: usize, block: usize, topk: usize, config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        self.mambavision_msa_native(input, batch, tokens, channels, heads, block, topk, config)
+    }
+
+    fn mambavision_msa_backward_f32(
+        &self, input: &Self::Tensor, probabilities: &Self::Tensor, active: &Self::Tensor,
+        grad: &Self::Tensor, batch: usize, tokens: usize, channels: usize,
+        heads: usize, config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        self.mambavision_msa_backward_native(input, probabilities, active, grad,
+            batch, tokens, channels, heads, config)
+    }
+
     fn upload_f32(&self, shape: &[usize], host: &[f32]) -> Result<Self::Tensor, Self::Error> {
         let expected: usize = shape.iter().product();
         if expected != host.len() {
@@ -11641,6 +11750,23 @@ impl F32TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         OxideBackend::vit_pos_embed_backward_f32(self, grad, batch, table, config)
+    }
+
+    fn tucker_attention_f32(
+        &self, q: &Self::Tensor, k: &Self::Tensor, v: &Self::Tensor,
+        geometry: lightnet_cuda::host_ops::tucker_attention::AttentionGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        self.tucker_attention_native(q, k, v, geometry, config)
+    }
+
+    fn tucker_attention_backward_f32(
+        &self, q: &Self::Tensor, k: &Self::Tensor, v: &Self::Tensor,
+        probabilities: &Self::Tensor, active: &Self::Tensor, grad: &Self::Tensor,
+        geometry: lightnet_cuda::host_ops::tucker_attention::AttentionGeometry,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        self.tucker_attention_backward_native(q, k, v, probabilities, active, grad, geometry, config)
     }
 
     fn clifford_interaction_f32(

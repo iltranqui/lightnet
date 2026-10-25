@@ -1,6 +1,6 @@
 use super::*;
 use crate::depth_anything::DepthAnythingWeights;
-use crate::runtime::{GpuForwardState, GradMode, reject_gpu_hyperbolic_foveation};
+use crate::runtime::{GradMode, reject_gpu_hyperbolic_foveation};
 use crate::weights::{WeightsArrayInspection, inspect_weights_file, save_weights};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -716,54 +716,24 @@ fn dpt_head_to_depth_anything_chain_receives_analytical_input_gradient() {
 }
 
 #[test]
-fn dpt_head_rejects_gpu_execution_backward_and_updates() {
+fn dpt_head_native_f32_dispatch_and_unsupported_half_boundary() {
     let network = Network::from_config(
         ConfigFile::parse_str("dpt-head-gpu.cfg", &tiny_dpt_config("dpt_head")).unwrap(),
     )
     .unwrap();
     let input = Tensor::zeros(network.net.input_shape());
     let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
-    for (operation, result) in [
-        ("full", gpu.forward(&input).map(|_| ())),
-        ("compact", gpu.forward_compact(&input).map(|_| ())),
-    ] {
-        let error = result.expect_err("DPT GPU execution must fail");
-        assert!(
-            error.to_string().contains("Stage-1 CPU support"),
-            "{operation}: {error}"
-        );
-    }
-    let error = gpu
-        .update_weights_gpu(0.01, 0.0, 0.0, 1)
-        .expect_err("DPT GPU update must fail");
-    assert!(error.to_string().contains("Stage-1 CPU support"));
-    let error = gpu
-        .update_weights_gpu_deferred(0.01, 0.0, 0.0, 1)
-        .expect_err("DPT deferred GPU update must fail");
+    assert!(!gpu.requires_cpu_backward_fallback());
+    gpu.init_train_buffers_gpu().unwrap();
+    let state = gpu.forward_training_device(&input).unwrap();
+    let shape = network.layers[0].output_shape;
+    let seeds = [Some(Tensor::from_data(shape, vec![1.0;shape.batch*shape.element_count()]).unwrap())];
+    gpu.backward_accumulate_seeded_gpu(&state, &seeds).unwrap();
+    gpu.update_weights_gpu(0.01, 0.0, 0.0, 1).unwrap();
+    let error = gpu.forward_compact(&input).unwrap_err();
     assert!(error.to_string().contains("Stage-1 CPU support"));
     let error = reject_gpu_hyperbolic_foveation(&network, "f16 inference")
         .expect_err("DPT f16 GPU execution must fail");
     assert!(error.to_string().contains("Stage-1 CPU support"));
 
-    let fake = FakeTensor {
-        shape: vec![],
-        data: vec![],
-    };
-    let state = GpuForwardState {
-        input_gpu: fake,
-        gpu_layer_outputs: Vec::new(),
-        gpu_layer_activation_inputs: Vec::new(),
-        gpu_batch_norm_caches: Vec::new(),
-        gpu_rnn_caches: Vec::new(),
-        gpu_crnn_caches: Vec::new(),
-        gpu_lstm_caches: Vec::new(),
-        gpu_moe_caches: Vec::new(),
-        gpu_eml_caches: Vec::new(),
-        gpu_dcnv4_caches: Vec::new(),
-        cpu_forward: ForwardResult::from_heads(Vec::new(), Vec::new()),
-    };
-    let error = gpu
-        .backward_accumulate_seeded_gpu(&state, &[None])
-        .expect_err("DPT GPU backward must fail");
-    assert!(error.to_string().contains("Stage-1 CPU support"));
 }

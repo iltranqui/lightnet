@@ -15,6 +15,7 @@ pub mod laya_act;
 pub mod local;
 pub mod marker_gather;
 pub mod muon;
+pub mod tucker_attention;
 pub mod wmhf;
 
 /// Geometry for the bounded single-template Dynamic Snake Conv native path.

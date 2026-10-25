@@ -71,10 +71,10 @@ where
                 || moe.len() != self.network.layers.len()
                 || eml.len() != self.network.layers.len()
                 || dcnv4.len() != self.network.layers.len()
-                || (conv.iter().all(Option::is_none)
-                    && moe.iter().all(Option::is_none)
-                    && eml.iter().all(Option::is_none)
-                    && dcnv4.iter().all(Option::is_none))
+                // A transformer-only network legitimately has no convolution
+                // buffers. Initialization is a length contract, not a test
+                // for whether any layer owns convolution parameters.
+                || self.cpu_fallback_train_buffers.borrow().len() != self.network.layers.len()
         };
         if train_buffers_uninitialized {
             self.init_train_buffers_gpu()?;
@@ -551,6 +551,31 @@ where
                         grad,
                         config,
                         &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::TuckerAttention(spec), Some(LayerParams::TuckerAttention(_))) => {
+                    self.backward_tucker_attention_gpu(
+                        layer, spec, grad, config, &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::MambaVision(spec), Some(LayerParams::MambaVision(_))) => {
+                    self.backward_mambavision_gpu(
+                        layer, spec, grad, config, &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::KimiKda(spec), Some(LayerParams::KimiKda(_))) => {
+                    self.backward_kimi_kda_gpu(
+                        layer, spec, grad, config, &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::DptHead(spec), Some(LayerParams::DptHead(_))) => {
+                    self.backward_dpt_head_gpu(
+                        layer, spec, grad, config, &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::DepthAnything(spec), Some(LayerParams::DepthAnything(_))) => {
+                    self.backward_depth_anything_gpu(
+                        layer, spec, grad, config, &mut layer_output_gradients,
                     )?;
                 }
                 _ => {

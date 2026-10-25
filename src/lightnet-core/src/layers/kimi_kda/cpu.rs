@@ -83,7 +83,7 @@ impl KimiKdaParams {
         })
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self) -> Result<(), String> {
         let offsets = KimiOffsets::new(self.channels, self.rank, self.experts, self.hidden)?;
         if self.biases.len() != offsets.total_biases || self.weights.len() != offsets.total_weights
         {
@@ -98,7 +98,7 @@ impl KimiKdaParams {
         Ok(())
     }
 
-    fn matches(&self, g: &KimiKdaGeometry) -> bool {
+    pub(super) fn matches(&self, g: &KimiKdaGeometry) -> bool {
         self.channels == g.channels
             && self.rank == g.rank
             && self.experts == g.experts
@@ -346,35 +346,35 @@ pub(crate) fn initialize_kimi_kda_params(
 }
 
 #[derive(Clone, Copy, Debug)]
-struct KimiOffsets {
-    wq: usize,
-    wk: usize,
-    wv: usize,
-    wo: usize,
-    wbeta: usize,
-    wdecay: usize,
-    wrouter: usize,
-    w1: usize,
-    w2: usize,
-    total_weights: usize,
-    ln1_gamma: usize,
-    ln1_beta: usize,
-    ln2_gamma: usize,
-    ln2_beta: usize,
-    bq: usize,
-    bk: usize,
-    bv: usize,
-    bbeta: usize,
-    bdecay: usize,
-    bo: usize,
-    brouter: usize,
-    b1: usize,
-    b2: usize,
-    total_biases: usize,
+pub(super) struct KimiOffsets {
+    pub(super) wq: usize,
+    pub(super) wk: usize,
+    pub(super) wv: usize,
+    pub(super) wo: usize,
+    pub(super) wbeta: usize,
+    pub(super) wdecay: usize,
+    pub(super) wrouter: usize,
+    pub(super) w1: usize,
+    pub(super) w2: usize,
+    pub(super) total_weights: usize,
+    pub(super) ln1_gamma: usize,
+    pub(super) ln1_beta: usize,
+    pub(super) ln2_gamma: usize,
+    pub(super) ln2_beta: usize,
+    pub(super) bq: usize,
+    pub(super) bk: usize,
+    pub(super) bv: usize,
+    pub(super) bbeta: usize,
+    pub(super) bdecay: usize,
+    pub(super) bo: usize,
+    pub(super) brouter: usize,
+    pub(super) b1: usize,
+    pub(super) b2: usize,
+    pub(super) total_biases: usize,
 }
 
 impl KimiOffsets {
-    fn new(channels: usize, rank: usize, experts: usize, hidden: usize) -> Result<Self, String> {
+    pub(super) fn new(channels: usize, rank: usize, experts: usize, hidden: usize) -> Result<Self, String> {
         if channels == 0 || rank == 0 || experts == 0 || hidden == 0 {
             return Err("Kimi KDA parameter geometry must be positive".into());
         }
@@ -1052,7 +1052,9 @@ pub(crate) fn kimi_kda_backward(
     )?;
     gradients.biases[offsets.ln1_gamma..offsets.ln1_gamma + channels].copy_from_slice(&d_ln1_gamma);
     gradients.biases[offsets.ln1_beta..offsets.ln1_beta + channels].copy_from_slice(&d_ln1_beta);
-    let mut d_tokens = dy;
+    // pre_expert = tokens + attention_projection. Both the direct output
+    // seed and the expert/router LN2 adjoint reach this identity edge.
+    let mut d_tokens = d_pre_expert;
     for (dst, src) in d_tokens.iter_mut().zip(d_ln1_input) {
         *dst += src;
     }
@@ -1128,6 +1130,39 @@ mod tests {
 
     fn shape(g: &KimiKdaGeometry) -> TensorShape {
         TensorShape::new(g.width, g.height, g.channels, g.batch)
+    }
+
+    #[test]
+    fn expert_input_adjoint_reaches_tokens_through_pre_expert_identity() {
+        // Zero attention leaves pre_expert=tokens. A shared linear expert
+        // behind LN2 must still contribute to the input derivative.
+        let mut g = geometry(1, 3, 1, 1);
+        g.rank = 1;
+        g.experts = 1;
+        g.hidden = 2;
+        g.load_balance = 0.0;
+        g.activation = Activation::Linear;
+        let mut params = KimiKdaParams::zeroed(3, 1, 1, 2).unwrap();
+        let o = super::KimiOffsets::new(3, 1, 1, 2).unwrap();
+        params.biases[o.ln2_gamma..o.ln2_gamma + 3].fill(1.0);
+        params.biases[o.bk] = 1.0;
+        params.weights[o.w1..o.w1 + 6].copy_from_slice(&[0.7, -0.2, 0.1, 0.3, 0.4, -0.6]);
+        params.weights[o.w2..o.w2 + 6].copy_from_slice(&[0.8, 0.2, -0.4, 0.5, 0.1, -0.7]);
+        let input = [0.2, -0.7, 1.1];
+        let seed = [0.3, -0.2, 0.7];
+        let (_, cache) = kimi_kda_forward(&input, shape(&g), &spec(&g), &params).unwrap();
+        let grad = kimi_kda_backward(&seed, &params, &cache).unwrap();
+        assert!(grad.input.iter().zip(seed).any(|(dx, dy)| (dx - dy).abs() > 1e-3));
+        for i in 0..input.len() {
+            let mut plus = input;
+            let mut minus = input;
+            plus[i] += 1e-3;
+            minus[i] -= 1e-3;
+            let expected = (objective(&plus, &params, &g, &seed)
+                - objective(&minus, &params, &g, &seed)) / 2e-3;
+            assert!((grad.input[i] - expected).abs() < 3e-4,
+                "input[{i}]: {} vs {expected}", grad.input[i]);
+        }
     }
 
     #[test]

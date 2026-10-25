@@ -365,4 +365,15 @@ pub mod kernels {
             *dst = sum;
         }
     }
+
+    #[kernel]
+    pub fn depth_tap_clamp(raw: &[f32], grad: &[f32], mut output: DisjointSlice<f32>, clip: f32, backward: bool) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= output.len() { return; }
+        let x = raw[i];
+        let value = if backward { if x < -clip || x > clip { 0.0 } else { grad[i] } }
+            else { x.clamp(-clip, clip) };
+        if let Some(dst) = output.get_mut(idx) { *dst = value; }
+    }
 }

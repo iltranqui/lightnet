@@ -85,7 +85,7 @@ impl MambaVisionParams {
         })
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub(super) fn validate(&self) -> Result<(), String> {
         let expected = MambaOffsets::new(
             self.channels,
             self.filters,
@@ -104,7 +104,7 @@ impl MambaVisionParams {
         Ok(())
     }
 
-    fn matches(&self, g: &MambaVisionGeometry) -> bool {
+    pub(super) fn matches(&self, g: &MambaVisionGeometry) -> bool {
         self.channels == g.channels
             && self.filters == g.filters
             && self.state_size == g.state_size
@@ -152,21 +152,21 @@ pub struct MambaVisionGradients {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct MambaVisionGeometry {
-    batch: usize,
-    channels: usize,
-    height: usize,
-    width: usize,
-    filters: usize,
-    state_size: usize,
-    conv_size: usize,
-    dt_rank: usize,
-    ffn_ratio: usize,
-    activation: Activation,
-    msa_enabled: bool,
-    msa_block_size: usize,
-    msa_topk: usize,
-    msa_heads: usize,
-    causal: bool,
+    pub(super) batch: usize,
+    pub(super) channels: usize,
+    pub(super) height: usize,
+    pub(super) width: usize,
+    pub(super) filters: usize,
+    pub(super) state_size: usize,
+    pub(super) conv_size: usize,
+    pub(super) dt_rank: usize,
+    pub(super) ffn_ratio: usize,
+    pub(super) activation: Activation,
+    pub(super) msa_enabled: bool,
+    pub(super) msa_block_size: usize,
+    pub(super) msa_topk: usize,
+    pub(super) msa_heads: usize,
+    pub(super) causal: bool,
 }
 
 impl MambaVisionGeometry {
@@ -234,23 +234,23 @@ impl MambaVisionGeometry {
         Ok(())
     }
 
-    fn tokens(&self) -> usize {
+    pub(super) fn tokens(&self) -> usize {
         self.height * self.width
     }
 
-    fn rows(&self) -> usize {
+    pub(super) fn rows(&self) -> usize {
         self.batch * self.tokens()
     }
 
-    fn half(&self) -> usize {
+    pub(super) fn half(&self) -> usize {
         self.filters / 2
     }
 
-    fn hidden(&self) -> usize {
+    pub(super) fn hidden(&self) -> usize {
         self.filters * self.ffn_ratio
     }
 
-    fn projection_width(&self) -> usize {
+    pub(super) fn projection_width(&self) -> usize {
         self.dt_rank + 2 * self.state_size
     }
 }
@@ -301,34 +301,34 @@ pub(crate) struct MambaParamBlock {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct MambaOffsets {
-    in_w: Range<usize>,
-    in_b: Range<usize>,
-    conv_x_w: Range<usize>,
-    conv_x_b: Range<usize>,
-    conv_z_w: Range<usize>,
-    conv_z_b: Range<usize>,
-    x_proj_w: Range<usize>,
-    dt_proj_w: Range<usize>,
-    dt_proj_b: Range<usize>,
-    a_log: Range<usize>,
-    d_skip: Range<usize>,
-    out_w: Range<usize>,
-    out_b: Range<usize>,
-    res_w: Option<Range<usize>>,
-    ln1_gamma: Range<usize>,
-    ln1_beta: Range<usize>,
-    ln2_gamma: Range<usize>,
-    ln2_beta: Range<usize>,
-    ffn1_w: Range<usize>,
-    ffn1_b: Range<usize>,
-    ffn2_w: Range<usize>,
-    ffn2_b: Range<usize>,
-    total: usize,
+pub(super) struct MambaOffsets {
+    pub(super) in_w: Range<usize>,
+    pub(super) in_b: Range<usize>,
+    pub(super) conv_x_w: Range<usize>,
+    pub(super) conv_x_b: Range<usize>,
+    pub(super) conv_z_w: Range<usize>,
+    pub(super) conv_z_b: Range<usize>,
+    pub(super) x_proj_w: Range<usize>,
+    pub(super) dt_proj_w: Range<usize>,
+    pub(super) dt_proj_b: Range<usize>,
+    pub(super) a_log: Range<usize>,
+    pub(super) d_skip: Range<usize>,
+    pub(super) out_w: Range<usize>,
+    pub(super) out_b: Range<usize>,
+    pub(super) res_w: Option<Range<usize>>,
+    pub(super) ln1_gamma: Range<usize>,
+    pub(super) ln1_beta: Range<usize>,
+    pub(super) ln2_gamma: Range<usize>,
+    pub(super) ln2_beta: Range<usize>,
+    pub(super) ffn1_w: Range<usize>,
+    pub(super) ffn1_b: Range<usize>,
+    pub(super) ffn2_w: Range<usize>,
+    pub(super) ffn2_b: Range<usize>,
+    pub(super) total: usize,
 }
 
 impl MambaOffsets {
-    fn new(
+    pub(super) fn new(
         channels: usize,
         filters: usize,
         state_size: usize,

@@ -65,13 +65,31 @@ where
                         return true;
                     }
                 }
+                LayerKind::TuckerAttention(spec) => {
+                    let geometry = crate::layers::tucker_attention::gpu::geometry(layer, spec);
+                    if !crate::layers::tucker_attention::gpu::supported(&geometry) {
+                        return true;
+                    }
+                }
                 // Weighted shortcut parameter reductions stay host-resident,
                 // while input/source gradients use backend elementwise ops.
                 // `[laya_act_head]` still uses the host fallback.
-                LayerKind::LayaActHead(_)
-                | LayerKind::TuckerAttention(_)
-                | LayerKind::MambaVision(_)
-                | LayerKind::KimiKda(_) => return true,
+                LayerKind::MambaVision(spec) => {
+                    if !crate::layers::mambavision::gpu::supported(layer, spec) {
+                        return true;
+                    }
+                }
+                LayerKind::KimiKda(spec) => {
+                    if !crate::layers::kimi_kda::gpu::supported(layer, spec) {
+                        return true;
+                    }
+                }
+                LayerKind::DepthAnything(spec) => {
+                    if !crate::layers::depth_anything::gpu::supported(layer, spec) {
+                        return true;
+                    }
+                }
+                LayerKind::LayaActHead(_) => return true,
                 // Connected layers are handled on the GPU path with a host
                 // round trip unless their activation or batch norm
                 // (batch-statistics training) is unsupported.
@@ -119,9 +137,7 @@ where
             conv.len() != self.network.layers.len()
                 || moe.len() != self.network.layers.len()
                 || eml.len() != self.network.layers.len()
-                || (conv.iter().all(Option::is_none)
-                    && moe.iter().all(Option::is_none)
-                    && eml.iter().all(Option::is_none))
+                || self.cpu_fallback_train_buffers.borrow().len() != self.network.layers.len()
         };
         if train_buffers_uninitialized {
             self.init_train_buffers_gpu()?;

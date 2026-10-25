@@ -433,6 +433,8 @@ where
                         )
                         | (LayerKind::MambaVision(_), LayerParams::MambaVision(_))
                         | (LayerKind::KimiKda(_), LayerParams::KimiKda(_))
+                        | (LayerKind::DptHead(_), LayerParams::DptHead(_))
+                        | (LayerKind::DepthAnything(_), LayerParams::DepthAnything(_))
                         | (LayerKind::GraphConv(_), LayerParams::GraphConv(_))
                         | (LayerKind::Dcnv4(_), LayerParams::Dcnv4(_))
                         | (LayerKind::DeformConv(_), LayerParams::DeformConv(_))
@@ -501,6 +503,7 @@ where
             let layer = self.network.layers[index].clone();
             if !layer.train.updates_at(iteration_num, burn_in)
                 || matches!(self.params[index], LayerParams::None)
+                || matches!(layer.kind, LayerKind::DepthAnything(_))
             {
                 continue;
             }
@@ -1040,6 +1043,8 @@ where
                         | LayerParams::TuckerAttention(_)
                         | LayerParams::MambaVision(_)
                         | LayerParams::KimiKda(_)
+                        | LayerParams::DptHead(_)
+                        | LayerParams::DepthAnything(_)
                         | LayerParams::Rnn(_)
                         | LayerParams::Lstm(_)
                         | LayerParams::Crnn(_)
@@ -1338,7 +1343,7 @@ where
                 &preserve_device_moe_params,
                 &preserve_device_eml_params,
                 &preserve_device_dcnv4_params,
-            );
+            )?;
         }
         Ok(())
     }
@@ -1456,6 +1461,13 @@ where
                         &mut moments.biases,
                         adam,
                     )?;
+                }
+                (LayerParams::DptHead(params), LayerTrainBuffers::DptHead(train)) => {
+                    let LayerKind::DptHead(spec) = &layer.kind else {
+                        return Err(Error::InvalidConfig("DPT optimizer layer kind mismatch".into()));
+                    };
+                    let moments = moments_all[index].get_or_insert_with(HostAdamLayerState::default);
+                    apply_host_adam_dpt(spec, layer.input_shape, params, train, moments, adam, true)?;
                 }
                 (LayerParams::MambaVision(params), LayerTrainBuffers::MambaVision(train)) => {
                     let moments =
@@ -1887,6 +1899,7 @@ where
                     apply_host_adam_convolutional(params, train, moments, adam)?;
                 }
                 (LayerParams::None, _) | (LayerParams::Convolutional(_), _) => {}
+                (LayerParams::DepthAnything(_), LayerTrainBuffers::None) => {}
                 _ => {
                     return Err(Error::InvalidConfig(format!(
                         "adam=1 on the GPU path has no optimizer state for layer #{} ({})",
@@ -1923,7 +1936,7 @@ where
         preserve_device_moe_params: &[bool],
         preserve_device_eml_params: &[bool],
         preserve_device_dcnv4_params: &[bool],
-    ) {
+    ) -> Result<()> {
         let iteration_num = self.train_iteration as i64 + 1;
         let burn_in = self.network.net.burn_in;
         let train_buffers = self.cpu_fallback_train_buffers.get_mut();
@@ -2100,6 +2113,13 @@ where
                         decay,
                         batch,
                     );
+                }
+                (LayerParams::DptHead(params), LayerTrainBuffers::DptHead(train)) => {
+                    let LayerKind::DptHead(spec) = &layer.kind else {
+                        return Err(Error::InvalidConfig("DPT optimizer layer kind mismatch".into()));
+                    };
+                    update_dpt_head_sgd(spec, layer.input_shape, params, train,
+                        lr * layer.train.learning_rate_scale, momentum, decay, batch);
                 }
                 (
                     LayerParams::TuckerAttention(params),
@@ -2477,6 +2497,7 @@ where
                 }
             }
         }
+        Ok(())
     }
 
 }

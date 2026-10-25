@@ -1789,7 +1789,7 @@ fn container_convolution_cache_is_keyed_by_owner_and_expert_slot() {
     }
     drop(cache);
 
-    gpu.update_cpu_fallback_weights(0.1, 0.0, 0.0, 1, &[], &[], &[]);
+    gpu.update_cpu_fallback_weights(0.1, 0.0, 0.0, 1, &[], &[], &[]).unwrap();
     assert!(gpu.device_conv_params.borrow()[0].is_empty());
     gpu.warm_device_conv_params()
         .expect("rewarm updated experts");

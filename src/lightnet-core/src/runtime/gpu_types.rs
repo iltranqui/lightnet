@@ -41,7 +41,7 @@ pub(super) fn reject_gpu_stage1_cpu_layers(network: &Network, operation: &str) -
     if let Some(layer) = network.layers.iter().find(|layer| {
         matches!(
             layer.kind,
-            LayerKind::DepthAnything(_) | LayerKind::DptHead(_) | LayerKind::Yolo3d(_)
+            LayerKind::Yolo3d(_)
         )
     }) {
         return Err(Error::UnsupportedLayer {
@@ -238,6 +238,18 @@ where
     /// forward when the network takes the native backward (see `layers::swin::gpu`).
     pub(crate) swin_device_caches:
         RefCell<Vec<Option<crate::layers::swin::gpu::DeviceCache<B::Tensor>>>>,
+    /// Tucker factor projections and attention routes of the native training forward.
+    pub(crate) tucker_attention_device_caches:
+        RefCell<Vec<Option<crate::layers::tucker_attention::gpu::DeviceCache<B::Tensor>>>>,
+    /// Native MambaVision scan, depthwise and FFN intermediates.
+    pub(crate) mambavision_device_caches:
+        RefCell<Vec<Option<crate::layers::mambavision::gpu::DeviceCache<B::Tensor>>>>,
+    pub(crate) kimi_kda_device_caches:
+        RefCell<Vec<Option<crate::layers::kimi_kda::gpu::DeviceCache<B::Tensor>>>>,
+    pub(crate) dpt_head_device_caches:
+        RefCell<Vec<Option<crate::layers::dpt_head::gpu::DeviceCache<B::Tensor>>>>,
+    pub(crate) depth_anything_device_caches:
+        RefCell<Vec<Option<crate::layers::depth_anything::gpu::DeviceCache<B::Tensor>>>>,
     /// Native Clifford intermediates, populated by the training forward.
     pub(crate) clifford_device_caches:
         RefCell<Vec<Option<crate::layers::clifford::gpu::DeviceCache<B::Tensor>>>>,

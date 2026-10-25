@@ -124,7 +124,7 @@ impl TuckerAttentionParams {
         })
     }
 
-    fn matches_geometry(&self, g: &TuckerGeometry) -> bool {
+    pub(super) fn matches_geometry(&self, g: &TuckerGeometry) -> bool {
         self.channels == g.channels
             && self.heads == g.heads
             && self.rank_q == g.rank_q
