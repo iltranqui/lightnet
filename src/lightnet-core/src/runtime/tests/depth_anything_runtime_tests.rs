@@ -473,6 +473,7 @@ fn depth_anything_native_f32_execution_keeps_weights_frozen() {
     gpu.backward_accumulate_seeded_gpu(&forward, &seeds).unwrap();
     gpu.update_weights_gpu(0.1, 0.0, 0.0, 1).unwrap();
     assert_eq!(gpu.params, frozen);
-    let error = gpu.forward_compact(&input).unwrap_err().to_string();
-    assert!(error.contains("Stage-1 CPU support"), "{error}");
+    assert!(gpu.forward_compact(&input).unwrap().final_output.is_some());
+    let error = crate::runtime::reject_gpu_hyperbolic_foveation(&network,"f16 inference").unwrap_err();
+    assert!(error.to_string().contains("Stage-1 CPU support"));
 }

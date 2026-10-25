@@ -50,6 +50,12 @@ remain outside this checkpoint.
   accumulation for networks with no convolution-owned buffers. Propagate
   errors from host-staged SGD dispatch instead of returning errors from a
   unit-returning function.
+- Compact f32 continuation: reuse inference-only layer paths for ViT, Swin,
+  TuckerAttention, MambaVision, KimiKDA, frozen DepthAnything, DPT, WMHF and
+  Clifford. Keep output last-use release accounting and full-forward fallback
+  for documented unsupported variants. Half-storage guards remain separate.
+  Source fixtures compare CPU/full/compact outputs and place compact inference
+  between training forward/backward to pin preservation of training caches.
 - Source fixtures: oxide_mambavision, oxide_kimi_kda, oxide_dpt_head and
   oxide_depth_anything exercise layout, state adjoints, routing, repeated
   accumulation, input/parameter gradients and updates. Existing depth host
@@ -62,7 +68,7 @@ All new fixtures are unrun. No successful compilation or numeric parity is
 claimed. References are hand-derived Rust/C++ source, no compiled-C++ golden.
 
 This is not every layer completed. RecursiveBlock runtime, yolo_3d CPU loss
-and device path, remaining native variants/controller paths, compact f32/f16
+and device path, remaining native variants/controller paths, remaining compact f32/f16
 coverage, host optimizer transfers/residency, native Muon eligibility and
 the rest of the AGENTS.md queue remain open. Existing ViT/Swin/WMHF/Clifford
 WIP commits are also unvalidated and do not certify completion.

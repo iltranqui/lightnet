@@ -133,6 +133,8 @@ fn train_check(options: &str, w: usize, h: usize, c: usize, adam: bool, fallback
     let expected = cpu.forward(&input).unwrap().final_output().unwrap().clone();
     let actual = gpu.forward(&input).unwrap().final_output().unwrap().clone();
     close("inference", &actual.data, &expected.data, 2e-4);
+    let compact = gpu.forward_compact(&input).unwrap().final_output.unwrap();
+    close("compact inference", &compact.data, &expected.data, 2e-4);
 
     gpu.init_train_buffers_gpu().unwrap();
     let forward = cpu.forward_training(&input).unwrap();

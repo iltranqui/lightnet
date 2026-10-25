@@ -33,6 +33,8 @@ fn native_encoder_repeated_taps_patch_layout_and_input_derivative_match_cpu() {
         assert!(state.cpu_forward.layer_outputs[0].data.is_empty());
         let expected = host.final_output().unwrap();
         close("output",&gpu.backend.download_f32(&state.gpu_layer_outputs[0]).unwrap(),&expected.data,4e-4);
+        let compact = gpu.forward_compact(&input).unwrap().final_output.unwrap();
+        close("compact forward",&compact.data,&expected.data,4e-4);
         let seed = Tensor::from_data(expected.shape,(0..expected.len()).map(|i|(i as f32*0.13).sin()*0.1).collect()).unwrap();
         let seeds = [Some(seed)];
         let expected = cpu.backward_accumulate_seeded(&input,&host,&seeds).unwrap();

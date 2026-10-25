@@ -730,8 +730,7 @@ fn dpt_head_native_f32_dispatch_and_unsupported_half_boundary() {
     let seeds = [Some(Tensor::from_data(shape, vec![1.0;shape.batch*shape.element_count()]).unwrap())];
     gpu.backward_accumulate_seeded_gpu(&state, &seeds).unwrap();
     gpu.update_weights_gpu(0.01, 0.0, 0.0, 1).unwrap();
-    let error = gpu.forward_compact(&input).unwrap_err();
-    assert!(error.to_string().contains("Stage-1 CPU support"));
+    assert!(gpu.forward_compact(&input).unwrap().final_output.is_some());
     let error = reject_gpu_hyperbolic_foveation(&network, "f16 inference")
         .expect_err("DPT f16 GPU execution must fail");
     assert!(error.to_string().contains("Stage-1 CPU support"));

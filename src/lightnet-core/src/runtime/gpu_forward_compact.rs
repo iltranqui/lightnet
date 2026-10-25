@@ -6,7 +6,13 @@ where
     B::Error: std::fmt::Display,
 {
     pub fn forward_compact(&self, input: &Tensor) -> Result<GpuForwardSummary> {
-        reject_gpu_hyperbolic_foveation(&self.network, "compact inference")?;
+        // Compact f32 has its own dispatch coverage. The stricter shared
+        // half-storage guard remains in forward_compact_f16.
+        reject_gpu_stage1_cpu_layers(&self.network, "compact inference")?;
+        if self.network.layers.iter().any(|layer| matches!(layer.kind,
+            LayerKind::HyperbolicFoveation(_) | LayerKind::FoveationFilm(_))) {
+            reject_gpu_hyperbolic_foveation(&self.network, "compact inference")?;
+        }
         if let Some(layer) = self
             .network
             .layers
@@ -67,34 +73,12 @@ where
             .network
             .layers
             .iter()
-            .find(|layer| matches!(layer.kind, LayerKind::Wmhf(_)))
-        {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "[wmhf] compact GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
-            });
-        }
-        if let Some(layer) = self
-            .network
-            .layers
-            .iter()
             .find(|layer| matches!(layer.kind, LayerKind::RecursiveBlock(_)))
         {
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
                 name: "[recursive_block] compact GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path"
                     .to_owned(),
-            });
-        }
-        if let Some(layer) = self
-            .network
-            .layers
-            .iter()
-            .find(|layer| matches!(layer.kind, LayerKind::Clifford(_)))
-        {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "[clifford] compact GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
             });
         }
         if self.network.layers.iter().any(|layer| {
@@ -123,6 +107,18 @@ where
                 LayerKind::Connected(spec)
                     if spec.activation.to_cuda_f32_kind().is_none()
             )
+        }) || self.network.layers.iter().any(|layer| match &layer.kind {
+            LayerKind::Vit(spec) => !vit_gpu::supported(&vit_geometry(layer, spec)),
+            LayerKind::Swin(spec) => !crate::layers::swin::gpu::supported(
+                &crate::layers::swin::gpu::geometry(layer, spec)),
+            LayerKind::TuckerAttention(spec) => !crate::layers::tucker_attention::gpu::supported(
+                &crate::layers::tucker_attention::gpu::geometry(layer, spec)),
+            LayerKind::MambaVision(spec) => !crate::layers::mambavision::gpu::supported(layer, spec),
+            LayerKind::KimiKda(spec) => !crate::layers::kimi_kda::gpu::supported(layer, spec),
+            LayerKind::DepthAnything(spec) => !crate::layers::depth_anything::gpu::supported(layer, spec),
+            LayerKind::Wmhf(spec) => crate::layers::wmhf::gpu::needs_host(spec),
+            LayerKind::Clifford(spec) => crate::layers::clifford::gpu::needs_host(spec),
+            _ => false,
         }) {
             let state = self.forward_with_state(input)?;
             return Ok(GpuForwardSummary {
@@ -163,6 +159,27 @@ where
             };
 
             let output_gpu = match (&layer.kind, params) {
+                (LayerKind::Vit(spec), LayerParams::Vit(weights)) => vit_gpu::forward(
+                    &self.backend, &vit_geometry(layer, spec), weights,
+                    current_input.expect("ViT requires current input"), layer.output_shape, launch_config)?,
+                (LayerKind::Swin(spec), LayerParams::Swin(weights)) => crate::layers::swin::gpu::forward(
+                    &self.backend, &crate::layers::swin::gpu::geometry(layer, spec), weights,
+                    current_input.expect("Swin requires current input"), layer.output_shape, launch_config)?,
+                (LayerKind::TuckerAttention(spec), LayerParams::TuckerAttention(weights)) => self.forward_tucker_attention_gpu(
+                    layer, spec, weights, current_input.expect("Tucker attention requires current input"), launch_config, false)?.0,
+                (LayerKind::MambaVision(spec), LayerParams::MambaVision(weights)) => self.forward_mambavision_gpu(
+                    layer, spec, weights, current_input.expect("MambaVision requires current input"), launch_config, false)?.0,
+                (LayerKind::KimiKda(spec), LayerParams::KimiKda(weights)) => self.forward_kimi_kda_gpu(
+                    layer, spec, weights, current_input.expect("Kimi KDA requires current input"), launch_config, false)?.0,
+                (LayerKind::DepthAnything(spec), LayerParams::DepthAnything(weights)) => self.forward_depth_anything_gpu(
+                    layer, spec, weights, current_input.expect("DepthAnything requires current input"), launch_config, false)?.0,
+                (LayerKind::DptHead(spec), LayerParams::DptHead(weights)) => self.forward_dpt_head_gpu(
+                    layer, spec, weights, current_input.expect("DPT requires current input"), launch_config, false)?.0,
+                (LayerKind::Wmhf(spec), LayerParams::Wmhf(weights)) => self.forward_wmhf_gpu(
+                    layer, spec, weights, current_input.expect("WMHF requires current input"), false, true, launch_config)?.output,
+                (LayerKind::Clifford(spec), LayerParams::Clifford(weights)) => self.forward_clifford_gpu(
+                    layer, spec, weights, current_input.expect("Clifford requires current input"), false, true,
+                    &vec![1.0;layer.input_shape.batch], launch_config)?.0,
                 (
                     LayerKind::Convolutional(spec),
                     LayerParams::Convolutional(_) | LayerParams::None,

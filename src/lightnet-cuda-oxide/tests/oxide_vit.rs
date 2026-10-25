@@ -183,6 +183,8 @@ fn check(extra: &str, width: usize, height: usize) {
     let actual = gpu.forward(&input).unwrap().final_output().unwrap().clone();
     assert_eq!(actual.shape, expected.shape, "{extra}");
     close(extra, &actual.data, &expected.data, 2e-4);
+    let compact = gpu.forward_compact(&input).unwrap().final_output.unwrap();
+    close("compact ViT", &compact.data, &expected.data, 2e-4);
 }
 
 #[test]

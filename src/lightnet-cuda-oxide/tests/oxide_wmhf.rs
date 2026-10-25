@@ -818,6 +818,8 @@ fn wmhf_inference_check(cfg: &str) {
     let actual = gpu.forward(&input).unwrap().final_output().unwrap().clone();
     assert_eq!(actual.shape, expected.shape, "{cfg}");
     close("WMHF inference", &actual.data, &expected.data, 2e-4);
+    let compact = gpu.forward_compact(&input).unwrap().final_output.unwrap();
+    close("WMHF compact inference", &compact.data, &expected.data, 2e-4);
 }
 
 #[test]

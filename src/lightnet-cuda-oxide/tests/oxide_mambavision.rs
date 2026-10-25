@@ -98,6 +98,8 @@ fn mambavision_native_runtime_accumulation_and_two_updates_match_cpu() {
             let expected = host.final_output().unwrap();
             let actual = gpu.backend.download_f32(&device.gpu_layer_outputs[0]).unwrap();
             close("forward", &actual, &expected.data, 2e-4);
+            let compact = gpu.forward_compact(&input).unwrap().final_output.unwrap();
+            close("compact forward", &compact.data, &expected.data, 2e-4);
             let seed = Tensor::from_data(expected.shape, values(expected.len(), 21.0)).unwrap();
             let seeds = [Some(seed)];
             for _ in 0..2 {

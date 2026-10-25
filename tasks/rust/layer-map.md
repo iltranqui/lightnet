@@ -62,7 +62,7 @@ Per layer directory under `src/lightnet-core/src/layers/`: which files hold the 
 | `shortcut_weights` | yes | - | - | - |
 | `softmax` | - | yes | `softmax.rs` | - |
 | `swin` | yes | yes | - | - |
-| `tucker_attention` | yes | yes | `tucker_attention.rs` | - (unrun WIP) |
+| `tucker_attention` | yes | yes | `tucker_attention.rs` | `oxide_tucker_attention` (unrun WIP) |
 | `upsample` | - | yes | - | - |
 | `vc_attention` | yes | - | - | - |
 | `vit` | yes | yes | `vit.rs` | `oxide_vit` |

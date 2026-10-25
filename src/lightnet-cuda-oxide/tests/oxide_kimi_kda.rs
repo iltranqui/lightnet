@@ -87,6 +87,8 @@ fn kimi_native_runtime_two_step_outputs_gradients_and_updates_match_cpu() {
             assert!(device.cpu_forward.layer_outputs[0].data.is_empty());
             let expected = host.final_output().unwrap();
             close("output", &gpu.backend.download_f32(&device.gpu_layer_outputs[0]).unwrap(), &expected.data, 3e-4);
+            let compact = gpu.forward_compact(&input).unwrap().final_output.unwrap();
+            close("compact forward", &compact.data, &expected.data, 3e-4);
             let seeds = [Some(Tensor::from_data(expected.shape, values(expected.len(), 9.0)).unwrap())];
             for _ in 0..2 {
                 let expected = cpu.backward_accumulate_seeded(&input, &host, &seeds).unwrap();

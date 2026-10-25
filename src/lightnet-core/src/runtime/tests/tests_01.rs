@@ -2157,18 +2157,14 @@ num_dwconv=1
 }
 
 #[test]
-fn clifford_gpu_compact_rejects_explicitly() {
+fn clifford_gpu_compact_f32_matches_full_forward() {
     let network = clifford_test_network("");
     let gpu = GpuExecutableNetwork::new(network, FakeBackend);
     let input = Tensor::from_data(TensorShape::new(2, 1, 2, 2), vec![0.1; 8]).unwrap();
-    assert!(
-        gpu.forward_compact(&input)
-            .unwrap_err()
-            .to_string()
-            .contains(
-                "[clifford] compact GPU execution is not implemented in the Stage-1 CPU port"
-            )
-    );
+    let full = gpu.forward(&input).unwrap().final_output().unwrap().clone();
+    let compact = gpu.forward_compact(&input).unwrap().final_output.unwrap();
+    assert_eq!(compact.shape, full.shape);
+    for (a,b) in compact.data.iter().zip(&full.data) { assert!((a-b).abs()<1e-5); }
 }
 
 #[test]
@@ -2242,8 +2238,8 @@ fn wmhf_sgd_updates_every_block_and_gpu_forward_matches_cpu() {
     assert!((params.scan_weights[0] - 2.015).abs() < 1.0e-6);
 
     // The full GPU forward is native (FakeBackend runs the trait host
-    // defaults for the WMHF primitives); compact inference stays rejected
-    // because WMHF is not on the f16 inference list.
+    // defaults for the WMHF primitives). Compact f32 reuses that path;
+    // compact half-storage support remains a separate contract.
     let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
     gpu.params = executable.params.clone();
     let input = Tensor::from_data(TensorShape::new(1, 1, 2, 1), vec![0.1, 0.2]).unwrap();
@@ -2251,12 +2247,8 @@ fn wmhf_sgd_updates_every_block_and_gpu_forward_matches_cpu() {
     let actual = gpu.forward(&input).unwrap().final_output().unwrap().clone();
     assert_eq!(actual.shape, expected.shape);
     assert_wmhf_close("GPU inference forward", &actual.data, &expected.data, 1.0e-5);
-    assert!(
-        gpu.forward_compact(&input)
-            .unwrap_err()
-            .to_string()
-            .contains("[wmhf] compact GPU execution is not implemented")
-    );
+    let compact = gpu.forward_compact(&input).unwrap().final_output.unwrap();
+    assert_wmhf_close("GPU compact inference", &compact.data, &expected.data, 1e-5);
 }
 
 fn wmhf_buffer_blob(buffers: &LayerTrainBuffers) -> Vec<f32> {
