@@ -531,9 +531,11 @@ fn vit_gpu_host_fallback_matches_a_preceding_convolution_and_backward() {
     let network = Network::from_config(
         ConfigFile::parse_str(
             "vit-chain.cfg",
+            // `revleaky` has no device activation, so this ViT keeps the host
+            // fallback that this test covers.
             "[net]\nwidth=4\nheight=4\nchannels=1\nbatch=1\n\
              [convolutional]\nfilters=1\nsize=1\nactivation=linear\n\
-             [vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=4\nflash_attention=1\n",
+             [vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=4\nflash_attention=1\nactivation=revleaky\n",
         )
         .unwrap(),
     )

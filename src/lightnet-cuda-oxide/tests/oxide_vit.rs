@@ -1,7 +1,15 @@
-//! Native `[vit]` f32 inference: per-kernel parity against host references and
-//! end-to-end `GpuExecutableNetwork<OxideBackend>` against the Rust CPU forward.
+//! Native `[vit]` f32: per-kernel parity against host references, and
+//! end-to-end `GpuExecutableNetwork<OxideBackend>` against the Rust CPU
+//! reference for inference, the native training forward, the native backward
+//! (input and staged parameter gradients) and the following SGD update.
+//!
+//! Tolerances are relative to `max(1, max |reference|)`: 2e-4 for outputs and
+//! 5e-4 for gradients and updated parameters (f32 GEMM and reduction order
+//! differ from the host loops; dense `flash_attention=0` also differs by the
+//! CPU softmax's 1e-9 denominator epsilon).
 use lightnet_core::{
-    ConfigFile, ExecutableNetwork, GpuExecutableNetwork, LayerParams, Network, Tensor, TensorShape,
+    ConfigFile, ExecutableNetwork, GpuExecutableNetwork, LayerParams, LayerTrainBuffers, Network,
+    Tensor, TensorShape,
 };
 use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
 use lightnet_cuda_oxide::OxideBackend;
@@ -184,4 +192,202 @@ fn vit_native_forward_matches_cpu() {
     check("patch_size=2\npatch_stride=1\nactivation=leaky", 4, 4);
     check("patch_size=3\npatch_stride=2\npatch_pad=1\nflash_attention=1\nactivation=swish", 5, 5);
     check("patch_size=1\nflash_attention=1\nactivation=relu", 3, 4);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ref_scatter(
+    g: &[f32], b: usize, c: usize, h: usize, w: usize, p: usize, s: usize, pad: usize, oh: usize,
+    ow: usize,
+) -> Vec<f32> {
+    let pd = p * p * c;
+    let mut out = vec![0.0; b * c * h * w];
+    for bi in 0..b {
+        for ty in 0..oh {
+            for tx in 0..ow {
+                for dy in 0..p {
+                    for dx in 0..p {
+                        for ch in 0..c {
+                            let y = ty * s + dy;
+                            let xx = tx * s + dx;
+                            if y < pad || y - pad >= h || xx < pad || xx - pad >= w {
+                                continue;
+                            }
+                            out[((bi * c + ch) * h + y - pad) * w + xx - pad] +=
+                                g[((bi * oh * ow + ty * ow + tx) * pd) + (dy * p + dx) * c + ch];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn backward_kernels_match_references() {
+    let be = OxideBackend::new().unwrap();
+    let mut rng = Rng(23);
+
+    let (b, oh, ow, d) = (2usize, 2usize, 3usize, 5usize);
+    let x = rng.vec(b * d * oh * ow);
+    let xt = be.upload_f32(&[b, d, oh, ow], &x).unwrap();
+    let got = be
+        .download_f32(&be.vit_nchw_to_tokens_f32(&xt, b, oh, ow, d, cfg()).unwrap())
+        .unwrap();
+    let mut want = vec![0.0; x.len()];
+    for bi in 0..b {
+        for t in 0..oh * ow {
+            for c in 0..d {
+                want[(bi * oh * ow + t) * d + c] = x[(bi * d + c) * oh * ow + t];
+            }
+        }
+    }
+    close("tokens", &got, &want, 0.0);
+
+    for &(b, c, h, w, p, s, pad) in &[
+        (1usize, 1usize, 4usize, 4usize, 1usize, 1usize, 0usize),
+        (2, 3, 6, 8, 2, 2, 0),
+        (2, 2, 5, 5, 3, 1, 1),
+        (1, 3, 7, 7, 3, 2, 1),
+        (2, 1, 4, 4, 2, 1, 0),
+    ] {
+        let (oh, ow, _) = ref_patchify(&vec![0.0; b * c * h * w], b, c, h, w, p, s, pad);
+        let pg = rng.vec(b * oh * ow * p * p * c);
+        let pt = be.upload_f32(&[b * oh * ow, p * p * c], &pg).unwrap();
+        let got = be
+            .download_f32(&be.vit_patch_scatter_f32(&pt, b, c, h, w, p, s, pad, oh, ow, cfg()).unwrap())
+            .unwrap();
+        close("scatter", &got, &ref_scatter(&pg, b, c, h, w, p, s, pad, oh, ow), 1e-6);
+    }
+
+    let mut raw: Vec<f32> = rng.vec(64).iter().map(|v| v * 40.0).collect();
+    raw[2] = f32::NAN;
+    raw[7] = f32::INFINITY;
+    raw[8] = 10.0;
+    let grad = rng.vec(64);
+    let rt = be.upload_f32(&[64], &raw).unwrap();
+    let gt = be.upload_f32(&[64], &grad).unwrap();
+    let got = be
+        .download_f32(&be.vit_clamp_backward_f32(&rt, &gt, 10.0, cfg()).unwrap())
+        .unwrap();
+    let want: Vec<f32> = raw
+        .iter()
+        .zip(&grad)
+        .map(|(&r, &g)| if r.is_finite() && r.abs() < 10.0 { g } else { 0.0 })
+        .collect();
+    close("clamp backward", &got, &want, 0.0);
+
+    // mHC adjoint against the `mhc_residual_backward` formulas.
+    let mut skip: Vec<f32> = rng.vec(96).iter().map(|v| v * 30.0).collect();
+    let branch: Vec<f32> = rng.vec(96).iter().map(|v| v * 30.0).collect();
+    let mut seed = rng.vec(96);
+    skip[4] = f32::NAN;
+    seed[9] = f32::INFINITY;
+    let (a, bb, mix, ps, pb) = (0.7f32, 1.1f32, 0.3f32, 1.2f32, 0.6f32);
+    let st = be.upload_f32(&[96], &skip).unwrap();
+    let bt = be.upload_f32(&[96], &branch).unwrap();
+    let et = be.upload_f32(&[96], &seed).unwrap();
+    let (ds, db, sums) = be
+        .vit_mhc_residual_backward_f32(&st, &bt, &et, a, bb, mix, ps, pb, 10.0, cfg())
+        .unwrap();
+    let (mut want_ds, mut want_db, mut want_sums) = (vec![0.0; 96], vec![0.0; 96], [0.0f32; 3]);
+    for i in 0..96 {
+        let s = clamp_feature(skip[i], 10.0);
+        let br = clamp_feature(branch[i], 10.0);
+        let mixed = a * s + bb * br;
+        if !mixed.is_finite() || mixed.abs() >= 10.0 || !seed[i].is_finite() {
+            continue;
+        }
+        if skip[i].is_finite() && skip[i].abs() < 10.0 {
+            want_ds[i] = seed[i] * a;
+        }
+        if branch[i].is_finite() && branch[i].abs() < 10.0 {
+            want_db[i] = seed[i] * bb;
+        }
+        want_sums[0] += seed[i] * (mix * s + (1.0 - mix) * br);
+        want_sums[1] += seed[i] * ((1.0 - mix) * s + mix * br);
+        want_sums[2] += seed[i] * (ps - pb) * (s - br);
+    }
+    close("mhc d_skip", &be.download_f32(&ds).unwrap(), &want_ds, 0.0);
+    close("mhc d_branch", &be.download_f32(&db).unwrap(), &want_db, 0.0);
+    close("mhc sums", &be.download_f32(&sums).unwrap(), &want_sums, 1e-5);
+
+    let (batch, table) = (3usize, 10usize);
+    let g = rng.vec(batch * table);
+    let tg = be.upload_f32(&[batch * table], &g).unwrap();
+    let got = be
+        .download_f32(&be.vit_pos_embed_backward_f32(&tg, batch, table, cfg()).unwrap())
+        .unwrap();
+    let want: Vec<f32> = (0..table)
+        .map(|i| (0..batch).map(|bi| g[bi * table + i]).sum())
+        .collect();
+    close("pos backward", &got, &want, 1e-6);
+}
+
+fn vit_updates(buffers: &LayerTrainBuffers) -> Vec<f32> {
+    let LayerTrainBuffers::Vit(train) = buffers else { panic!("expected Vit train buffers") };
+    train.updates.to_blob()
+}
+
+fn vit_blob(params: &LayerParams) -> Vec<f32> {
+    let LayerParams::Vit(w) = params else { panic!("expected Vit weights") };
+    w.to_blob()
+}
+
+/// Native training forward, native backward and the SGD step against the CPU.
+fn train_check(extra: &str, width: usize, height: usize) {
+    let mut cpu = network(extra, width, height);
+    let shape = TensorShape::new(width, height, 3, 2);
+    let mut rng = Rng(5);
+    let input = Tensor::from_data(shape, rng.vec(shape.batch * shape.element_count())).unwrap();
+    let mut gpu = GpuExecutableNetwork::new(cpu.network.clone(), OxideBackend::new().unwrap());
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().unwrap();
+
+    let cpu_forward = cpu.forward_training(&input).unwrap();
+    let gpu_state = gpu.forward_training_with_state(&input).unwrap();
+    let expected = cpu_forward.final_output().unwrap().clone();
+    let actual = gpu_state.cpu_forward.final_output().unwrap().clone();
+    close(&format!("{extra} forward"), &actual.data, &expected.data, 2e-4);
+
+    let seed = Tensor::from_data(expected.shape, rng.vec(expected.len())).unwrap();
+    let seeds = [Some(seed)];
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().unwrap();
+    let cpu_backward = cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds).unwrap();
+    let gpu_input_gradient = gpu
+        .backward_accumulate_seeded_gpu_with_input_gradient(&gpu_state, &seeds)
+        .unwrap()
+        .expect("native ViT input gradient");
+    close(
+        &format!("{extra} input gradient"),
+        &gpu_input_gradient.data,
+        &cpu_backward.input_gradient.data,
+        5e-4,
+    );
+    let gpu_updates = vit_updates(&gpu.host_fallback_train_buffers()[0]);
+    close(
+        &format!("{extra} staged gradients"),
+        &gpu_updates,
+        &vit_updates(&cpu.train_buffers[0]),
+        5e-4,
+    );
+
+    cpu.update_weights(0.01, 0.9, 0.0005, 2);
+    gpu.update_weights_gpu(0.01, 0.9, 0.0005, 2).unwrap();
+    close(
+        &format!("{extra} updated parameters"),
+        &vit_blob(&gpu.params[0]),
+        &vit_blob(&cpu.params[0]),
+        5e-4,
+    );
+}
+
+#[test]
+fn vit_native_training_backward_and_update_match_cpu() {
+    train_check("patch_size=2\nflash_attention=1\nactivation=gelu", 4, 4);
+    train_check("patch_size=2\nactivation=gelu", 4, 4);
+    train_check("patch_size=2\npatch_stride=1\nactivation=leaky\npos_embed=sinusoidal", 4, 4);
+    train_check("patch_size=3\npatch_stride=2\npatch_pad=1\nflash_attention=1\nactivation=swish", 5, 5);
+    train_check("patch_size=1\nflash_attention=1\nactivation=relu", 3, 4);
 }

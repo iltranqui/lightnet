@@ -1821,12 +1821,12 @@ fn vit_flash_attention_runtime_uses_native_forward_and_backward_and_matches_cpu(
     cpu.zero_train_buffers();
     gpu.zero_train_buffers_gpu()
         .expect("zero ViT train buffers");
-    // The rest of the transformer backward remains on the host fallback; this
-    // flash-attention dQ/dK/dV derivative dispatches through Oxide's native kernels.
+    // The whole ViT backward, including the flash-attention dQ/dK/dV
+    // derivative, runs natively on Oxide from the training forward's device cache.
     cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
         .expect("CPU ViT backward");
     gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
-        .expect("Oxide ViT backward fallback");
+        .expect("Oxide ViT native backward");
     cpu.update_weights(1e-4, 0.0, 0.0, 1);
     gpu.update_weights_gpu(1e-4, 0.0, 0.0, 1)
         .expect("Oxide fallback update");

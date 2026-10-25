@@ -43,13 +43,19 @@ where
                         return true;
                     }
                 }
+                // `[vit]` variants outside the native gate (MSA, VC attention,
+                // head_dim > 128, unmapped activation) keep the host fallback;
+                // standard-flash dQ/dK/dV dispatches to Oxide from that
+                // fallback when the head dimension is supported.
+                LayerKind::Vit(spec) => {
+                    if !vit_gpu::supported(&vit_geometry(layer, spec)) {
+                        return true;
+                    }
+                }
                 // Weighted shortcut parameter reductions stay host-resident,
                 // while input/source gradients use backend elementwise ops.
-                // `[laya_act_head]` and the full ViT backward still use the
-                // host fallback; standard-flash dQ/dK/dV dispatches to Oxide
-                // from that fallback when the head dimension is supported.
+                // `[laya_act_head]` still uses the host fallback.
                 LayerKind::LayaActHead(_)
-                | LayerKind::Vit(_)
                 | LayerKind::Swin(_)
                 | LayerKind::TuckerAttention(_)
                 | LayerKind::MambaVision(_)

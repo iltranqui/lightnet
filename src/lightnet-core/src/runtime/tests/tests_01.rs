@@ -262,9 +262,44 @@ fn vit_runtime_forward_backward_matches_input_and_parameter_finite_differences()
     for (g, c) in gpu_output.data.iter().zip(&cpu_output.data) {
         assert!((g - c).abs() <= 1e-5 * c.abs().max(1.0), "gpu={g} cpu={c}");
     }
-    // `[vit]` still has no native device backward, so this network must
-    // keep the host fallback.
-    assert!(gpu.requires_cpu_backward_fallback());
+    // Flash `[vit]` with a mapped activation takes the native device backward:
+    // the training forward keeps a device cache and the backward stages the
+    // same parameter gradients the CPU reference returns (here through the
+    // fake backend's host reference ops).
+    assert!(!gpu.requires_cpu_backward_fallback());
+    let cpu_forward = executable.forward(&input).unwrap();
+    let cpu_backward = executable.backward(&input, &cpu_forward, &seed).unwrap();
+    let gpu_state = gpu.forward_training_with_state(&input).unwrap();
+    let gpu_input_gradient = gpu
+        .backward_accumulate_seeded_gpu_with_input_gradient(&gpu_state, &[Some(seed.clone())])
+        .unwrap()
+        .expect("captured ViT input gradient");
+    for (g, c) in gpu_input_gradient
+        .data
+        .iter()
+        .zip(&cpu_backward.input_gradient.data)
+    {
+        assert!((g - c).abs() <= 1e-4 * c.abs().max(1.0), "input grad gpu={g} cpu={c}");
+    }
+    let LayerParams::Vit(cpu_grad) = &cpu_backward.param_gradients[0] else {
+        panic!("Vit gradients")
+    };
+    let buffers = gpu.host_fallback_train_buffers();
+    let LayerTrainBuffers::Vit(train) = &buffers[0] else {
+        panic!("Vit native-staged updates")
+    };
+    for (i, (u, c)) in train
+        .updates
+        .to_blob()
+        .iter()
+        .zip(cpu_grad.to_blob())
+        .enumerate()
+    {
+        assert!(
+            (u + c).abs() <= 1e-4 * c.abs().max(1.0),
+            "param blob[{i}]: staged update {u}, CPU gradient {c}"
+        );
+    }
 }
 
 #[test]

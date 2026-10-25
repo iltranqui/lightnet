@@ -47,6 +47,7 @@ where
             capture_input_gradient: Cell::new(false),
             captured_input_gradient: RefCell::new(None),
             deform_device_caches: RefCell::new(Vec::new()),
+            vit_device_caches: RefCell::new(Vec::new()),
             adam_state: Vec::new(),
             moe_adam_state,
             eml_adam_state,

@@ -552,9 +552,10 @@ fn eml_convolutional_cpu_math_gradients_and_gpu_device_sgd_are_integrated() {
 
 #[test]
 fn eml_sgd_uses_host_optimizer_when_another_layer_requires_cpu_fallback() {
+    // `revleaky` has no device activation, so the ViT forces the CPU fallback.
     let cfg = "[net]\nchannels=1\nbatch=1\nheight=4\nwidth=4\n\
                    [eml_convolutional]\nfilters=1\nsize=1\nbatch_normalize=0\nresidual=0\n\
-                   [vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=4\n";
+                   [vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=4\nactivation=revleaky\n";
     let network = Network::from_config(
         ConfigFile::parse_str("eml-fallback.cfg", cfg).expect("fallback cfg parses"),
     )
@@ -762,9 +763,10 @@ fn eml_convolutional_gpu_adam_updates_device_parameters() {
 
 #[test]
 fn eml_adam_stays_host_side_when_network_requires_cpu_backward_fallback() {
+    // `revleaky` has no device activation, so the ViT forces the CPU fallback.
     let cfg = "[net]\nchannels=1\nbatch=1\nheight=4\nwidth=4\nadam=1\nb1=0.8\nb2=0.95\neps=0.001\n\
                    [eml_convolutional]\nfilters=1\nsize=1\nbatch_normalize=0\nresidual=0\n\
-                   [vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=4\n";
+                   [vit]\ndim=4\nheads=2\npatch_size=2\npatch_stride=2\nmlp_dim=4\nactivation=revleaky\n";
     let network = Network::from_config(
         ConfigFile::parse_str("eml-adam-fallback.cfg", cfg).expect("EML Adam fallback cfg parses"),
     )

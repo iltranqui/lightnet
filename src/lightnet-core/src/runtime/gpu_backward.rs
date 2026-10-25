@@ -512,6 +512,16 @@ where
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::Vit(spec), Some(LayerParams::Vit(weights))) => {
+                    self.backward_vit_gpu(
+                        layer,
+                        &vit_geometry(layer, spec),
+                        weights,
+                        grad,
+                        config,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 _ => {
                     return Err(Error::UnsupportedLayer {
                         layer_index: layer.index,

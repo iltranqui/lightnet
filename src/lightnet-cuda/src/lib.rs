@@ -2947,6 +2947,172 @@ pub trait F32TensorOpsBackend {
         }
         self.upload_f32(&[batch, hidden, out_h, out_w], &out)
     }
+    /// NCHW `[batch, hidden, out_h, out_w]` to `[batch * tokens, hidden]` token
+    /// rows: the inverse (and adjoint) of [`Self::vit_tokens_to_nchw_f32`].
+    fn vit_nchw_to_tokens_f32(
+        &self,
+        input: &Self::Tensor,
+        batch: usize,
+        out_h: usize,
+        out_w: usize,
+        hidden: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let host = self.download_f32(input)?;
+        let tokens = out_h * out_w;
+        assert_eq!(host.len(), batch * tokens * hidden, "vit_nchw_to_tokens_f32: length");
+        let mut out = vec![0.0; host.len()];
+        for b in 0..batch {
+            for t in 0..tokens {
+                for c in 0..hidden {
+                    out[(b * tokens + t) * hidden + c] = host[(b * hidden + c) * tokens + t];
+                }
+            }
+        }
+        self.upload_f32(&[batch * tokens, hidden], &out)
+    }
+    /// Adjoint of [`Self::vit_patchify_f32`]: `[batch * tokens, patch_dim]` patch
+    /// gradients accumulated into an NCHW `[batch, channels, height, width]`
+    /// input gradient (overlapping patches add).
+    fn vit_patch_scatter_f32(
+        &self,
+        patch_grad: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        patch_size: usize,
+        patch_stride: usize,
+        pad: usize,
+        out_h: usize,
+        out_w: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let host = self.download_f32(patch_grad)?;
+        let tokens = out_h * out_w;
+        let patch_dim = patch_size * patch_size * channels;
+        assert_eq!(host.len(), batch * tokens * patch_dim, "vit_patch_scatter_f32: length");
+        let mut out = vec![0.0; batch * channels * height * width];
+        for b in 0..batch {
+            for ty in 0..out_h {
+                for tx in 0..out_w {
+                    let t = ty * out_w + tx;
+                    for dy in 0..patch_size {
+                        let y = ty * patch_stride + dy;
+                        if y < pad || y - pad >= height {
+                            continue;
+                        }
+                        for dx in 0..patch_size {
+                            let x = tx * patch_stride + dx;
+                            if x < pad || x - pad >= width {
+                                continue;
+                            }
+                            for c in 0..channels {
+                                out[((b * channels + c) * height + y - pad) * width + x - pad] +=
+                                    host[(b * tokens + t) * patch_dim + (dy * patch_size + dx) * channels + c];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.upload_f32(&[batch, channels, height, width], &out)
+    }
+    /// Adjoint of [`Self::vit_clamp_feature_f32`] at its raw input: `grad` where
+    /// `raw` is finite and strictly inside `(-clip, clip)`, else zero.
+    fn vit_clamp_backward_f32(
+        &self,
+        raw: &Self::Tensor,
+        grad: &Self::Tensor,
+        clip: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let x = self.download_f32(raw)?;
+        let g = self.download_f32(grad)?;
+        assert_eq!(x.len(), g.len(), "vit_clamp_backward_f32: length mismatch");
+        let out: Vec<f32> = x
+            .iter()
+            .zip(&g)
+            .map(|(&x, &g)| if x.is_finite() && x.abs() < clip { g } else { 0.0 })
+            .collect();
+        self.upload_f32(&[out.len()], &out)
+    }
+    /// Adjoint of [`Self::vit_mhc_residual_f32`]. Returns `(d_skip, d_branch,
+    /// sums)` with `sums = [grad_post_skip, grad_post_branch, grad_mix]`, the
+    /// three reductions the six mHC parameter gradients of one site need.
+    /// `mix`, `post_skip` and `post_branch` are the site's `p`, `2*sigmoid`
+    /// scales; elements whose mix saturated or whose seed is non-finite add
+    /// nothing, as in the Rust CPU reference.
+    fn vit_mhc_residual_backward_f32(
+        &self,
+        skip: &Self::Tensor,
+        branch: &Self::Tensor,
+        grad: &Self::Tensor,
+        skip_scale: f32,
+        branch_scale: f32,
+        mix: f32,
+        post_skip: f32,
+        post_branch: f32,
+        clip: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let s = self.download_f32(skip)?;
+        let b = self.download_f32(branch)?;
+        let g = self.download_f32(grad)?;
+        assert!(
+            s.len() == b.len() && s.len() == g.len(),
+            "vit_mhc_residual_backward_f32: length mismatch"
+        );
+        let mut ds = vec![0.0; s.len()];
+        let mut db = vec![0.0; s.len()];
+        let mut sums = [0.0f32; 3];
+        for i in 0..s.len() {
+            let sc = host_ops::vit_clamp_feature(s[i], clip);
+            let bc = host_ops::vit_clamp_feature(b[i], clip);
+            let mixed = skip_scale * sc + branch_scale * bc;
+            if !mixed.is_finite() || mixed.abs() >= clip || !g[i].is_finite() {
+                continue;
+            }
+            if s[i].is_finite() && s[i].abs() < clip {
+                ds[i] = g[i] * skip_scale;
+            }
+            if b[i].is_finite() && b[i].abs() < clip {
+                db[i] = g[i] * branch_scale;
+            }
+            sums[0] += g[i] * (mix * sc + (1.0 - mix) * bc);
+            sums[1] += g[i] * ((1.0 - mix) * sc + mix * bc);
+            sums[2] += g[i] * (post_skip - post_branch) * (sc - bc);
+        }
+        Ok((
+            self.upload_f32(&[ds.len()], &ds)?,
+            self.upload_f32(&[db.len()], &db)?,
+            self.upload_f32(&[3], &sums)?,
+        ))
+    }
+    /// Sum a `[batch, table]` token gradient over the batch (the learned
+    /// positional-table gradient).
+    fn vit_pos_embed_backward_f32(
+        &self,
+        grad: &Self::Tensor,
+        batch: usize,
+        table: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let host = self.download_f32(grad)?;
+        assert_eq!(host.len(), batch * table, "vit_pos_embed_backward_f32: length");
+        let mut out = vec![0.0; table];
+        for b in 0..batch {
+            for (dst, src) in out.iter_mut().zip(&host[b * table..(b + 1) * table]) {
+                *dst += src;
+            }
+        }
+        self.upload_f32(&[table], &out)
+    }
     /// Concatenate WMHF 3x/5x/7x local branch tensors in channel-major order.
     fn wmhf_concat_local_f32(
         &self,

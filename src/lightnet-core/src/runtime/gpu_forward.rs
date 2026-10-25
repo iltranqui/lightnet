@@ -68,6 +68,9 @@ where
         // gate exactly; independent of whether host copies are retained.
         // DCNv4's own unsupported variants are in requires_cpu_backward_fallback.
         let deform_device = !self.requires_cpu_backward_fallback() && !host_only_deform;
+        // `[vit]` keeps its device backward cache only when that same native
+        // backward will run; otherwise training uses the host cache.
+        let vit_device_training = training && deform_device;
         let expected = self.network.net.input_shape();
         if input.shape != expected {
             return Err(Error::InvalidConfig(format!(
@@ -152,6 +155,7 @@ where
         let mut gpu_dcnv4_caches = Vec::with_capacity(self.network.layers.len());
         let mut deform_conv_caches = Vec::with_capacity(self.network.layers.len());
         let mut deform_device_caches = Vec::with_capacity(self.network.layers.len());
+        let mut vit_device_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches: Vec<Option<crate::vit::VitForwardCache>> =
             Vec::with_capacity(self.network.layers.len());
         let mut swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>> =
@@ -191,6 +195,7 @@ where
             let mut crop_cache = None;
             let mut batch_norm_cache = None;
             let mut vit_cache = None;
+            let mut vit_device_cache = None;
             let mut swin_cache = None;
             let mut tucker_attention_cache = None;
             let mut mambavision_cache = None;
@@ -568,18 +573,32 @@ where
                     forward.output
                 }
                 (LayerKind::Vit(spec), LayerParams::Vit(weights))
-                    if !training
+                    if (!training || vit_device_training)
                         && vit_gpu::supported(&vit_geometry(layer, spec)) =>
                 {
-                    // Inference only: backward needs the host `VitForwardCache`.
-                    vit_gpu::forward(
-                        &self.backend,
-                        &vit_geometry(layer, spec),
-                        weights,
-                        current_input,
-                        layer.output_shape,
-                        launch_config,
-                    )?
+                    let geometry = vit_geometry(layer, spec);
+                    if vit_device_training {
+                        // Training: the native backward reads this device cache.
+                        let (output, cache) = vit_gpu::forward_training(
+                            &self.backend,
+                            &geometry,
+                            weights,
+                            current_input,
+                            layer.output_shape,
+                            launch_config,
+                        )?;
+                        vit_device_cache = Some(cache);
+                        output
+                    } else {
+                        vit_gpu::forward(
+                            &self.backend,
+                            &geometry,
+                            weights,
+                            current_input,
+                            layer.output_shape,
+                            launch_config,
+                        )?
+                    }
                 }
                 (LayerKind::Vit(spec), LayerParams::Vit(weights)) => {
                     let (output, cache) = self.forward_vit_host(
@@ -1004,6 +1023,7 @@ where
             deform_conv_caches.push(deform_conv_cache);
             deform_device_caches.push(deform_device_cache);
             vit_caches.push(vit_cache);
+            vit_device_caches.push(vit_device_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
             mambavision_caches.push(mambavision_cache);
@@ -1013,6 +1033,7 @@ where
         }
 
         *self.deform_device_caches.borrow_mut() = deform_device_caches;
+        *self.vit_device_caches.borrow_mut() = vit_device_caches;
         Ok(GpuForwardState {
             input_gpu,
             gpu_layer_outputs,

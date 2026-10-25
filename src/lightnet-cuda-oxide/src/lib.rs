@@ -1147,6 +1147,247 @@ impl OxideBackend {
         Ok(OxideTensorF32::new(output, &[batch, hidden, out_h, out_w]))
     }
 
+    /// NCHW `[batch, hidden, out_h, out_w]` to `[batch * tokens, hidden]` rows.
+    pub fn vit_nchw_to_tokens_f32(
+        &self,
+        input: &OxideTensorF32,
+        batch: usize,
+        out_h: usize,
+        out_w: usize,
+        hidden: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "vit_nchw_to_tokens_f32";
+        let tokens = out_h * out_w;
+        if batch == 0 || tokens == 0 || hidden == 0 {
+            return Err(shape_err(op, "dimensions must be positive".to_owned()));
+        }
+        let len = batch * tokens * hidden;
+        let input = self.f32v(input)?;
+        if input.len() != len {
+            return Err(shape_err(op, "input length mismatch".to_owned()));
+        }
+        let mut output = self.alloc_uninit(len)?;
+        // SAFETY: one thread owns each output element.
+        unsafe {
+            self.vit.vit_nchw_to_tokens(
+                &self.stream,
+                launch::elementwise(len, config),
+                &input.buf,
+                &mut output,
+                tokens,
+                hidden,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, &[batch * tokens, hidden]))
+    }
+
+    /// Adjoint of [`Self::vit_patchify_f32`]: `[batch * tokens, patch_dim]`
+    /// patch gradients accumulated into an NCHW input gradient.
+    pub fn vit_patch_scatter_f32(
+        &self,
+        patch_grad: &OxideTensorF32,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        patch_size: usize,
+        patch_stride: usize,
+        pad: usize,
+        out_h: usize,
+        out_w: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "vit_patch_scatter_f32";
+        if batch == 0
+            || channels == 0
+            || height == 0
+            || width == 0
+            || patch_size == 0
+            || patch_stride == 0
+            || out_h == 0
+            || out_w == 0
+        {
+            return Err(shape_err(op, "dimensions, patch size and stride must be positive".to_owned()));
+        }
+        let patch_dim = patch_size * patch_size * channels;
+        let patch_len = batch
+            .checked_mul(out_h * out_w)
+            .and_then(|n| n.checked_mul(patch_dim))
+            .ok_or_else(|| shape_err(op, "patch gradient size overflows".to_owned()))?;
+        let output_len = batch
+            .checked_mul(channels)
+            .and_then(|n| n.checked_mul(height))
+            .and_then(|n| n.checked_mul(width))
+            .ok_or_else(|| shape_err(op, "output element count overflows".to_owned()))?;
+        let patch_grad = self.f32v(patch_grad)?;
+        if patch_grad.len() != patch_len {
+            return Err(shape_err(op, "patch gradient length mismatch".to_owned()));
+        }
+        let mut output = self.alloc_uninit(output_len)?;
+        // SAFETY: one thread owns each output pixel and reads only in-range taps.
+        unsafe {
+            self.vit.vit_patch_scatter(
+                &self.stream,
+                launch::elementwise(output_len, config),
+                &patch_grad.buf,
+                &mut output,
+                channels,
+                height,
+                width,
+                patch_size,
+                patch_stride,
+                pad,
+                out_h,
+                out_w,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, &[batch, channels, height, width]))
+    }
+
+    /// Adjoint of [`Self::vit_clamp_feature_f32`] evaluated at its raw input.
+    pub fn vit_clamp_backward_f32(
+        &self,
+        raw: &OxideTensorF32,
+        grad: &OxideTensorF32,
+        clip: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "vit_clamp_backward_f32";
+        if !clip.is_finite() || clip <= 0.0 {
+            return Err(shape_err(op, "clip must be positive and finite".to_owned()));
+        }
+        let raw = self.f32v(raw)?;
+        let grad = self.f32v(grad)?;
+        if raw.len() != grad.len() {
+            return Err(shape_err(op, "raw and gradient lengths differ".to_owned()));
+        }
+        let len = grad.len();
+        let shape = grad.shape().to_vec();
+        let mut output = self.alloc_uninit(len)?;
+        // SAFETY: one thread owns each output element.
+        unsafe {
+            self.vit.vit_clamp_backward(
+                &self.stream,
+                launch::elementwise(len, config),
+                &raw.buf,
+                &grad.buf,
+                &mut output,
+                clip,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, &shape))
+    }
+
+    /// Adjoint of [`Self::vit_mhc_residual_f32`]: `(d_skip, d_branch, sums)`,
+    /// where `sums` holds the `[grad_post_skip, grad_post_branch, grad_mix]`
+    /// reductions the host turns into the six mHC parameter gradients.
+    pub fn vit_mhc_residual_backward_f32(
+        &self,
+        skip: &OxideTensorF32,
+        branch: &OxideTensorF32,
+        grad: &OxideTensorF32,
+        skip_scale: f32,
+        branch_scale: f32,
+        mix: f32,
+        post_skip: f32,
+        post_branch: f32,
+        clip: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(OxideTensorF32, OxideTensorF32, OxideTensorF32), OxideError> {
+        let op = "vit_mhc_residual_backward_f32";
+        if !clip.is_finite() || clip <= 0.0 {
+            return Err(shape_err(op, "clip must be positive and finite".to_owned()));
+        }
+        let skip = self.f32v(skip)?;
+        let branch = self.f32v(branch)?;
+        let grad = self.f32v(grad)?;
+        if skip.len() != branch.len() || skip.len() != grad.len() || grad.len() == 0 {
+            return Err(shape_err(op, "skip, branch and gradient lengths differ".to_owned()));
+        }
+        let len = grad.len();
+        let shape = grad.shape().to_vec();
+        let mut d_skip = self.alloc_uninit(len)?;
+        let mut d_branch = self.alloc_uninit(len)?;
+        // SAFETY: one thread owns each element of both outputs.
+        unsafe {
+            self.vit.vit_mhc_residual_backward(
+                &self.stream,
+                launch::elementwise(len, config),
+                &skip.buf,
+                &branch.buf,
+                &grad.buf,
+                &mut d_skip,
+                &mut d_branch,
+                skip_scale,
+                branch_scale,
+                clip,
+            )
+        }
+        .map_err(launch_err)?;
+        let mut terms = self.alloc_uninit(3 * len)?;
+        // SAFETY: one thread owns each of the `3 * len` planar term elements.
+        unsafe {
+            self.vit.vit_mhc_param_terms(
+                &self.stream,
+                launch::elementwise(3 * len, config),
+                &skip.buf,
+                &branch.buf,
+                &grad.buf,
+                &mut terms,
+                skip_scale,
+                branch_scale,
+                mix,
+                post_skip,
+                post_branch,
+                clip,
+            )
+        }
+        .map_err(launch_err)?;
+        // Planar `[3, len]` terms: three channels of stride `len`, one row group.
+        let terms = OxideTensorF32::new(terms, &[3, len]);
+        let sums = <Self as F32TensorOpsBackend>::bias_backward_f32(self, &terms, 3, len, config)?;
+        Ok((
+            OxideTensorF32::new(d_skip, &shape),
+            OxideTensorF32::new(d_branch, &shape),
+            sums,
+        ))
+    }
+
+    /// Sum a `[batch, table]` token gradient over the batch (learned positions).
+    pub fn vit_pos_embed_backward_f32(
+        &self,
+        grad: &OxideTensorF32,
+        batch: usize,
+        table: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "vit_pos_embed_backward_f32";
+        if batch == 0 || table == 0 {
+            return Err(shape_err(op, "batch and table must be positive".to_owned()));
+        }
+        let grad = self.f32v(grad)?;
+        if Some(grad.len()) != batch.checked_mul(table) {
+            return Err(shape_err(op, "gradient length is not batch * table".to_owned()));
+        }
+        let mut output = self.alloc_uninit(table)?;
+        // SAFETY: one thread owns each table entry.
+        unsafe {
+            self.vit.vit_pos_embed_backward(
+                &self.stream,
+                launch::elementwise(table, config),
+                &grad.buf,
+                &mut output,
+                batch,
+            )
+        }
+        .map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, &[table]))
+    }
+
     /// Concatenate the three WMHF local depthwise branch outputs in source order.
     pub fn wmhf_concat_local_f32(
         &self,
@@ -11300,6 +11541,96 @@ impl F32TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         OxideBackend::vit_tokens_to_nchw_f32(self, input, batch, out_h, out_w, hidden, config)
+    }
+
+    fn vit_nchw_to_tokens_f32(
+        &self,
+        input: &Self::Tensor,
+        batch: usize,
+        out_h: usize,
+        out_w: usize,
+        hidden: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        OxideBackend::vit_nchw_to_tokens_f32(self, input, batch, out_h, out_w, hidden, config)
+    }
+
+    fn vit_patch_scatter_f32(
+        &self,
+        patch_grad: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        patch_size: usize,
+        patch_stride: usize,
+        pad: usize,
+        out_h: usize,
+        out_w: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        OxideBackend::vit_patch_scatter_f32(
+            self,
+            patch_grad,
+            batch,
+            channels,
+            height,
+            width,
+            patch_size,
+            patch_stride,
+            pad,
+            out_h,
+            out_w,
+            config,
+        )
+    }
+
+    fn vit_clamp_backward_f32(
+        &self,
+        raw: &Self::Tensor,
+        grad: &Self::Tensor,
+        clip: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        OxideBackend::vit_clamp_backward_f32(self, raw, grad, clip, config)
+    }
+
+    fn vit_mhc_residual_backward_f32(
+        &self,
+        skip: &Self::Tensor,
+        branch: &Self::Tensor,
+        grad: &Self::Tensor,
+        skip_scale: f32,
+        branch_scale: f32,
+        mix: f32,
+        post_skip: f32,
+        post_branch: f32,
+        clip: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        OxideBackend::vit_mhc_residual_backward_f32(
+            self,
+            skip,
+            branch,
+            grad,
+            skip_scale,
+            branch_scale,
+            mix,
+            post_skip,
+            post_branch,
+            clip,
+            config,
+        )
+    }
+
+    fn vit_pos_embed_backward_f32(
+        &self,
+        grad: &Self::Tensor,
+        batch: usize,
+        table: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        OxideBackend::vit_pos_embed_backward_f32(self, grad, batch, table, config)
     }
 
     fn wmhf_apply_gate_f32(
