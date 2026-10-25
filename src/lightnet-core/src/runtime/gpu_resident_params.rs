@@ -5,9 +5,38 @@ use super::*;
 use std::ops::Range;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResidentMomentSlot {
+    ChildWeights(usize),
+    Weights,
+    Biases,
+}
+
+impl ResidentMomentSlot {
+    fn get<'a>(&self, state: &'a HostAdamLayerState) -> Option<&'a (Vec<f32>, Vec<f32>)> {
+        match self {
+            Self::ChildWeights(index) => state.children.get(*index)?.weights.as_ref(),
+            Self::Weights => state.weights.as_ref(),
+            Self::Biases => state.biases.as_ref(),
+        }
+    }
+
+    fn set(&self, state: &mut HostAdamLayerState, pair: (Vec<f32>, Vec<f32>)) {
+        match self {
+            Self::ChildWeights(index) => host_adam_child(state, *index).weights = Some(pair),
+            Self::Weights => state.weights = Some(pair),
+            Self::Biases => state.biases = Some(pair),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResidentParameterRange {
     pub range: Range<usize>,
+    /// SGD and decoupled AdamW decay eligibility.
     pub decay: bool,
+    /// Coupled Adam can decay biases even when SGD and AdamW do not.
+    pub coupled_decay: bool,
+    pub moment_slot: ResidentMomentSlot,
 }
 
 #[derive(Clone, Debug)]
@@ -16,6 +45,7 @@ pub(crate) struct ResidentParameterState<T> {
     pub updates: T,
     pub moments: Option<(T, T)>,
     decay_mask: T,
+    coupled_decay_mask: T,
     layout: Vec<ResidentParameterRange>,
     snapshot: Vec<f32>,
     pub generation: u64,
@@ -24,6 +54,65 @@ pub(crate) struct ResidentParameterState<T> {
 
 fn same_bits(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(a,b)| a.to_bits() == b.to_bits())
+}
+
+fn host_values_match(params: &LayerParams, snapshot: &[f32]) -> Result<bool> {
+    let split_matches = |biases: &[f32], weights: &[f32]| {
+        snapshot.len() == biases.len() + weights.len()
+            && same_bits(biases, &snapshot[..biases.len()])
+            && same_bits(weights, &snapshot[biases.len()..])
+    };
+    match params {
+        LayerParams::MambaVision(p) => Ok(same_bits(&p.values, snapshot)),
+        LayerParams::KimiKda(p) => Ok(split_matches(&p.biases, &p.weights)),
+        LayerParams::TuckerAttention(p) => Ok(split_matches(&p.biases, &p.weights)),
+        _ => Err(Error::InvalidConfig("resident parameter host kind mismatch".into())),
+    }
+}
+
+fn host_updates(buffer: &LayerTrainBuffers) -> Result<Vec<f32>> {
+    match buffer {
+        LayerTrainBuffers::MambaVision(t) => Ok(t.updates.clone()),
+        LayerTrainBuffers::KimiKda(t) => Ok([t.bias_updates.as_slice(), t.weight_updates.as_slice()].concat()),
+        LayerTrainBuffers::TuckerAttention(t) => Ok([t.bias_updates.as_slice(), t.weight_updates.as_slice()].concat()),
+        _ => Err(Error::InvalidConfig("resident accumulator host kind mismatch".into())),
+    }
+}
+
+fn set_host_updates(buffer: &mut LayerTrainBuffers, values: &[f32]) -> Result<()> {
+    match buffer {
+        LayerTrainBuffers::MambaVision(t) if t.updates.len() == values.len() => t.updates.copy_from_slice(values),
+        LayerTrainBuffers::KimiKda(t) if t.bias_updates.len() + t.weight_updates.len() == values.len() => {
+            let biases = t.bias_updates.len();
+            t.bias_updates.copy_from_slice(&values[..biases]);
+            t.weight_updates.copy_from_slice(&values[biases..]);
+        }
+        LayerTrainBuffers::TuckerAttention(t) if t.bias_updates.len() + t.weight_updates.len() == values.len() => {
+            let biases = t.bias_updates.len();
+            t.bias_updates.copy_from_slice(&values[..biases]);
+            t.weight_updates.copy_from_slice(&values[biases..]);
+        }
+        _ => return Err(Error::InvalidConfig("resident host accumulator mirror mismatch".into())),
+    }
+    Ok(())
+}
+
+fn set_host_values(params: &mut LayerParams, values: &[f32]) -> Result<()> {
+    match params {
+        LayerParams::MambaVision(p) if p.values.len() == values.len() => p.values.copy_from_slice(values),
+        LayerParams::KimiKda(p) if p.parameter_count() == values.len() => {
+            let biases = p.biases.len();
+            p.biases.copy_from_slice(&values[..biases]);
+            p.weights.copy_from_slice(&values[biases..]);
+        }
+        LayerParams::TuckerAttention(p) if p.parameter_count() == values.len() => {
+            let biases = p.biases.len();
+            p.biases.copy_from_slice(&values[..biases]);
+            p.weights.copy_from_slice(&values[biases..]);
+        }
+        _ => return Err(Error::InvalidConfig("resident parameter host length/kind mismatch".into())),
+    }
+    Ok(())
 }
 
 fn validate_layout(layout: &[ResidentParameterRange], total: usize) -> Result<()> {
@@ -83,14 +172,16 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
             }
         } else {
             let mut mask = vec![0.0;host.len()];
+            let mut coupled_mask = vec![0.0;host.len()];
             let mut first = vec![0.0;host.len()];
             let mut second = first.clone();
             let mut has_moments = false;
             let host_moments = self.host_adam_state.borrow();
             let parent = host_moments.get(index).and_then(Option::as_ref);
-            for (i,block) in layout.iter().enumerate() {
+            for block in &layout {
                 if block.decay { mask[block.range.clone()].fill(1.0); }
-                if let Some((m,v)) = parent.and_then(|p|p.children.get(i)).and_then(|c|c.weights.as_ref()) {
+                if block.coupled_decay { coupled_mask[block.range.clone()].fill(1.0); }
+                if let Some((m,v)) = parent.and_then(|p|block.moment_slot.get(p)) {
                     if m.len()!=block.range.len() || v.len()!=block.range.len() {
                         return Err(Error::InvalidConfig("resident Adam sidecar moment length mismatch".into()));
                     }
@@ -101,15 +192,20 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
             }
             let moments = if has_moments { Some((be.upload_f32(&[host.len()],&first).map_err(err)?,
                 be.upload_f32(&[host.len()],&second).map_err(err)?)) } else {None};
-            let host_updates = self.cpu_fallback_train_buffers.borrow();
-            let updates = match host_updates.get(index) {
-                Some(LayerTrainBuffers::MambaVision(t)) if t.updates.len()==host.len() =>
-                    be.upload_f32(&[host.len()],&t.updates).map_err(err)?,
-                Some(LayerTrainBuffers::MambaVision(_)) => return Err(Error::InvalidConfig("resident Mamba accumulator length mismatch".into())),
-                _ => be.zeros_f32(&[host.len()]).map_err(err)?,
+            let host_buffers = self.cpu_fallback_train_buffers.borrow();
+            let updates = match host_buffers.get(index) {
+                Some(buffer) => {
+                    let values = host_updates(buffer)?;
+                    if values.len() != host.len() {
+                        return Err(Error::InvalidConfig("resident accumulator length mismatch".into()));
+                    }
+                    be.upload_f32(&[host.len()], &values).map_err(err)?
+                }
+                None => be.zeros_f32(&[host.len()]).map_err(err)?,
             };
             *slot = Some(ResidentParameterState { weights:be.upload_f32(&[host.len()],host).map_err(err)?,
                 updates, moments, decay_mask:be.upload_f32(&[host.len()],&mask).map_err(err)?, layout,
+                coupled_decay_mask:be.upload_f32(&[host.len()],&coupled_mask).map_err(err)?,
                 snapshot:host.to_vec(), generation:0, dirty:false });
         }
         let state = slot.as_ref().ok_or_else(||Error::InvalidConfig("missing resident parameter bank".into()))?;
@@ -132,8 +228,15 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
         let mut banks=self.resident_parameter_banks.borrow_mut();
         let state=banks.get_mut(index).and_then(Option::as_mut)
             .ok_or_else(||Error::InvalidConfig("missing resident gradient bank".into()))?;
-        if state.generation!=generation || gradients.len()!=state.layout.len()
-            || gradients.iter().zip(&state.layout).any(|((r,_),b)|*r!=b.range) {
+        // Gradient operation boundaries need not equal optimizer group
+        // boundaries (Kimi has many projections but two checkpoint arrays).
+        let mut end = 0;
+        let coverage = gradients.iter().all(|(range, _)| {
+            let valid = range.start == end && range.end > end && range.end <= state.snapshot.len();
+            end = range.end;
+            valid
+        }) && end == state.snapshot.len();
+        if state.generation!=generation || !coverage {
             return Err(Error::InvalidConfig("resident gradient snapshot/range mismatch; rerun training forward after parameter updates".into()));
         }
         let refs=gradients.iter().map(|(_,t)|t).collect::<Vec<_>>();
@@ -155,10 +258,9 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
             let Some(state)=state else {continue;};
             let values=self.backend.download_f32(&state.updates)
                 .map_err(|e|backend_error("download resident gradient diagnostic",e))?;
-            match buffers.get_mut(index) {
-                Some(LayerTrainBuffers::MambaVision(t)) if t.updates.len()==values.len()=>t.updates.copy_from_slice(&values),
-                _=>return Err(Error::InvalidConfig("resident host accumulator mirror mismatch".into())),
-            }
+            let buffer = buffers.get_mut(index)
+                .ok_or_else(|| Error::InvalidConfig("resident host accumulator index".into()))?;
+            set_host_updates(buffer, &values)?;
         }
         Ok(())
     }
@@ -173,8 +275,8 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
             if m.len()!=state.snapshot.len() || v.len()!=m.len(){return Err(Error::InvalidConfig("resident moment length mismatch".into()));}
             let parent=states.get_mut(index).ok_or_else(||Error::InvalidConfig("resident Adam host-state index".into()))?
                 .get_or_insert_with(HostAdamLayerState::default);
-            for (slot,block) in state.layout.iter().enumerate(){
-                host_adam_child(parent,slot).weights=Some((m[block.range.clone()].to_vec(),v[block.range.clone()].to_vec()));
+            for block in &state.layout {
+                block.moment_slot.set(parent, (m[block.range.clone()].to_vec(), v[block.range.clone()].to_vec()));
             }
         }
         Ok(())
@@ -190,13 +292,12 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
         for (index,state) in banks.iter_mut().enumerate(){
             let Some(state)=state else{continue;};
             if !state.dirty{continue;}
-            let Some(LayerParams::MambaVision(p))=self.params.get_mut(index)else{
-                return Err(Error::InvalidConfig("resident parameter host kind mismatch".into()));
-            };
-            if !same_bits(&p.values,&state.snapshot){return Err(Error::InvalidConfig("host parameters were edited before deferred device synchronization".into()));}
+            let params = self.params.get_mut(index)
+                .ok_or_else(|| Error::InvalidConfig("resident parameter host index".into()))?;
+            if !host_values_match(params,&state.snapshot)?{return Err(Error::InvalidConfig("host parameters were edited before deferred device synchronization".into()));}
             let values=self.backend.download_f32(&state.weights).map_err(|e|backend_error("download resident parameter mirror",e))?;
-            if values.len()!=p.values.len(){return Err(Error::InvalidConfig("resident parameter host length mismatch".into()));}
-            p.values.copy_from_slice(&values);state.snapshot=values;state.dirty=false;
+            set_host_values(params, &values)?;
+            state.snapshot=values;state.dirty=false;
         }
         *self.host_adam_state.get_mut()=moments;
         Ok(())
@@ -219,7 +320,6 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
     pub(super) fn update_resident_parameters(&mut self,step:&GpuOptimizerStep,
         sync_host:bool,config:ElementwiseLaunchConfig)->Result<()> {
         let iteration=self.train_iteration as i64+1;
-        let mut changed=false;
         let be=&self.backend;
         let err=|e|backend_error("resident parameter optimizer",e);
         let banks=self.resident_parameter_banks.get_mut();
@@ -229,10 +329,9 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
             let Some(old)=slot.as_ref()else{continue;};
             let layer=&self.network.layers[index];
             if !layer.train.updates_at(iteration,self.network.net.burn_in){continue;}
-            let Some(LayerParams::MambaVision(host))=self.params.get(index)else{
-                return Err(Error::InvalidConfig("resident optimizer parameter kind mismatch".into()));
-            };
-            if !same_bits(&host.values,&old.snapshot){return Err(Error::InvalidConfig("host parameters changed after native forward; rerun forward or synchronize before updating".into()));}
+            let host = self.params.get(index)
+                .ok_or_else(|| Error::InvalidConfig("resident optimizer parameter index".into()))?;
+            if !host_values_match(host,&old.snapshot)?{return Err(Error::InvalidConfig("host parameters changed after native forward; rerun forward or synchronize before updating".into()));}
             let mut next=old.clone();
             let masked=be.vector_mul_f32(&old.weights,&old.decay_mask,&[old.snapshot.len()],config).map_err(err)?;
             match step {
@@ -245,8 +344,11 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
                 GpuOptimizerStep::Adam(adam)=>{
                     let adam=AdamParams{lr:adam.lr*layer.train.learning_rate_scale,..*adam};
                     let (coupled,decoupled,_,_)=adam.kernel_scalars();
-                    let effective=if coupled==0.0{old.updates.clone()}
-                        else{be.saxpy_f32(-coupled,&masked,&old.updates,config).map_err(err)?};
+                    let effective=if coupled==0.0{old.updates.clone()} else {
+                        let coupled_weights = be.vector_mul_f32(&old.weights, &old.coupled_decay_mask,
+                            &[old.snapshot.len()], config).map_err(err)?;
+                        be.saxpy_f32(-coupled,&coupled_weights,&old.updates,config).map_err(err)?
+                    };
                     let moments=match &old.moments{
                         Some(pair)=>pair.clone(),
                         None=>(be.zeros_f32(&[old.snapshot.len()]).map_err(err)?,be.zeros_f32(&[old.snapshot.len()]).map_err(err)?),
@@ -257,9 +359,11 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
                     next.moments=Some((m,v));next.updates=be.zeros_f32(&[old.snapshot.len()]).map_err(err)?;
                 }
             }
-            next.dirty=true;next.generation=next.generation.wrapping_add(1);*slot=Some(next);changed=true;
+            next.dirty=true;next.generation=next.generation.wrapping_add(1);*slot=Some(next);
+            // A later layer can fail. Preserve the staleness marker as soon
+            // as this layer publishes a new authoritative device state.
+            self.host_weights_stale=true;
         }
-        if changed{self.host_weights_stale=true;}
         if sync_host{self.synchronize_resident_parameter_state()?;}
         Ok(())
     }

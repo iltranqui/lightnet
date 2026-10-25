@@ -96,6 +96,7 @@ fn kimi_native_runtime_two_step_outputs_gradients_and_updates_match_cpu() {
                 let got = gpu.backward_accumulate_seeded_gpu_with_input_gradient(&device, &seeds).unwrap().unwrap();
                 close("input gradient", &got.data, &expected.input_gradient.data, 1e-3);
             }
+            gpu.synchronize_resident_parameter_gradients().unwrap();
             close("parameter accumulation", &updates(&gpu.host_fallback_train_buffers()[0]), &updates(&cpu.train_buffers[0]), 1e-3);
             if cpu.network.net.muon {cpu.update_weights_muon(0.003,2).unwrap();}
             else if cpu.network.net.adam {cpu.update_weights_adam(0.003,2).unwrap();}

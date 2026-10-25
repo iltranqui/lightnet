@@ -82,6 +82,30 @@ remain outside this checkpoint.
   SGD/Adam/AdamW, update gates, deferred inference, sidecar resume, reset,
   stale mirrors and stale training caches. Oxide finiteness diagnostics reduce
   on device and transfer one scalar flag, not the inspected gradient tensor.
+- Kimi/Tucker residency continuation: native SGD/Adam now slice serialized
+  resident parameters and accumulate mathematical gradients as descending
+  device directions. Kimi packs all projections and four LayerNorm arrays;
+  Tucker performs source-factor packing and inverse gradient permutations on
+  device using existing token-layout kernels. Both preserve biases-first
+  serialization and root bias/weight DNOPT slots, independent of Mamba's child
+  moment slots. Separate coupled-decay masks preserve bias L2 under Adam while
+  excluding bias decay for SGD/AdamW. Deferred/eager updates, explicit gradient
+  diagnostics, host mirrors and sidecar resume use the shared bank lifecycle.
+  Muon and whole-network CPU backward retain their hybrid paths. Kimi scalar
+  finiteness checks still synchronize; no throughput claim is made.
+- Half-storage continuation: add required device widening/narrowing methods to
+  F16TensorOpsBackend and connect Oxide's existing conversion kernels. Supported
+  MambaVision/KimiKDA/TuckerAttention inference now crosses half activation
+  boundaries around device f32 arithmetic islands with f32 master parameters.
+  Training caches are preserved. This is neither native half mixer arithmetic
+  nor FP16 training completion. Unrun fixtures cover half conversion shape,
+  NaN/overflow, inference between forward/backward and updated resident masters.
+- Additional unrun Kimi/Tucker fixtures cover asymmetric Tucker ranks and
+  multiple heads, padded dense/sparse windows, repeated accumulation, loss
+  scaling, three deferred optimizer steps, decay modes, stale-cache/host-edit
+  rejection, update gates, reset and Kimi root-slot DNOPT resume. Existing Kimi
+  gradient comparisons now request explicit resident diagnostics. Host staleness
+  is recorded on each resident layer publication, even if a later layer fails.
 
 ## Evidence and remaining work
 

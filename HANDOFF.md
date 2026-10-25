@@ -7,6 +7,7 @@ Branch at handoff: `main`. Latest implementation commit: `c9feefb`.
 
 - [User priority and execution restrictions](#user-priority-and-execution-restrictions)
 - [Read first](#read-first)
+- [Continuation after this handoff](#continuation-after-this-handoff)
 - [Implementation checkpoints](#implementation-checkpoints)
 - [Current implementation](#current-implementation)
 - [Code map](#code-map)
@@ -38,8 +39,8 @@ Standing user instructions:
   four jobs and `MemoryHigh=3G`. The session's 3G requirement is stricter than
   older 4G examples in the Rust handbook. Oxide uses the repository wrapper.
 
-The user's latest request was to prepare this Markdown handoff. No additional
-implementation should be inferred as having happened after `c9feefb`.
+The original handoff ended at `c9feefb`. The user subsequently requested source
+implementation of the device-completion priority; see the continuation below.
 
 ## Read first
 
@@ -69,6 +70,34 @@ All entries below are **local, uncompiled and untested WIP**.
 Earlier ViT/Swin WIP exists in history. It is not certified complete by the
 later changes. The next agent should inspect `git log` and `git status` before
 editing or staging.
+
+## Continuation after this handoff
+
+2026-10-25, source-only WIP following the user's explicit implementation request:
+
+- KimiKDA and TuckerAttention now use resident serialized parameters,
+  descending gradient accumulators, SGD momentum and Adam moments on the native
+  SGD/Adam paths. Both map DNOPT moments to root biases/weights, while Mamba
+  retains per-block child weights. Separate coupled-decay masks preserve each
+  CPU optimizer's bias decay rules.
+- Tucker factors and gradients are packed/unpacked on device using token-layout
+  permutations, including head-major Q/K/V cores. Native backward no longer
+  downloads parameter gradients on these resident paths. Kimi finiteness guards
+  retain scalar flag synchronization. Muon remains explicitly hybrid.
+- Mamba/Kimi/Tucker now support half-storage inference around device f32
+  arithmetic islands. Mandatory backend casts call existing Oxide kernels;
+  parameters/moments stay f32 and inference does not replace training caches.
+  Native half arithmetic and FP16 training remain open.
+- Unrun fixtures cover repeated gradients/updates, coupled versus decoupled
+  decay, deferred inference, Kimi DNOPT resume, stale caches/edits, gates/reset,
+  Tucker multi-head/asymmetric-factor permutations and half conversion edges.
+- A layer publication marks host parameters stale immediately, even if a later
+  resident layer fails. Source inspection and `git diff --check` only; no Cargo,
+  build, test, runtime, training or benchmark execution. Check `git log` for the
+  local WIP checkpoint; no release tag or version-map entry is appropriate.
+
+The original per-layer descriptions below describe the earlier checkpoint;
+use this continuation and `tasks/rust/source-wip.md` for current source scope.
 
 ## Current implementation
 
@@ -206,9 +235,9 @@ src/lightnet-cuda-oxide/
 
 ## Source review concerns
 
-- The flat resident bank currently materializes only Mamba parameters and its
-  per-block DNOPT child `weights` moments. It is **not yet a general adapter for
-  Kimi, DPT, Tucker, ViT or Swin**.
+- The flat resident bank now materializes Mamba parameters/per-block DNOPT
+  child moments and Kimi/Tucker biases-first arrays/root DNOPT moments. It is
+  **not yet an adapter for DPT, ViT or Swin**.
 - Tucker factors require packing/unpacking permutations. Kimi has separate
   bias/weight arrays. DPT has fixed slot indices and unused slots. Do not apply
   Mamba's range/sidecar assumptions to those layers unchanged.

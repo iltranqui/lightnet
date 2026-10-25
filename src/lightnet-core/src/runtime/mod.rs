@@ -77,7 +77,7 @@ mod gpu_backward_support;
 mod gpu_dense_loss;
 mod gpu_params;
 mod gpu_resident_params;
-pub(crate) use gpu_resident_params::{ResidentParameterRange, ResidentParameterState};
+pub(crate) use gpu_resident_params::{ResidentMomentSlot, ResidentParameterRange, ResidentParameterState};
 mod defaults;
 mod param_updates;
 mod weights_io;

@@ -33,9 +33,12 @@ does not imply runtime optimizer integration.
 2026-10-25: WIP source now wires native f32 TuckerAttention, MambaVision,
 KimiKDA, DepthAnything and DPT paths. See [source-wip.md](source-wip.md) for
 scope and limits. The older matrix/counts below have not been promoted to
-verified status: the user prohibited Cargo check/build/test/run. Mamba/Kimi/DPT
-updates remain host-staged; DepthAnything is frozen. Half-storage inference,
-remaining variants and full device residency are still open. No layer is
+verified status: the user prohibited Cargo check/build/test/run. Mamba/Kimi/Tucker
+SGD/Adam source now retains native parameters/gradients/moments on device;
+Muon remains hybrid and DPT updates remain host-staged. DepthAnything is frozen.
+Mamba/Kimi/Tucker half-storage inference uses explicit device f32 arithmetic
+islands, not native half training. Remaining variants and full device residency
+across all families are still open. No layer is
 certified complete by this continuation.
 
 ## How this file was derived

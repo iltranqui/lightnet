@@ -1,10 +1,12 @@
 //! Native f32 Tucker attention: padded window gather, low-rank projections,
 //! dense or minimax sparse attention and the exact CPU-reference adjoint.
-//! Parameter gradients stage to the existing host SGD/Adam/Muon buffers.
+//! Native SGD/Adam keep serialized factors and gradients resident; Muon
+//! retains the explicit host-staged optimizer path.
 use crate::error::{Error, Result};
 use crate::layers::vit::gpu::device_activation;
 use crate::model::{Layer, TuckerAttentionSpec};
-use crate::runtime::{GpuExecutableNetwork, LayerTrainBuffers, backend_error, tensor_backend_shape};
+use crate::runtime::{GpuExecutableNetwork, LayerTrainBuffers, ResidentMomentSlot,
+    ResidentParameterRange, backend_error, tensor_backend_shape};
 use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
 use lightnet_cuda::host_ops::tucker_attention::AttentionGeometry;
 use super::{TuckerAttentionParams, TuckerGeometry};
@@ -79,6 +81,7 @@ pub(crate) struct DeviceCache<T> {
     o_mix: T,
     pre_activation: T,
     weights: Vec<T>,
+    resident_generation: Option<u64>,
 }
 
 impl<B> GpuExecutableNetwork<B>
@@ -98,25 +101,54 @@ where
         if layer.output_shape != layer.input_shape || !params.matches_geometry(&g) {
             return Err(Error::InvalidConfig("Tucker parameter/output geometry does not match the layer".into()));
         }
-        params.to_blob().map_err(Error::InvalidConfig)?;
+        let host = params.to_blob().map_err(Error::InvalidConfig)?;
         let rows = a.windows * a.tokens;
         let c = g.channels;
         let up = |shape: &[usize], data: &[f32]| self.backend.upload_f32(shape, data)
             .map_err(|e| backend_error("upload Tucker parameters", e));
         let mut weights = Vec::with_capacity(8);
         let mut offset = 0;
-        for (inputs, outputs, core) in blocks(&g) {
-            let count = inputs * outputs;
-            let mut packed = vec![0.0; count];
-            for out in 0..outputs {
-                for input in 0..inputs {
-                    packed[out * inputs + input] = params.weights[offset
-                        + source_index(input, out, inputs, outputs, core, g.heads)];
-                }
+        let (bias, resident_generation) = if self.resident_parameter_path_enabled() {
+            let layout = vec![
+                ResidentParameterRange { range:0..c, decay:false, coupled_decay:true,
+                    moment_slot:ResidentMomentSlot::Biases },
+                ResidentParameterRange { range:c..host.len(), decay:true, coupled_decay:true,
+                    moment_slot:ResidentMomentSlot::Weights },
+            ];
+            let mut slices = vec![0..c];
+            let mut start = c;
+            for (inputs, outputs, _) in blocks(&g) {
+                slices.push(start..start + inputs * outputs);
+                start += inputs * outputs;
             }
-            weights.push(up(&[outputs, inputs], &packed)?);
-            offset += count;
-        }
+            let (tensors, generation) = self.resident_parameter_slices(layer.index, &host,
+                layout, &slices, config)?;
+            let mut tensors = tensors.into_iter();
+            let bias = tensors.next().expect("Tucker bias slice");
+            for ((inputs, outputs, core), source) in blocks(&g).into_iter().zip(tensors) {
+                // [inputs, outputs] -> [outputs, inputs]; for Q/K/V
+                // cores the head is an independent batch dimension.
+                let heads = if core { g.heads } else { 1 };
+                weights.push(self.backend.vit_nchw_to_tokens_f32(&source, heads, 1,
+                    outputs / heads, inputs, config)
+                    .map_err(|e| backend_error("pack resident Tucker factor", e))?);
+            }
+            (bias, Some(generation))
+        } else {
+            for (inputs, outputs, core) in blocks(&g) {
+                let count = inputs * outputs;
+                let mut packed = vec![0.0; count];
+                for out in 0..outputs {
+                    for input in 0..inputs {
+                        packed[out * inputs + input] = params.weights[offset
+                            + source_index(input, out, inputs, outputs, core, g.heads)];
+                    }
+                }
+                weights.push(up(&[outputs, inputs], &packed)?);
+                offset += count;
+            }
+            (up(&[c], &params.biases)?, None)
+        };
         let project = |x: &B::Tensor, index: usize, bias: Option<&B::Tensor>| -> Result<B::Tensor> {
             let (inputs, outputs, _) = blocks(&g)[index];
             let zero;
@@ -138,7 +170,6 @@ where
             .tucker_attention_f32(&qkv[0], &qkv[1], &qkv[2], a, config)
             .map_err(|e| backend_error("GPU Tucker attention", e))?;
         let o_mix = project(&context, 6, None)?;
-        let bias = up(&[c], &params.biases)?;
         // The identity residual is added before the activation.
         let projection = project(&o_mix, 7, Some(&bias))?;
         let pre_activation = self.backend.residual_bias_f32(&projection, &input, None,
@@ -151,7 +182,7 @@ where
             .map_err(|e| backend_error("GPU Tucker window unpartition", e))?;
         let cache = training.then(|| DeviceCache {
             geometry: g, input, latent, qkv, probabilities, active, context, o_mix,
-            pre_activation, weights,
+            pre_activation, weights, resident_generation,
         });
         Ok((output, cache))
     }
@@ -218,7 +249,7 @@ where
         }
         let d_input = be.swin_window_unpartition_f32(&d_input, g.batch, c, g.height, g.width,
             ph, pw, g.size, 0, 0.0, config).map_err(err)?;
-        // Restore the serialized CPU factor order at the host optimizer boundary.
+        // Restore the serialized CPU factor order before accumulation.
         let descriptions = blocks(&g);
         let mut offsets = [0usize; 8];
         let mut total = 0;
@@ -226,31 +257,43 @@ where
             offsets[i] = total;
             total += inputs * outputs;
         }
-        let mut d_weights = vec![0.0; total];
-        for (i, tensor) in parameter_grads {
-            let values = be.download_f32(&tensor).map_err(err)?;
-            let (inputs, outputs, core) = descriptions[i];
-            if values.len() != inputs * outputs {
-                return Err(Error::InvalidConfig("Tucker factor gradient length mismatch".into()));
+        if let Some(generation) = cache.resident_generation {
+            let mut gradients = vec![(0..c, d_bias)];
+            for (i, tensor) in parameter_grads {
+                let (inputs, outputs, core) = descriptions[i];
+                let heads = if core { g.heads } else { 1 };
+                let source = be.vit_tokens_to_nchw_f32(&tensor, heads, 1,
+                    outputs / heads, inputs, config).map_err(err)?;
+                let start = c + offsets[i];
+                gradients.push((start..start + inputs * outputs, source));
             }
-            for out in 0..outputs {
-                for input in 0..inputs {
-                    d_weights[offsets[i] + source_index(input, out, inputs, outputs, core, g.heads)] =
-                        values[out * inputs + input];
+            self.accumulate_resident_parameter_gradients(layer.index, generation, gradients, config)?;
+        } else {
+            let mut d_weights = vec![0.0; total];
+            for (i, tensor) in parameter_grads {
+                let values = be.download_f32(&tensor).map_err(err)?;
+                let (inputs, outputs, core) = descriptions[i];
+                if values.len() != inputs * outputs {
+                    return Err(Error::InvalidConfig("Tucker factor gradient length mismatch".into()));
+                }
+                for out in 0..outputs {
+                    for input in 0..inputs {
+                        d_weights[offsets[i] + source_index(input, out, inputs, outputs, core, g.heads)] =
+                            values[out * inputs + input];
+                    }
                 }
             }
+            let d_bias = be.download_f32(&d_bias).map_err(err)?;
+            let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+            let Some(LayerTrainBuffers::TuckerAttention(train)) = buffers.get_mut(layer.index) else {
+                return Err(Error::InvalidConfig("missing Tucker attention train buffers".into()));
+            };
+            if train.weight_updates.len() != total || train.bias_updates.len() != d_bias.len() {
+                return Err(Error::InvalidConfig("Tucker attention train buffer length mismatch".into()));
+            }
+            for (dst, src) in train.weight_updates.iter_mut().zip(d_weights) { *dst -= src; }
+            for (dst, src) in train.bias_updates.iter_mut().zip(d_bias) { *dst -= src; }
         }
-        let d_bias = be.download_f32(&d_bias).map_err(err)?;
-        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
-        let Some(LayerTrainBuffers::TuckerAttention(train)) = buffers.get_mut(layer.index) else {
-            return Err(Error::InvalidConfig("missing Tucker attention train buffers".into()));
-        };
-        if train.weight_updates.len() != total || train.bias_updates.len() != d_bias.len() {
-            return Err(Error::InvalidConfig("Tucker attention train buffer length mismatch".into()));
-        }
-        for (dst, src) in train.weight_updates.iter_mut().zip(d_weights) { *dst -= src; }
-        for (dst, src) in train.bias_updates.iter_mut().zip(d_bias) { *dst -= src; }
-        drop(buffers);
         drop(caches);
         self.accumulate_previous_gpu_gradient(layer.index, d_input, layer_output_gradients)
     }

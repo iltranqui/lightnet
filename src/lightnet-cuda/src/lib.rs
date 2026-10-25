@@ -5783,6 +5783,12 @@ pub trait F16TensorOpsBackend: F32TensorOpsBackend {
     fn upload_f16(&self, shape: &[usize], host: &[f32]) -> Result<Self::TensorF16, Self::Error>;
     /// Downloads an f16 tensor widened to f32.
     fn download_f16(&self, tensor: &Self::TensorF16) -> Result<Vec<f32>, Self::Error>;
+    /// Widen half storage on device, preserving shape. Used at an explicit
+    /// f32 arithmetic island; implementations must not stage through the host.
+    fn widen_f16(&self, tensor: &Self::TensorF16) -> Result<Self::Tensor, Self::Error>;
+    /// Round an f32 device tensor to binary16 storage, preserving shape.
+    /// Overflow remains infinite (no saturation), and NaNs remain visible.
+    fn narrow_f32(&self, tensor: &Self::Tensor) -> Result<Self::TensorF16, Self::Error>;
     /// Converts `[filters, per_filter]` f32 conv weights to the backend's f16
     /// GEMM operand layout (backend-defined padding, opaque to the caller).
     fn conv_weights_f16(

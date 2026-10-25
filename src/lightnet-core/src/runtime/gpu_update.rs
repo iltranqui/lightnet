@@ -292,6 +292,8 @@ where
     /// One optimizer step over device convolutions, EML SGD, and MoE SGD/Adam,
     /// including BN scales. EML Adam, HyperbolicFoveation, and FoveationFilm
     /// parameters are updated through their host fallback buffers.
+    /// Supported native MambaVision, KimiKDA and TuckerAttention SGD/Adam
+    /// parameters, accumulators and moments use resident device banks.
     /// The optimizer follows `[net]`: SGD with
     /// momentum by default, Adam with `adam=1` (`B1`/`B2`/`eps`, coupled L2
     /// decay like C++, or AdamW with `decoupled_decay=1`; `lr`/`decay`/`batch`
@@ -315,7 +317,9 @@ where
     /// the current router forward consumes host parameters; EML branch and MoE
     /// expert params remain stale until [`Self::sync_host_weights_from_device`]
     /// runs (call it before reading or saving `params`). Falls back to eager
-    /// sync when CPU backward reads host weights.
+    /// sync when CPU backward reads host weights. Supported native MambaVision,
+    /// KimiKDA and TuckerAttention SGD/Adam banks also remain device-authoritative
+    /// until synchronization; forward reads their updated device weights.
     pub fn update_weights_gpu_deferred(
         &mut self,
         lr: f32,
@@ -328,7 +332,8 @@ where
     }
 
     /// Refreshes host convolution, EML branch, and MoE expert weights/biases/BN
-    /// stats after deferred device updates.
+    /// stats and resident mixer parameter/optimizer mirrors after deferred
+    /// device updates.
     pub fn sync_host_weights_from_device(&mut self) -> Result<()> {
         self.synchronize_resident_parameter_state()?;
         if !self.host_weights_stale {

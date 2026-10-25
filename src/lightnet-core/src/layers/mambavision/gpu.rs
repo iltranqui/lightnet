@@ -7,7 +7,7 @@ use super::cpu::{MambaOffsets, MambaVisionGeometry};
 use crate::layers::vit::gpu::device_activation;
 use crate::error::{Error, Result};
 use crate::model::{Layer, MambaVisionSpec};
-use crate::runtime::{GpuExecutableNetwork, LayerTrainBuffers, ResidentParameterRange,
+use crate::runtime::{GpuExecutableNetwork, LayerTrainBuffers, ResidentMomentSlot, ResidentParameterRange,
     backend_error, tensor_backend_shape};
 use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
 use lightnet_cuda::mambavision::{MambaScanForward, MambaScanGeometry};
@@ -109,7 +109,10 @@ where
         let o = offsets(&g)?;
         let (p,resident_generation) = if self.resident_parameter_path_enabled() {
             let layout = super::mambavision_param_blocks(params).map_err(Error::InvalidConfig)?
-                .into_iter().map(|b|ResidentParameterRange{range:b.range,decay:b.decay}).collect();
+                .into_iter().enumerate().map(|(i,b)|ResidentParameterRange {
+                    range:b.range, decay:b.decay, coupled_decay:b.decay,
+                    moment_slot:ResidentMomentSlot::ChildWeights(i),
+                }).collect();
             let (p,generation) = self.resident_parameter_slices(layer.index,&params.values,
                 layout,&ranges(&o),config)?;
             (p,Some(generation))

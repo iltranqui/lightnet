@@ -7,14 +7,16 @@ where
     B: F16TensorOpsBackend,
     B::Error: std::fmt::Display,
 {
-    /// f16 twin of [`GpuExecutableNetwork::forward_compact`]: weights and
-    /// activations are stored as binary16 on the device (f32 accumulation,
-    /// bias and activation), the yolo heads are widened to f32 on download.
+    /// f16 twin of [`GpuExecutableNetwork::forward_compact`]. Convolution and
+    /// connected operands use binary16 device storage with f32 accumulation.
+    /// MambaVision, KimiKDA and TuckerAttention use half activation storage around explicit
+    /// device f32 arithmetic islands; their master weights remain f32.
+    /// The yolo heads are widened to f32 on download.
     /// Supports convolutional, maxpool, (local) avgpool, standalone batchnorm,
     /// route, LAYA marker gather, SAM, shortcut (mismatched sources are cropped /
     /// zero-padded like Darknet), upsample (also `reverse`), Logistic sigmoid and
     /// OMD loss inference pass-through, group-major JevCe softmax, and yolo-style
-    /// pass-through layers;
+    /// pass-through layers, supported MambaVision, KimiKDA and TuckerAttention mixers;
     /// any other layer returns `UnsupportedLayer` (use `forward_compact`).
     pub fn forward_compact_f16(&self, input: &Tensor) -> Result<GpuForwardSummary> {
         reject_gpu_hyperbolic_foveation(&self.network, "f16 inference")?;
@@ -43,6 +45,31 @@ where
                         return Err(Error::UnsupportedLayer {
                             layer_index: layer.index,
                             name: format!("{} (f16 inference)", layer.kind.name()),
+                        });
+                    }
+                }
+                LayerKind::MambaVision(spec) => {
+                    if !crate::layers::mambavision::gpu::supported(layer, spec) {
+                        return Err(Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: "MambaVision variant (f16 storage, f32 arithmetic)".into(),
+                        });
+                    }
+                }
+                LayerKind::KimiKda(spec) => {
+                    if !crate::layers::kimi_kda::gpu::supported(layer, spec) {
+                        return Err(Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: "KimiKDA variant (f16 storage, f32 arithmetic)".into(),
+                        });
+                    }
+                }
+                LayerKind::TuckerAttention(spec) => {
+                    let g = crate::layers::tucker_attention::gpu::geometry(layer, spec);
+                    if !crate::layers::tucker_attention::gpu::supported(&g) {
+                        return Err(Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: "TuckerAttention variant (f16 storage, f32 arithmetic)".into(),
                         });
                     }
                 }
@@ -791,6 +818,31 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("f16 upsample", err))?,
+                (LayerKind::MambaVision(spec), LayerParams::MambaVision(params)) => {
+                    let input = self.backend.widen_f16(current_input.expect("MambaVision input"))
+                        .map_err(|err| backend_error("widen MambaVision half storage", err))?;
+                    // Inference must not replace the last training cache.
+                    let (output, _) = self.forward_mambavision_gpu(layer, spec, params,
+                        &input, launch_config, false)?;
+                    self.backend.narrow_f32(&output)
+                        .map_err(|err| backend_error("narrow MambaVision half storage", err))?
+                }
+                (LayerKind::KimiKda(spec), LayerParams::KimiKda(params)) => {
+                    let input = self.backend.widen_f16(current_input.expect("KimiKDA input"))
+                        .map_err(|err| backend_error("widen KimiKDA half storage", err))?;
+                    let (output, _) = self.forward_kimi_kda_gpu(layer, spec, params,
+                        &input, launch_config, false)?;
+                    self.backend.narrow_f32(&output)
+                        .map_err(|err| backend_error("narrow KimiKDA half storage", err))?
+                }
+                (LayerKind::TuckerAttention(spec), LayerParams::TuckerAttention(params)) => {
+                    let input = self.backend.widen_f16(current_input.expect("TuckerAttention input"))
+                        .map_err(|err| backend_error("widen TuckerAttention half storage", err))?;
+                    let (output, _) = self.forward_tucker_attention_gpu(layer, spec, params,
+                        &input, launch_config, false)?;
+                    self.backend.narrow_f32(&output)
+                        .map_err(|err| backend_error("narrow TuckerAttention half storage", err))?
+                }
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None) => current_input
