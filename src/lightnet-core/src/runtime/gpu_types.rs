@@ -230,6 +230,10 @@ where
     /// One slot per layer; only `[vit]` uses it, filled by the native training
     /// forward when the network takes the native backward (see `vit_gpu`).
     pub(crate) vit_device_caches: RefCell<Vec<Option<vit_gpu::DeviceCache<B::Tensor>>>>,
+    /// One slot per layer; only `[swin]` uses it, filled by the native training
+    /// forward when the network takes the native backward (see `layers::swin::gpu`).
+    pub(crate) swin_device_caches:
+        RefCell<Vec<Option<crate::layers::swin::gpu::DeviceCache<B::Tensor>>>>,
     /// Per-owner-layer convolution Adam moments (device), created lazily on the
     /// first Adam update.
     pub(super) adam_state: Vec<Option<GpuAdamLayerState<B::Tensor>>>,

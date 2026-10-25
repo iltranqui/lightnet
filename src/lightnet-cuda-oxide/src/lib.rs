@@ -6,6 +6,7 @@ pub mod conv;
 mod dcnv4_native;
 mod deconvolutional;
 mod graph_conv;
+mod swin;
 pub use dcnv4_native::Dcnv4NativeGradients;
 pub mod fp4;
 pub mod fp8;
@@ -239,6 +240,7 @@ pub struct OxideBackend {
     moe: moe::kernels::LoadedModule,
     attention: attention::kernels::LoadedModule,
     vit: vit::kernels::LoadedModule,
+    swin: kernels::swin::kernels::LoadedModule,
     residual_epilogue: layers_extra::residual::LoadedModule,
     conv_mode: ConvMode,
     /// FP8 formats for the dgrad / wgrad GEMMs when the FP8 backward is
@@ -1930,6 +1932,8 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load residual epilogue module: {err:?}")))?;
         let vit = vit::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load vit module: {err:?}")))?;
+        let swin = kernels::swin::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load swin module: {err:?}")))?;
         let attention = attention::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load attention module: {err:?}")))?;
         let moe = moe::kernels::load(&ctx)
@@ -2040,6 +2044,7 @@ impl OxideBackend {
             moe,
             attention,
             vit,
+            swin,
             deform_sample,
             deform_backward,
             dsconv,
@@ -11633,6 +11638,148 @@ impl F32TensorOpsBackend for OxideBackend {
         OxideBackend::vit_pos_embed_backward_f32(self, grad, batch, table, config)
     }
 
+    fn swin_window_partition_f32(
+        &self,
+        input: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        padded_height: usize,
+        padded_width: usize,
+        window: usize,
+        shift: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        self.swin_window_partition_native(
+            input,
+            batch,
+            channels,
+            height,
+            width,
+            padded_height,
+            padded_width,
+            window,
+            shift,
+            config,
+        )
+    }
+
+    fn swin_window_unpartition_f32(
+        &self,
+        windows: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        padded_height: usize,
+        padded_width: usize,
+        window: usize,
+        shift: usize,
+        clip: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        self.swin_window_unpartition_native(
+            windows,
+            batch,
+            channels,
+            height,
+            width,
+            padded_height,
+            padded_width,
+            window,
+            shift,
+            clip,
+            config,
+        )
+    }
+
+    fn swin_mhc_residual_f32(
+        &self,
+        skip: &Self::Tensor,
+        branch: &Self::Tensor,
+        skip_scale: f32,
+        branch_scale: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        self.swin_mhc_residual_native(skip, branch, skip_scale, branch_scale, config)
+    }
+
+    fn swin_mhc_residual_backward_f32(
+        &self,
+        skip: &Self::Tensor,
+        branch: &Self::Tensor,
+        grad: &Self::Tensor,
+        skip_scale: f32,
+        branch_scale: f32,
+        mix: f32,
+        post_skip: f32,
+        post_branch: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        self.swin_mhc_residual_backward_native(
+            skip,
+            branch,
+            grad,
+            skip_scale,
+            branch_scale,
+            mix,
+            post_skip,
+            post_branch,
+            config,
+        )
+    }
+
+    fn swin_window_attention_f32(
+        &self,
+        qkv: &Self::Tensor,
+        relative_position_bias: &Self::Tensor,
+        mask: &Self::Tensor,
+        total_windows: usize,
+        spatial_windows: usize,
+        window: usize,
+        channels: usize,
+        heads: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        self.swin_window_attention_native(
+            qkv,
+            relative_position_bias,
+            mask,
+            total_windows,
+            spatial_windows,
+            window,
+            channels,
+            heads,
+            config,
+        )
+    }
+
+    fn swin_window_attention_backward_f32(
+        &self,
+        qkv: &Self::Tensor,
+        probabilities: &Self::Tensor,
+        active: &Self::Tensor,
+        context_grad: &Self::Tensor,
+        total_windows: usize,
+        window: usize,
+        channels: usize,
+        heads: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        self.swin_window_attention_backward_native(
+            qkv,
+            probabilities,
+            active,
+            context_grad,
+            total_windows,
+            window,
+            channels,
+            heads,
+            config,
+        )
+    }
+
     fn wmhf_apply_gate_f32(
         &self,
         fuse: &Self::Tensor,
@@ -11640,8 +11787,11 @@ impl F32TensorOpsBackend for OxideBackend {
         projected: &Self::Tensor,
         shortcut: Option<&Self::Tensor>,
         freq_scale: f32,
+        shape: &[usize],
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
+        // The native kernel validates matching operand shapes and keeps `fuse`'s.
+        let _ = shape;
         OxideBackend::wmhf_apply_gate_f32(self, fuse, gate, projected, shortcut, freq_scale, config)
     }
 
@@ -11652,8 +11802,10 @@ impl F32TensorOpsBackend for OxideBackend {
         projected: &Self::Tensor,
         freq_scale: f32,
         use_shortcut: bool,
+        shape: &[usize],
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = shape;
         OxideBackend::wmhf_apply_gate_backward_f32(
             self,
             output_grad,

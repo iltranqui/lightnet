@@ -6264,7 +6264,14 @@ fn gpu_muon_swin_host_gradient_matrices_match_cpu_across_steps() {
             );
         }
         assert_eq!(gpu_swin.res_proj, cpu_swin.res_proj);
-        assert_eq!(gpu_swin.mhc, cpu_swin.mhc);
+        // The native Swin backward reduces the mHC gradient on the device, so
+        // it matches the CPU only up to f32 summation order.
+        close(
+            &format!("Swin mHC step {step}"),
+            &gpu_swin.mhc,
+            &cpu_swin.mhc,
+            1e-3,
+        );
     }
 }
 

@@ -465,9 +465,11 @@ fn swin_gpu_host_round_trip_matches_cpu_chain_and_backward_updates() {
     let network = Network::from_config(
         ConfigFile::parse_str(
             "swin-fake-backend-chain.cfg",
+            // `revleaky` has no device activation, so this Swin keeps the host
+            // round trip and the CPU backward fallback that this test covers.
             "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=1\n\
              [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
-             [swin]\nfilters=3\nsize=2\nheads=1\nshift=1\nffn_ratio=2\nactivation=gelu\n",
+             [swin]\nfilters=3\nsize=2\nheads=1\nshift=1\nffn_ratio=2\nactivation=revleaky\n",
         )
         .unwrap(),
     )
@@ -524,6 +526,99 @@ fn swin_gpu_host_round_trip_matches_cpu_chain_and_backward_updates() {
         unreachable!()
     };
     assert_eq!(gpu_swin, cpu_swin);
+}
+
+#[test]
+fn swin_gpu_native_path_matches_cpu_forward_backward_and_staged_gradients() {
+    // Shifted windows, bottom/right padding (3x5 input, window 2), two heads,
+    // a C->N residual projection and batch 2 (per-sample mask reuse).
+    let network = Network::from_config(
+        ConfigFile::parse_str(
+            "swin-native-fake-backend.cfg",
+            "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\n\
+             [swin]\nfilters=4\nsize=2\nheads=2\nshift=1\nffn_ratio=2\nactivation=gelu\n",
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut cpu = ExecutableNetwork::new(network.clone());
+    crate::initialize_training_params(&network, &mut cpu.params, 211);
+    let LayerParams::Swin(weights) = &mut cpu.params[0] else {
+        panic!("Swin params")
+    };
+    for (index, value) in weights.relative_position_bias.iter_mut().enumerate() {
+        *value = ((index % 5) as f32 - 2.0) * 0.03;
+    }
+    weights.mhc.copy_from_slice(&[
+        0.3, -0.2, 0.1, 0.4, 0.2, -0.1, -0.3, 0.1, 0.25, 0.2, -0.15, 0.3,
+    ]);
+    let input = Tensor::from_data(
+        TensorShape::new(5, 3, 2, 2),
+        (0..60).map(|index| ((index as f32) * 0.37).sin() * 0.8).collect(),
+    )
+    .unwrap();
+    let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+    gpu.params = cpu.params.clone();
+    assert!(!gpu.requires_cpu_backward_fallback());
+    let close = |name: &str, got: &[f32], want: &[f32]| {
+        assert_eq!(got.len(), want.len(), "{name}: length");
+        for (index, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-4 * w.abs().max(1.0),
+                "{name}[{index}]: gpu={g} cpu={w}"
+            );
+        }
+    };
+
+    let cpu_output = cpu.forward(&input).unwrap().final_output().unwrap().clone();
+    let gpu_output = gpu.forward(&input).unwrap().final_output().unwrap().clone();
+    assert_eq!(gpu_output.shape, cpu_output.shape);
+    close("inference output", &gpu_output.data, &cpu_output.data);
+
+    let seed = Tensor::from_data(
+        cpu_output.shape,
+        (0..cpu_output.len())
+            .map(|index| ((index as f32) * 0.41 + 0.2).cos() * 0.3)
+            .collect(),
+    )
+    .unwrap();
+    let seeds = [Some(seed)];
+    gpu.init_train_buffers_gpu().unwrap();
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().unwrap();
+    let cpu_forward = cpu.forward_training(&input).unwrap();
+    let gpu_state = gpu.forward_training_with_state(&input).unwrap();
+    close(
+        "training output",
+        &gpu_state.cpu_forward.final_output().unwrap().data,
+        &cpu_forward.final_output().unwrap().data,
+    );
+    // The native training forward keeps no host cache.
+    assert!(gpu_state.cpu_forward.swin_caches[0].is_none());
+    let cpu_backward = cpu
+        .backward_accumulate_seeded(&input, &cpu_forward, &seeds)
+        .unwrap();
+    let gpu_input_gradient = gpu
+        .backward_accumulate_seeded_gpu_with_input_gradient(&gpu_state, &seeds)
+        .unwrap()
+        .expect("captured Swin input gradient");
+    close(
+        "input gradient",
+        &gpu_input_gradient.data,
+        &cpu_backward.input_gradient.data,
+    );
+    let LayerTrainBuffers::Swin(cpu_train) = &cpu.train_buffers[0] else {
+        panic!("Swin CPU train buffers")
+    };
+    let buffers = gpu.host_fallback_train_buffers();
+    let LayerTrainBuffers::Swin(gpu_train) = &buffers[0] else {
+        panic!("Swin native-staged updates")
+    };
+    close(
+        "staged updates",
+        &gpu_train.updates.to_blob().unwrap(),
+        &cpu_train.updates.to_blob().unwrap(),
+    );
 }
 
 #[test]

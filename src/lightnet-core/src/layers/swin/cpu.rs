@@ -756,7 +756,11 @@ fn mhc_sigmoid(value: f32) -> f32 {
     }
 }
 
-fn mhc_parameters(params: &[f32], site: usize) -> Result<(f32, f32, f32, f32, f32), String> {
+/// Site coefficients `(skip, branch, p, post_skip, post_branch)` of the mHC mix.
+pub(crate) fn mhc_parameters(
+    params: &[f32],
+    site: usize,
+) -> Result<(f32, f32, f32, f32, f32), String> {
     if params.len() != 12 || site >= 2 {
         return Err(format!(
             "Swin mHC expects 12 parameters and site 0 or 1 (got {}, {site})",

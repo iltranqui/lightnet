@@ -71,6 +71,8 @@ where
         // `[vit]` keeps its device backward cache only when that same native
         // backward will run; otherwise training uses the host cache.
         let vit_device_training = training && deform_device;
+        // `[swin]` uses the same rule for its device backward cache.
+        let swin_device_training = training && deform_device;
         let expected = self.network.net.input_shape();
         if input.shape != expected {
             return Err(Error::InvalidConfig(format!(
@@ -156,6 +158,7 @@ where
         let mut deform_conv_caches = Vec::with_capacity(self.network.layers.len());
         let mut deform_device_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_device_caches = Vec::with_capacity(self.network.layers.len());
+        let mut swin_device_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches: Vec<Option<crate::vit::VitForwardCache>> =
             Vec::with_capacity(self.network.layers.len());
         let mut swin_caches: Vec<Option<crate::swin_block::SwinForwardCache>> =
@@ -196,6 +199,7 @@ where
             let mut batch_norm_cache = None;
             let mut vit_cache = None;
             let mut vit_device_cache = None;
+            let mut swin_device_cache = None;
             let mut swin_cache = None;
             let mut tucker_attention_cache = None;
             let mut mambavision_cache = None;
@@ -609,6 +613,36 @@ where
                     )?;
                     vit_cache = Some(cache);
                     output
+                }
+                (LayerKind::Swin(spec), LayerParams::Swin(weights))
+                    if (!training || swin_device_training)
+                        && crate::layers::swin::gpu::supported(
+                            &crate::layers::swin::gpu::geometry(layer, spec),
+                        ) =>
+                {
+                    let geometry = crate::layers::swin::gpu::geometry(layer, spec);
+                    if swin_device_training {
+                        // Training: the native backward reads this device cache.
+                        let (output, cache) = crate::layers::swin::gpu::forward_training(
+                            &self.backend,
+                            &geometry,
+                            weights,
+                            current_input,
+                            layer.output_shape,
+                            launch_config,
+                        )?;
+                        swin_device_cache = Some(cache);
+                        output
+                    } else {
+                        crate::layers::swin::gpu::forward(
+                            &self.backend,
+                            &geometry,
+                            weights,
+                            current_input,
+                            layer.output_shape,
+                            launch_config,
+                        )?
+                    }
                 }
                 (LayerKind::Swin(spec), LayerParams::Swin(weights)) => {
                     let (output, cache) =
@@ -1024,6 +1058,7 @@ where
             deform_device_caches.push(deform_device_cache);
             vit_caches.push(vit_cache);
             vit_device_caches.push(vit_device_cache);
+            swin_device_caches.push(swin_device_cache);
             swin_caches.push(swin_cache);
             tucker_attention_caches.push(tucker_attention_cache);
             mambavision_caches.push(mambavision_cache);
@@ -1034,6 +1069,7 @@ where
 
         *self.deform_device_caches.borrow_mut() = deform_device_caches;
         *self.vit_device_caches.borrow_mut() = vit_device_caches;
+        *self.swin_device_caches.borrow_mut() = swin_device_caches;
         Ok(GpuForwardState {
             input_gpu,
             gpu_layer_outputs,

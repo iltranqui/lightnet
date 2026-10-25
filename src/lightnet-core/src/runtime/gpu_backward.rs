@@ -522,6 +522,16 @@ where
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::Swin(spec), Some(LayerParams::Swin(weights))) => {
+                    self.backward_swin_gpu(
+                        layer,
+                        &crate::layers::swin::gpu::geometry(layer, spec),
+                        weights,
+                        grad,
+                        config,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 _ => {
                     return Err(Error::UnsupportedLayer {
                         layer_index: layer.index,

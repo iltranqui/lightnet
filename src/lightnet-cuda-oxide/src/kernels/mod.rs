@@ -46,4 +46,5 @@ pub mod laya;
 pub mod moe;
 pub mod attention;
 pub mod vit;
+pub mod swin;
 pub(crate) mod unroll;

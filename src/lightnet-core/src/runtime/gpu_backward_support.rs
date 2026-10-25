@@ -52,11 +52,18 @@ where
                         return true;
                     }
                 }
+                // `[swin]` activations without a device kind (e.g. `revleaky`)
+                // keep the host forward and the CPU backward fallback.
+                LayerKind::Swin(spec) => {
+                    let geometry = crate::layers::swin::gpu::geometry(layer, spec);
+                    if !crate::layers::swin::gpu::supported(&geometry) {
+                        return true;
+                    }
+                }
                 // Weighted shortcut parameter reductions stay host-resident,
                 // while input/source gradients use backend elementwise ops.
                 // `[laya_act_head]` still uses the host fallback.
                 LayerKind::LayaActHead(_)
-                | LayerKind::Swin(_)
                 | LayerKind::TuckerAttention(_)
                 | LayerKind::MambaVision(_)
                 | LayerKind::KimiKda(_) => return true,
