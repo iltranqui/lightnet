@@ -25,7 +25,7 @@ Whole-repo map: [CONTEXT.md](CONTEXT.md).
 
 ## Which file for which task
 
-- Port or change a layer: `tasks/rust/AGENTS.md`, then `tasks/rust/layer-support.md` and `tasks/rust/layers.md`.
+- Port or change a layer: `src/lightnet-core/src/layers/CONTEXT.md` (layout, wiring, recipe), then `tasks/rust/AGENTS.md`, then `tasks/rust/layer-support.md` and `tasks/rust/layers.md`.
 - GPU layer work: `tasks/rust/gpu_layers_plan.md`.
 - Current state after a context reset: `tasks/rust/STATUS.md`.
 - Touch a crate: its `CONTEXT.md` first.

@@ -1,6 +1,6 @@
 # Layer map (branch `rust`)
 
-Per layer directory under `src/lightnet-core/src/layers/`: which files hold the CPU reference and the GPU runtime glue, which `lightnet-cuda-oxide` kernel file holds its device kernels, and which Oxide test covers it. Generated from the file tree; a `-` means no dedicated file of that kind (kernels may then live in a shared file such as `conv_direct.rs`, `elementwise.rs` or `layers_extra.rs`, and parity may be covered by `oxide_runtime_chain.rs`, `oxide_runtime_f16.rs`, `oxide_parity.rs` or `oxide_layers_extra.rs`). This file records layout only, not completeness: completeness per kind lives in [layer-support.md](layer-support.md).
+Per layer directory under `src/lightnet-core/src/layers/`: which files hold the CPU reference and the GPU runtime glue, which `lightnet-cuda-oxide` kernel file holds its device kernels, and which Oxide test covers it. Maintained by hand from the file tree (no generator yet); update it when a layer directory or file appears. The layout contract is in `src/lightnet-core/src/layers/CONTEXT.md`. A `-` means no dedicated file of that kind (kernels may then live in a shared file such as `conv_direct.rs`, `elementwise.rs` or `layers_extra.rs`, and parity may be covered by `oxide_runtime_chain.rs`, `oxide_runtime_f16.rs`, `oxide_parity.rs` or `oxide_layers_extra.rs`). This file records layout only, not completeness: completeness per kind lives in [layer-support.md](layer-support.md).
 
 ## Contents
 

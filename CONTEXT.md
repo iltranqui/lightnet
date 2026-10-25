@@ -40,7 +40,7 @@ Each crate's role, responsibilities and constraints are in `src/<crate>/CONTEXT.
 
 ## State and roadmap
 
-`tasks/` is listed in `.git/info/exclude`: only `STATUS.md`, `todo.md`, `layers.md`, `lessons.md`, `fp8_fp4.md` are tracked; other files are local and need `git add -f`.
+Most files in `tasks/rust/` are tracked. Check with `git ls-files tasks/rust/<file>`; only an untracked file needs `git add -f`.
 
 | Need | File |
 |---|---|

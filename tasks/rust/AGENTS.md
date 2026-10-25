@@ -74,23 +74,9 @@ This section defines where each layer's code lives and when a layer is finished.
 
 ### Layout
 
-Each layer's host and device code are grouped by layer, in two crates because `lightnet-cuda-oxide` depends on `lightnet-core` and so cannot hold CPU code:
+The layout contract (folder shape, where each piece plugs in, the add-or-finish recipe and the verify commands) lives in `src/lightnet-core/src/layers/CONTEXT.md`. Read it before touching a layer; it is not repeated here.
 
-```
-src/lightnet-core/src/layers/<layer>/
-  mod.rs   re-exports cpu::*; lib.rs re-exports the layer at its old path
-  cpu.rs   host reference: spec use, forward, exact backward, weights, optimizer arms
-  gpu.rs   device runtime glue: GpuExecutableNetwork methods for full and compact
-           forward, backward and update (present once the layer's arms are moved)
-src/lightnet-cuda/src/host_ops.rs      host math shared with the backend trait defaults
-src/lightnet-cuda-oxide/src/kernels/   device kernels, one file per layer as they are split
-src/lightnet-cuda-oxide/tests/oxide_<layer>.rs   CPU-versus-GPU parity for that layer
-```
-
-- `src/lightnet-cuda-oxide` stays outside the workspace and builds only through `cargo xtask oxide`.
 - `tasks/rust/layer-map.md` lists, per layer, its CPU file, GPU glue, kernel file and parity test.
-- Keep every old path working through re-exports, so moving a layer never forces edits elsewhere.
-- Widen visibility only as far as needed (`pub(crate)`); never widen to `pub` just to compile.
 
 ### Layer Completion Contract
 
@@ -111,7 +97,7 @@ Status on 2026-10-24, each move a refactor commit without a version tag (`refact
 - Done, host code: every layer module that was in `lightnet-core/src` is under `layers/<layer>/cpu.rs`.
 - Done, device glue in `layers/<layer>/gpu.rs`: `dcnv4`, `hyperbolic_foveation`, `laya_act_head`, `laya_encoder`, `laya_head`, `laya_scorer`, `vit`, `swin`, `tucker_attention`, `mambavision`, `kimi_kda`, `laya_marker_gather`, `channel_slice`, `channel_shuffle`, `route`, `pool` (max, local average, average), `upsample`, `reorg`, `softmax`, `scale_channels`, `sam`, `shortcut`, `crop`, `local`, `connected`, `deconvolutional`, `eml_convolutional`, `moe`, `foveation_film`, `dsconv`, `deform_conv`, `graph_conv`, `rnn`, `lstm`, `crnn`, `gru`, `convolutional` and `batch_norm` (with the shared batch-norm helpers). For the five transformer layers and `vit`, only the host-fallback forward arm and, for `vit`, the native inference path have moved so far.
 - Done: no full forward arm remains inline in `runtime/gpu_forward.rs` except pass-throughs. The `yolo` family (`yolo`, `obb_yolo`, `gaussian_yolo`, `detection`, `cost`, `regression`, `omd_loss`, `contrastive`) has no forward arm to move: it is a pass-through.
-- Done, compact arms in `runtime/gpu_forward_compact.rs` (`gpu.rs` `forward_<layer>_compact_gpu`): `convolutional`, `deconvolutional`, `graph_conv`, `connected`, `route`, `scale_channels`, `channel_slice`, `reorg`, `laya_marker_gather`, `laya_act_head`, `shortcut`, `sam`; the pool and `upsample` compact arms reuse the f32 methods. Open: the other compact arms (thin delegations). Done, backward arms (`backward_<layer>_gpu`): `batch_norm`, `maxpool`, `local_avgpool`, `avgpool`, `crop`, `route`, `laya_marker_gather`, `upsample`, `softmax`, `channel_slice`, `channel_shuffle`, `reorg`, `sam`, `scale_channels`, `rnn`, `lstm`, `crnn`, `dcnv4`, `dsconv`, `local`, `deconvolutional`, `connected`, `eml_convolutional`, `graph_conv`, `shortcut` (weighted and plain), `moe`, `convolutional`, `deform_conv`, `foveation_film`, `hyperbolic_foveation`. Open: the remaining backward arms (`region`, `dropout`) in `runtime/gpu_backward.rs`. Move backward one layer per commit and run that layer's Oxide parity suite before committing.
+- Done, compact arms in `runtime/gpu_forward_compact.rs` (`gpu.rs` `forward_<layer>_compact_gpu`): `convolutional`, `deconvolutional`, `graph_conv`, `connected`, `route`, `scale_channels`, `channel_slice`, `reorg`, `laya_marker_gather`, `laya_act_head`, `shortcut`, `sam`; the pool and `upsample` compact arms reuse the f32 methods. Open: the other compact arms (thin delegations). Done, backward arms (`backward_<layer>_gpu`): `batch_norm`, `maxpool`, `local_avgpool`, `avgpool`, `crop`, `route`, `laya_marker_gather`, `upsample`, `softmax`, `channel_slice`, `channel_shuffle`, `reorg`, `sam`, `scale_channels`, `rnn`, `lstm`, `crnn`, `dcnv4`, `dsconv`, `local`, `deconvolutional`, `connected`, `eml_convolutional`, `graph_conv`, `shortcut` (weighted and plain), `moe`, `convolutional`, `deform_conv`, `foveation_film`, `hyperbolic_foveation`, `region`, `dropout`. No backward arm remains open in `runtime/gpu_backward.rs`. Move backward one layer per commit and run that layer's Oxide parity suite before committing.
 - Done, device kernels: `kernels/layers_extra.rs` is split per layer into `kernels/*.rs` (wmhf, vit, attention, moe, laya, dense_loss, softmax, reorg, channel_shuffle, dropout, scale_channels, shortcut, recurrent, eml, normalize_channels), kernel names and signatures unchanged.
 - Open, backend methods: split the `OxideBackend` methods in `lightnet-cuda-oxide/src/lib.rs` per layer.
 - Done, `layer-map.md`: written (layout only; regenerate from the file tree when layers move).
