@@ -1,3 +1,17 @@
+//! Native `[wmhf]` f32: per-primitive parity against host references, and
+//! end-to-end `GpuExecutableNetwork<OxideBackend>` against the Rust CPU
+//! reference for inference, the native training forward, the native backward
+//! (input gradient, staged parameter gradients, BN rolling statistics) and
+//! the following host-staged SGD step.
+//!
+//! Runtime tolerances are relative to `max(1, max |reference|)`: 2e-4 for
+//! outputs and 5e-4 for gradients, rolling statistics and updated parameters
+//! (device convolution, batch-norm and scan reductions sum in a different
+//! order from the host loops). Rust CPU parity only, no compiled-C++ golden.
+use lightnet_core::{
+    ConfigFile, ExecutableNetwork, GpuExecutableNetwork, LayerParams, LayerTrainBuffers, Network,
+    Tensor,
+};
 use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
 use lightnet_cuda_oxide::OxideBackend;
 
@@ -210,6 +224,7 @@ fn wmhf_gate_forward_backward_matches_cpu_and_trait_dispatch() {
             &projected_device,
             shortcut_input,
             scale,
+            &shape,
             config,
         )
         .expect("native WMHF gate forward");
@@ -229,6 +244,7 @@ fn wmhf_gate_forward_backward_matches_cpu_and_trait_dispatch() {
                 &projected_device,
                 scale,
                 use_shortcut,
+                &shape,
                 config,
             )
             .expect("native WMHF gate backward");
@@ -660,5 +676,214 @@ fn wmhf_haar_dwt_f32_matches_nchw_reference_on_odd_non_square_batches() {
                 "{name}[{index}]: got {actual}, want {want}"
             );
         }
+    }
+}
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> f32 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.0 >> 40) as f32) / ((1u64 << 24) as f32) - 0.5
+    }
+
+    fn vec(&mut self, n: usize) -> Vec<f32> {
+        (0..n).map(|_| self.next()).collect()
+    }
+}
+
+fn close(name: &str, got: &[f32], want: &[f32], tol: f32) {
+    assert_eq!(got.len(), want.len(), "{name}: length");
+    let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!((g - w).abs() <= tol * scale, "{name}[{i}]: got {g}, want {w}");
+    }
+}
+
+/// A one-layer `[wmhf]` CPU network with seeded parameters for every block.
+fn wmhf_network(cfg: &str) -> ExecutableNetwork {
+    let cfg = ConfigFile::parse_str("native-wmhf.cfg", cfg).unwrap();
+    let mut cpu = ExecutableNetwork::new(Network::from_config(cfg).unwrap());
+    let LayerParams::Wmhf(params) = &mut cpu.params[0] else {
+        panic!("expected WMHF params")
+    };
+    let mut rng = Rng(0x5EED_57A7);
+    for conv in [
+        &mut params.pre,
+        &mut params.local_dw3,
+        &mut params.local_dw5,
+        &mut params.local_dw7,
+        &mut params.local_mix,
+        &mut params.hf_gate,
+        &mut params.fuse,
+    ] {
+        for value in conv.weights.iter_mut() {
+            *value = 0.4 * rng.next();
+        }
+        for value in conv.biases.iter_mut() {
+            *value = 0.2 * rng.next();
+        }
+        if let Some(batch_norm) = &mut conv.batch_norm {
+            for value in batch_norm.scales.iter_mut() {
+                *value = 1.0 + 0.3 * rng.next();
+            }
+            for value in batch_norm.rolling_mean.iter_mut() {
+                *value = 0.2 * rng.next();
+            }
+            for value in batch_norm.rolling_variance.iter_mut() {
+                *value = 1.0 + 0.5 * rng.next();
+            }
+        }
+    }
+    for value in params.scan_weights.iter_mut() {
+        *value = rng.next();
+    }
+    cpu
+}
+
+fn wmhf_input(cpu: &ExecutableNetwork, seed: u64) -> Tensor {
+    let shape = cpu.network.net.input_shape();
+    Tensor::from_data(shape, Rng(seed).vec(shape.batch * shape.element_count())).unwrap()
+}
+
+fn wmhf_updates(buffers: &LayerTrainBuffers) -> Vec<f32> {
+    let LayerTrainBuffers::Wmhf(train) = buffers else {
+        panic!("expected WMHF train buffers")
+    };
+    let mut blob = Vec::new();
+    for conv in [
+        &train.pre,
+        &train.local_dw3,
+        &train.local_dw5,
+        &train.local_dw7,
+        &train.local_mix,
+        &train.hf_gate,
+        &train.fuse,
+    ] {
+        blob.extend_from_slice(&conv.weight_updates);
+        blob.extend_from_slice(&conv.bias_updates);
+        if let Some(batch_norm) = &conv.batch_norm {
+            blob.extend_from_slice(&batch_norm.scale_updates);
+        }
+    }
+    blob.extend_from_slice(&train.scan_weight_updates);
+    blob
+}
+
+/// Weights, biases, BN scales and rolling statistics, and scan weights.
+fn wmhf_blob(params: &LayerParams) -> Vec<f32> {
+    let LayerParams::Wmhf(params) = params else {
+        panic!("expected WMHF params")
+    };
+    let mut blob = Vec::new();
+    for conv in [
+        &params.pre,
+        &params.local_dw3,
+        &params.local_dw5,
+        &params.local_dw7,
+        &params.local_mix,
+        &params.hf_gate,
+        &params.fuse,
+    ] {
+        blob.extend_from_slice(&conv.weights);
+        blob.extend_from_slice(&conv.biases);
+        if let Some(batch_norm) = &conv.batch_norm {
+            blob.extend_from_slice(&batch_norm.scales);
+            blob.extend_from_slice(&batch_norm.rolling_mean);
+            blob.extend_from_slice(&batch_norm.rolling_variance);
+        }
+    }
+    blob.extend_from_slice(&params.scan_weights);
+    blob
+}
+
+// `filters=8`, 8 input channels: identity 2, local 3, global 3, shortcut used,
+// batch-norm sub-convolutions, odd non-square plane.
+const WMHF_BN_SHORTCUT: &str = "[net]\nbatch=2\nwidth=5\nheight=3\nchannels=8\n[wmhf]\nfilters=8\nbatch_normalize=1\nshortcut=1\nactivation=leaky\n";
+// No identity channels (route concat without the projected slice), no BN,
+// no shortcut (input channels differ), swish output.
+const WMHF_NO_IDENTITY: &str = "[net]\nbatch=2\nwidth=4\nheight=4\nchannels=3\n[wmhf]\nfilters=6\nidentity_ratio=0\nbatch_normalize=0\nshortcut=1\nfreq_scale=0.4\nactivation=swish\n";
+// Plane larger than the 7x7 depthwise kernel, linear output, BN and shortcut.
+const WMHF_WIDE: &str = "[net]\nbatch=2\nwidth=9\nheight=7\nchannels=4\n[wmhf]\nfilters=4\nbatch_normalize=1\nshortcut=1\nactivation=linear\n";
+
+fn wmhf_inference_check(cfg: &str) {
+    let cpu = wmhf_network(cfg);
+    let input = wmhf_input(&cpu, 99);
+    let expected = cpu.forward(&input).unwrap().final_output().unwrap().clone();
+    let mut gpu = GpuExecutableNetwork::new(cpu.network.clone(), OxideBackend::new().unwrap());
+    gpu.params = cpu.params.clone();
+    let actual = gpu.forward(&input).unwrap().final_output().unwrap().clone();
+    assert_eq!(actual.shape, expected.shape, "{cfg}");
+    close("WMHF inference", &actual.data, &expected.data, 2e-4);
+}
+
+#[test]
+fn wmhf_native_inference_forward_matches_cpu() {
+    for cfg in [WMHF_BN_SHORTCUT, WMHF_NO_IDENTITY, WMHF_WIDE] {
+        wmhf_inference_check(cfg);
+    }
+}
+
+/// Native training forward, native backward (input gradient, staged parameter
+/// gradients, BN rolling statistics) and the host-staged SGD step.
+fn wmhf_train_check(cfg: &str) {
+    let mut cpu = wmhf_network(cfg);
+    let input = wmhf_input(&cpu, 5);
+    let mut gpu = GpuExecutableNetwork::new(cpu.network.clone(), OxideBackend::new().unwrap());
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().unwrap();
+
+    let cpu_forward = cpu.forward_training(&input).unwrap();
+    let gpu_state = gpu.forward_training_with_state(&input).unwrap();
+    let expected = cpu_forward.final_output().unwrap().clone();
+    let actual = gpu_state.cpu_forward.final_output().unwrap().clone();
+    close("WMHF training forward", &actual.data, &expected.data, 2e-4);
+
+    let mut rng = Rng(17);
+    let seed = Tensor::from_data(expected.shape, rng.vec(expected.data.len())).unwrap();
+    let seeds = [Some(seed)];
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().unwrap();
+    let cpu_backward = cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds).unwrap();
+    let gpu_input_gradient = gpu
+        .backward_accumulate_seeded_gpu_with_input_gradient(&gpu_state, &seeds)
+        .unwrap()
+        .expect("native WMHF input gradient");
+    close(
+        "WMHF input gradient",
+        &gpu_input_gradient.data,
+        &cpu_backward.input_gradient.data,
+        5e-4,
+    );
+    close(
+        "WMHF staged gradients",
+        &wmhf_updates(&gpu.host_fallback_train_buffers()[0]),
+        &wmhf_updates(&cpu.train_buffers[0]),
+        5e-4,
+    );
+    close(
+        "WMHF rolling statistics",
+        &wmhf_blob(&gpu.params[0]),
+        &wmhf_blob(&cpu.params[0]),
+        5e-4,
+    );
+
+    cpu.update_weights(0.01, 0.9, 0.0005, 2);
+    gpu.update_weights_gpu(0.01, 0.9, 0.0005, 2).unwrap();
+    close(
+        "WMHF updated parameters",
+        &wmhf_blob(&gpu.params[0]),
+        &wmhf_blob(&cpu.params[0]),
+        5e-4,
+    );
+}
+
+#[test]
+fn wmhf_native_training_backward_and_update_match_cpu() {
+    for cfg in [WMHF_BN_SHORTCUT, WMHF_NO_IDENTITY, WMHF_WIDE] {
+        wmhf_train_check(cfg);
     }
 }

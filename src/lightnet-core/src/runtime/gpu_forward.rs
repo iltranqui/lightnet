@@ -84,34 +84,12 @@ where
             .network
             .layers
             .iter()
-            .find(|layer| matches!(layer.kind, LayerKind::Wmhf(_)))
-        {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "[wmhf] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
-            });
-        }
-        if let Some(layer) = self
-            .network
-            .layers
-            .iter()
             .find(|layer| matches!(layer.kind, LayerKind::RecursiveBlock(_)))
         {
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
                 name: "[recursive_block] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path"
                     .to_owned(),
-            });
-        }
-        if let Some(layer) = self
-            .network
-            .layers
-            .iter()
-            .find(|layer| matches!(layer.kind, LayerKind::Clifford(_)))
-        {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "[clifford] GPU execution is not implemented in the Stage-1 CPU port; use the CPU forward path".to_owned(),
             });
         }
         if let Some(layer) = self
@@ -157,6 +135,14 @@ where
         let mut gpu_dcnv4_caches = Vec::with_capacity(self.network.layers.len());
         let mut deform_conv_caches = Vec::with_capacity(self.network.layers.len());
         let mut deform_device_caches = Vec::with_capacity(self.network.layers.len());
+        // `[wmhf]` slots are written by index in its arm: the host cache feeds
+        // the CPU backward fallback, the device cache the native backward.
+        let mut wmhf_caches: Vec<Option<WmhfRuntimeCache>> = vec![None; self.network.layers.len()];
+        let mut wmhf_device_caches: Vec<
+            Option<crate::layers::wmhf::gpu::DeviceCache<B::Tensor>>,
+        > = vec![None; self.network.layers.len()];
+        let mut clifford_caches = vec![None; self.network.layers.len()];
+        let mut clifford_device_caches = vec![None; self.network.layers.len()];
         let mut vit_device_caches = Vec::with_capacity(self.network.layers.len());
         let mut swin_device_caches = Vec::with_capacity(self.network.layers.len());
         let mut vit_caches: Vec<Option<crate::vit::VitForwardCache>> =
@@ -575,6 +561,52 @@ where
                     deform_device_cache = forward.device_cache;
                     deform_conv_cache = forward.host_cache;
                     forward.output
+                }
+                // Native when the network takes the native backward and the
+                // activation has a device kernel; otherwise the host reference.
+                (LayerKind::Wmhf(spec), LayerParams::Wmhf(params)) => {
+                    let forward = self.forward_wmhf_gpu(
+                        layer,
+                        spec,
+                        params,
+                        current_input,
+                        training,
+                        deform_device,
+                        launch_config,
+                    )?;
+                    activation_input_gpu = Some(forward.activation_input);
+                    wmhf_caches[layer.index] = forward.host_cache;
+                    wmhf_device_caches[layer.index] = forward.device_cache;
+                    forward.output
+                }
+                (LayerKind::Clifford(spec), LayerParams::Clifford(params)) => {
+                    let mask = if training && spec.drop_path > 0.0 {
+                        let keep = 1.0 - spec.drop_path;
+                        (0..layer.input_shape.batch)
+                            .map(|_| {
+                                if next_random_unit(&mut rng_state) < keep {
+                                    1.0 / keep
+                                } else {
+                                    0.0
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![1.0; layer.input_shape.batch]
+                    };
+                    let (output, device_cache, host_cache) = self.forward_clifford_gpu(
+                        layer,
+                        spec,
+                        params,
+                        current_input,
+                        training,
+                        deform_device,
+                        &mask,
+                        launch_config,
+                    )?;
+                    clifford_device_caches[layer.index] = device_cache;
+                    clifford_caches[layer.index] = host_cache;
+                    output
                 }
                 (LayerKind::Vit(spec), LayerParams::Vit(weights))
                     if (!training || vit_device_training)
@@ -1068,7 +1100,9 @@ where
         }
 
         *self.deform_device_caches.borrow_mut() = deform_device_caches;
+        *self.clifford_device_caches.borrow_mut() = clifford_device_caches;
         *self.vit_device_caches.borrow_mut() = vit_device_caches;
+        *self.wmhf_device_caches.borrow_mut() = wmhf_device_caches;
         *self.swin_device_caches.borrow_mut() = swin_device_caches;
         Ok(GpuForwardState {
             input_gpu,
@@ -1093,8 +1127,8 @@ where
                 deform_conv_caches,
                 dsconv_caches: vec![None; self.network.layers.len()],
                 graph_conv_caches,
-                wmhf_caches: vec![None; self.network.layers.len()],
-                clifford_caches: vec![None; self.network.layers.len()],
+                wmhf_caches,
+                clifford_caches,
                 recursive_block_caches: vec![None; self.network.layers.len()],
                 hyperbolic_foveation_caches,
                 foveation_film_caches,

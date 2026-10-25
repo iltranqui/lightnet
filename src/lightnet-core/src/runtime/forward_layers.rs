@@ -283,7 +283,7 @@ pub(crate) fn backward_wmhf_convolution(
     ))
 }
 
-pub(super) fn forward_wmhf_with_cache(
+pub(crate) fn forward_wmhf_with_cache(
     spec: &crate::model::WmhfSpec,
     params: &WmhfParams,
     input: &Tensor,

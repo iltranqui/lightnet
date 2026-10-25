@@ -39,6 +39,7 @@ pub mod shortcut;
 pub mod scale_channels;
 pub mod dropout;
 pub mod channel_shuffle;
+pub mod clifford;
 pub mod reorg;
 pub mod softmax;
 pub mod dense_loss;

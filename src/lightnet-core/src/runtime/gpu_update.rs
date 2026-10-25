@@ -1006,34 +1006,11 @@ where
             .network
             .layers
             .iter()
-            .find(|layer| matches!(layer.kind, LayerKind::Wmhf(_)))
-        {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "[wmhf] GPU updates are not implemented in the Stage-1 CPU port".to_owned(),
-            });
-        }
-        if let Some(layer) = self
-            .network
-            .layers
-            .iter()
             .find(|layer| matches!(layer.kind, LayerKind::RecursiveBlock(_)))
         {
             return Err(Error::UnsupportedLayer {
                 layer_index: layer.index,
                 name: "[recursive_block] GPU updates are not implemented in the Stage-1 CPU port"
-                    .to_owned(),
-            });
-        }
-        if let Some(layer) = self
-            .network
-            .layers
-            .iter()
-            .find(|layer| matches!(layer.kind, LayerKind::Clifford(_)))
-        {
-            return Err(Error::UnsupportedLayer {
-                layer_index: layer.index,
-                name: "[clifford] GPU updates are not implemented in the Stage-1 CPU port"
                     .to_owned(),
             });
         }
@@ -1059,6 +1036,7 @@ where
                         | LayerParams::Gru(_)
                         | LayerParams::Vit(_)
                         | LayerParams::Swin(_)
+                        | LayerParams::Clifford(_)
                         | LayerParams::TuckerAttention(_)
                         | LayerParams::MambaVision(_)
                         | LayerParams::KimiKda(_)
@@ -1072,10 +1050,11 @@ where
                         | LayerParams::DeformConv(_)
                         | LayerParams::DsConv(_)
                         | LayerParams::GraphConv(_)
+                        | LayerParams::Wmhf(_)
                 )
             }) {
                 return Err(Error::InvalidConfig(
-                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, deform_conv, DSConv, DCNv4, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, Kimi KDA, GraphConv, GRU/RNN/LSTM/CRNN, and host-updated HF/FiLM layers"
+                    "adam=1 on the GPU path supports convolutional, connected, local, shortcut, deform_conv, DSConv, DCNv4, MoE, standalone batchnorm, ViT, Swin, Tucker attention, MambaVision, Kimi KDA, GraphConv, GRU/RNN/LSTM/CRNN, and host-updated HF/FiLM/WMHF layers"
                         .to_string(),
                 ));
             }
@@ -1407,7 +1386,14 @@ where
                 | (
                     params @ LayerParams::FoveationFilm(_),
                     train @ LayerTrainBuffers::FoveationFilm(_),
-                ) => {
+                )
+                | (
+                    params @ LayerParams::Clifford(_),
+                    train @ LayerTrainBuffers::Clifford(_),
+                )
+                // `[wmhf]` gradients are staged by its native backward; the
+                // update stays host-side with the CPU Adam arm.
+                | (params @ LayerParams::Wmhf(_), train @ LayerTrainBuffers::Wmhf(_)) => {
                     let moments =
                         moments_all[index].get_or_insert_with(HostAdamLayerState::default);
                     apply_host_adam_layer(
@@ -2088,6 +2074,23 @@ where
                         learned_pos,
                     );
                 }
+                (LayerParams::Clifford(params), LayerTrainBuffers::Clifford(train)) => {
+                    let LayerKind::Clifford(spec) = &layer.kind else {
+                        return Err(Error::InvalidConfig(
+                            "Clifford parameters do not match layer kind during GPU update".to_owned(),
+                        ));
+                    };
+                    // Native backward stages positive gradients, as the CPU.
+                    update_clifford_params(
+                        spec,
+                        params,
+                        train,
+                        lr * layer.train.learning_rate_scale,
+                        momentum,
+                        decay,
+                        batch,
+                    );
+                }
                 (LayerParams::Swin(params), LayerTrainBuffers::Swin(train)) => {
                     update_swin_params(
                         params,
@@ -2242,6 +2245,30 @@ where
                         layer_lr * 0.01,
                         momentum,
                         0.0,
+                        batch,
+                    );
+                }
+                // Host-staged `[wmhf]` update, the CPU `update_weights` arm:
+                // the sub-convolutions take the network rate and only the scan
+                // weights take the layer's `learning_rate` scale.
+                (LayerParams::Wmhf(params), LayerTrainBuffers::Wmhf(train)) => {
+                    for (conv, updates) in [
+                        (&mut params.pre, &mut train.pre),
+                        (&mut params.local_dw3, &mut train.local_dw3),
+                        (&mut params.local_dw5, &mut train.local_dw5),
+                        (&mut params.local_dw7, &mut train.local_dw7),
+                        (&mut params.local_mix, &mut train.local_mix),
+                        (&mut params.hf_gate, &mut train.hf_gate),
+                        (&mut params.fuse, &mut train.fuse),
+                    ] {
+                        update_convolutional_params(conv, updates, lr, momentum, decay, batch);
+                    }
+                    sgd_update(
+                        &mut params.scan_weights,
+                        &mut train.scan_weight_updates,
+                        lr * layer.train.learning_rate_scale,
+                        momentum,
+                        decay,
                         batch,
                     );
                 }

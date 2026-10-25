@@ -18,6 +18,11 @@ where
                     }
                 }
                 LayerKind::Lstm(_) => {}
+                LayerKind::Clifford(spec) => {
+                    if crate::layers::clifford::gpu::needs_host(spec) {
+                        return true;
+                    }
+                }
                 LayerKind::Crnn(spec) => {
                     if spec.activation.to_cuda_f32_kind().is_none() {
                         return true;
@@ -86,6 +91,11 @@ where
                     }
                 }
                 LayerKind::GraphConv(spec) if graph_conv_spec_needs_host(spec) => return true,
+                // `[wmhf]` activations without a device kind keep the host
+                // forward and the CPU backward fallback.
+                LayerKind::Wmhf(spec) if crate::layers::wmhf::gpu::needs_host(spec) => {
+                    return true;
+                }
                 _ => {}
             }
             if let LayerKind::ScaleChannels(spec) = &layer.kind

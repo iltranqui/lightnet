@@ -705,7 +705,11 @@ pub(crate) fn backward(
     Ok((input_gradient, gradients))
 }
 
-fn validate_params(spec: &CliffordSpec, params: &CliffordParams, shape: TensorShape) -> Result<()> {
+pub(crate) fn validate_params(
+    spec: &CliffordSpec,
+    params: &CliffordParams,
+    shape: TensorShape,
+) -> Result<()> {
     let channels = shape.channels;
     let raw = raw_channels(spec, channels);
     let bad = |name: &str| {

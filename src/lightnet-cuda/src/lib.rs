@@ -2697,8 +2697,17 @@ pub trait F32TensorOpsBackend {
         width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
-        let _ = (input, batch, channels, height, width, config);
-        panic!("wmhf_haar_dwt_f32 is not implemented by this CUDA backend")
+        let _ = config;
+        let [ll, lh, hl, hh] =
+            host_ops::wmhf::haar_dwt(&self.download_f32(input)?, batch, channels, height, width)
+                .unwrap_or_else(|err| panic!("{err}"));
+        let shape = [batch, channels, height.div_ceil(2), width.div_ceil(2)];
+        Ok((
+            self.upload_f32(&shape, &ll)?,
+            self.upload_f32(&shape, &lh)?,
+            self.upload_f32(&shape, &hl)?,
+            self.upload_f32(&shape, &hh)?,
+        ))
     }
     /// Exact input adjoint of WMHF Haar DWT.
     fn wmhf_haar_dwt_backward_f32(
@@ -2713,10 +2722,19 @@ pub trait F32TensorOpsBackend {
         width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let _ = (
-            ll_grad, lh_grad, hl_grad, hh_grad, batch, channels, height, width, config,
-        );
-        panic!("wmhf_haar_dwt_backward_f32 is not implemented by this CUDA backend")
+        let _ = config;
+        let values = host_ops::wmhf::haar_dwt_backward(
+            &self.download_f32(ll_grad)?,
+            &self.download_f32(lh_grad)?,
+            &self.download_f32(hl_grad)?,
+            &self.download_f32(hh_grad)?,
+            batch,
+            channels,
+            height,
+            width,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(&[batch, channels, height, width], &values)
     }
     /// Native WMHF Haar synthesis and its exact input-gradient adjoint.
     fn wmhf_haar_iwt_f32(
@@ -2731,8 +2749,8 @@ pub trait F32TensorOpsBackend {
         width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let _ = (ll, lh, hl, hh, batch, channels, height, width, config);
-        panic!("wmhf_haar_iwt_f32 is not implemented by this CUDA backend")
+        // Haar synthesis is the transpose of the analysis transform.
+        self.wmhf_haar_dwt_backward_f32(ll, lh, hl, hh, batch, channels, height, width, config)
     }
     fn wmhf_haar_iwt_backward_f32(
         &self,
@@ -2743,8 +2761,8 @@ pub trait F32TensorOpsBackend {
         width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
-        let _ = (output_grad, batch, channels, height, width, config);
-        panic!("wmhf_haar_iwt_backward_f32 is not implemented by this CUDA backend")
+        // The synthesis adjoint is the analysis transform itself.
+        self.wmhf_haar_dwt_f32(output_grad, batch, channels, height, width, config)
     }
     /// Four-direction WMHF EMA scan forward and exact input/weight adjoint.
     fn wmhf_scan4_forward_f32(
@@ -2757,8 +2775,17 @@ pub trait F32TensorOpsBackend {
         width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let _ = (input, weights, batch, channels, height, width, config);
-        panic!("wmhf_scan4_forward_f32 is not implemented by this CUDA backend")
+        let _ = config;
+        let values = host_ops::wmhf::scan4_forward(
+            &self.download_f32(input)?,
+            &self.download_f32(weights)?,
+            batch,
+            channels,
+            height,
+            width,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(&[batch, channels, height, width], &values)
     }
     fn wmhf_scan4_backward_f32(
         &self,
@@ -2771,17 +2798,21 @@ pub trait F32TensorOpsBackend {
         width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
-        let _ = (
-            input,
-            output_grad,
-            weights,
+        let _ = config;
+        let (input_grad, weight_grad) = host_ops::wmhf::scan4_backward(
+            &self.download_f32(input)?,
+            &self.download_f32(output_grad)?,
+            &self.download_f32(weights)?,
             batch,
             channels,
             height,
             width,
-            config,
-        );
-        panic!("wmhf_scan4_backward_f32 is not implemented by this CUDA backend")
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        Ok((
+            self.upload_f32(&[batch, channels, height, width], &input_grad)?,
+            self.upload_f32(&[4, channels], &weight_grad)?,
+        ))
     }
     /// High-frequency WMHF magnitude sum and nearest-tile upsampling.
     fn wmhf_high_frequency_forward_f32(
@@ -2795,8 +2826,18 @@ pub trait F32TensorOpsBackend {
         width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let _ = (lh, hl, hh, batch, channels, height, width, config);
-        panic!("wmhf_high_frequency_forward_f32 is not implemented by this CUDA backend")
+        let _ = config;
+        let values = host_ops::wmhf::high_frequency_forward(
+            &self.download_f32(lh)?,
+            &self.download_f32(hl)?,
+            &self.download_f32(hh)?,
+            batch,
+            channels,
+            height,
+            width,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(&[batch, channels, height, width], &values)
     }
     fn wmhf_high_frequency_backward_f32(
         &self,
@@ -2810,18 +2851,24 @@ pub trait F32TensorOpsBackend {
         width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
-        let _ = (
-            output_grad,
-            lh,
-            hl,
-            hh,
+        let _ = config;
+        let [lh_grad, hl_grad, hh_grad] = host_ops::wmhf::high_frequency_backward(
+            &self.download_f32(output_grad)?,
+            &self.download_f32(lh)?,
+            &self.download_f32(hl)?,
+            &self.download_f32(hh)?,
             batch,
             channels,
             height,
             width,
-            config,
-        );
-        panic!("wmhf_high_frequency_backward_f32 is not implemented by this CUDA backend")
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        let shape = [batch, channels, height.div_ceil(2), width.div_ceil(2)];
+        Ok((
+            self.upload_f32(&shape, &lh_grad)?,
+            self.upload_f32(&shape, &hl_grad)?,
+            self.upload_f32(&shape, &hh_grad)?,
+        ))
     }
     /// Gather a contiguous NCHW channel range for a WMHF branch.
     fn wmhf_split_channels_f32(
@@ -2835,8 +2882,18 @@ pub trait F32TensorOpsBackend {
         count: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let _ = (input, batch, channels, height, width, begin, count, config);
-        panic!("wmhf_split_channels_f32 is not implemented by this CUDA backend")
+        let _ = config;
+        let values = host_ops::wmhf::split_channels(
+            &self.download_f32(input)?,
+            batch,
+            channels,
+            height,
+            width,
+            begin,
+            count,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(&[batch, count, height, width], &values)
     }
     /// ViT patch gather: NCHW input to `[batch * tokens, patch * patch * channels]`
     /// with `(dy, dx, channel)` patch order. Returns `(out_h, out_w, patches)`.
@@ -3113,6 +3170,338 @@ pub trait F32TensorOpsBackend {
         }
         self.upload_f32(&[table], &out)
     }
+    /// Swin window partition: NCHW `[batch, channels, height, width]` to raster
+    /// `[batch * windows * window^2, channels]` rows, with bottom/right zero
+    /// padding to `padded_height x padded_width` and the cyclic shift
+    /// `rows(y, x) = padded[(y + shift) % Hp, (x + shift) % Wp]`. The same
+    /// gather is the adjoint of [`Self::swin_window_unpartition_f32`] with
+    /// `clip = 0`.
+    fn swin_window_partition_f32(
+        &self,
+        input: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        padded_height: usize,
+        padded_width: usize,
+        window: usize,
+        shift: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let host = self.download_f32(input)?;
+        assert_eq!(
+            host.len(),
+            batch * channels * height * width,
+            "swin_window_partition_f32: input length"
+        );
+        let tokens = window * window;
+        let windows_w = padded_width / window;
+        let windows = (padded_height / window) * windows_w;
+        let rows = batch * windows * tokens;
+        let mut out = vec![0.0; rows * channels];
+        for (row, values) in out.chunks_mut(channels).enumerate() {
+            let token = row % tokens;
+            let window_index = row / tokens;
+            let (b, spatial) = (window_index / windows, window_index % windows);
+            let y = (spatial / windows_w) * window + token / window;
+            let x = (spatial % windows_w) * window + token % window;
+            let (sy, sx) = ((y + shift) % padded_height, (x + shift) % padded_width);
+            if sy < height && sx < width {
+                for (c, value) in values.iter_mut().enumerate() {
+                    *value = host[((b * channels + c) * height + sy) * width + sx];
+                }
+            }
+        }
+        self.upload_f32(&[rows, channels], &out)
+    }
+    /// Inverse gather of [`Self::swin_window_partition_f32`]: window rows to
+    /// cropped NCHW `[batch, channels, height, width]`, undoing the cyclic
+    /// shift. `clip > 0` applies the source output constrain (NaN to `-clip`,
+    /// else clamp to `[-clip, clip]`); `clip = 0` is the plain adjoint gather.
+    fn swin_window_unpartition_f32(
+        &self,
+        windows: &Self::Tensor,
+        batch: usize,
+        channels: usize,
+        height: usize,
+        width: usize,
+        padded_height: usize,
+        padded_width: usize,
+        window: usize,
+        shift: usize,
+        clip: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let host = self.download_f32(windows)?;
+        let tokens = window * window;
+        let windows_w = padded_width / window;
+        let spatial_windows = (padded_height / window) * windows_w;
+        assert_eq!(
+            host.len(),
+            batch * spatial_windows * tokens * channels,
+            "swin_window_unpartition_f32: window length"
+        );
+        let mut out = vec![0.0; batch * channels * height * width];
+        for (i, value) in out.iter_mut().enumerate() {
+            let x = i % width;
+            let y = (i / width) % height;
+            let c = (i / (width * height)) % channels;
+            let b = i / (width * height * channels);
+            let py = (y + padded_height - shift) % padded_height;
+            let px = (x + padded_width - shift) % padded_width;
+            let window_index = b * spatial_windows + (py / window) * windows_w + px / window;
+            let token = (py % window) * window + px % window;
+            let v = host[(window_index * tokens + token) * channels + c];
+            *value = if clip > 0.0 {
+                if v.is_nan() { -clip } else { v.clamp(-clip, clip) }
+            } else {
+                v
+            };
+        }
+        self.upload_f32(&[batch, channels, height, width], &out)
+    }
+    /// Swin two-stream mHC mix `skip_scale * skip + branch_scale * branch`
+    /// (no feature clamp, unlike [`Self::vit_mhc_residual_f32`]).
+    fn swin_mhc_residual_f32(
+        &self,
+        skip: &Self::Tensor,
+        branch: &Self::Tensor,
+        skip_scale: f32,
+        branch_scale: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let s = self.download_f32(skip)?;
+        let b = self.download_f32(branch)?;
+        assert_eq!(s.len(), b.len(), "swin_mhc_residual_f32: length mismatch");
+        let out: Vec<f32> = s
+            .iter()
+            .zip(&b)
+            .map(|(&s, &b)| skip_scale * s + branch_scale * b)
+            .collect();
+        self.upload_f32(&[out.len()], &out)
+    }
+    /// Adjoint of [`Self::swin_mhc_residual_f32`]: `(d_skip, d_branch, sums)`
+    /// with `sums = [grad_post_skip, grad_post_branch, grad_mix]`, the three
+    /// reductions of `swin::mhc_residual_backward` (`mix` is the site's `p`,
+    /// `post_*` its `2*sigmoid` scales).
+    fn swin_mhc_residual_backward_f32(
+        &self,
+        skip: &Self::Tensor,
+        branch: &Self::Tensor,
+        grad: &Self::Tensor,
+        skip_scale: f32,
+        branch_scale: f32,
+        mix: f32,
+        post_skip: f32,
+        post_branch: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let s = self.download_f32(skip)?;
+        let b = self.download_f32(branch)?;
+        let g = self.download_f32(grad)?;
+        assert!(
+            s.len() == b.len() && s.len() == g.len(),
+            "swin_mhc_residual_backward_f32: length mismatch"
+        );
+        let ds: Vec<f32> = g.iter().map(|&g| g * skip_scale).collect();
+        let db: Vec<f32> = g.iter().map(|&g| g * branch_scale).collect();
+        let mut sums = [0.0f32; 3];
+        for i in 0..g.len() {
+            sums[0] += g[i] * (mix * s[i] + (1.0 - mix) * b[i]);
+            sums[1] += g[i] * ((1.0 - mix) * s[i] + mix * b[i]);
+            sums[2] += g[i] * (post_skip - post_branch) * (s[i] - b[i]);
+        }
+        Ok((
+            self.upload_f32(&[ds.len()], &ds)?,
+            self.upload_f32(&[db.len()], &db)?,
+            self.upload_f32(&[3], &sums)?,
+        ))
+    }
+    /// Swin windowed attention over fused QKV `[total_windows * window^2,
+    /// 3 * channels]`: Q/K clamp to +-256, `score = dot / sqrt(head_dim) +
+    /// bias[head, rel(q, k)] + mask[window % spatial_windows, q, k]`, clamp to
+    /// +-20, stabilised softmax with a `1e-9` denominator epsilon. Returns the
+    /// context `[rows, channels]`, the probabilities and the score-clamp
+    /// activity (1/0), both `[total_windows, heads, tokens, tokens]`.
+    /// `relative_position_bias` is `[heads, (2 * window - 1)^2]`.
+    fn swin_window_attention_f32(
+        &self,
+        qkv: &Self::Tensor,
+        relative_position_bias: &Self::Tensor,
+        mask: &Self::Tensor,
+        total_windows: usize,
+        spatial_windows: usize,
+        window: usize,
+        channels: usize,
+        heads: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let qkv = self.download_f32(qkv)?;
+        let bias = self.download_f32(relative_position_bias)?;
+        let mask = self.download_f32(mask)?;
+        let constrain = |v: f32, limit: f32| if v.is_nan() { -limit } else { v.clamp(-limit, limit) };
+        let tokens = window * window;
+        let head_dim = channels / heads;
+        let table_width = 2 * window - 1;
+        let table_len = table_width * table_width;
+        let rows = total_windows * tokens;
+        assert_eq!(qkv.len(), rows * 3 * channels, "swin_window_attention_f32: QKV length");
+        assert_eq!(bias.len(), heads * table_len, "swin_window_attention_f32: bias length");
+        assert_eq!(
+            mask.len(),
+            spatial_windows * tokens * tokens,
+            "swin_window_attention_f32: mask length"
+        );
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut context = vec![0.0; rows * channels];
+        let mut probabilities = vec![0.0; total_windows * heads * tokens * tokens];
+        let mut active = vec![0.0; probabilities.len()];
+        for w in 0..total_windows {
+            let mask_base = (w % spatial_windows) * tokens * tokens;
+            for h in 0..heads {
+                for q in 0..tokens {
+                    let row_base = ((w * heads + h) * tokens + q) * tokens;
+                    let qb = (w * tokens + q) * 3 * channels + h * head_dim;
+                    let row = &mut probabilities[row_base..row_base + tokens];
+                    for (k, score) in row.iter_mut().enumerate() {
+                        let kb = (w * tokens + k) * 3 * channels + channels + h * head_dim;
+                        let mut dot = 0.0;
+                        for d in 0..head_dim {
+                            dot += constrain(qkv[qb + d], 256.0) * constrain(qkv[kb + d], 256.0);
+                        }
+                        let dy = q / window + window - 1 - k / window;
+                        let dx = q % window + window - 1 - k % window;
+                        let raw = (dot * scale + bias[h * table_len + dy * table_width + dx])
+                            + mask[mask_base + q * tokens + k];
+                        *score = constrain(raw, 20.0);
+                        active[row_base + k] =
+                            if raw.is_finite() && raw > -20.0 && raw < 20.0 { 1.0 } else { 0.0 };
+                    }
+                    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0;
+                    for value in row.iter_mut() {
+                        *value = (*value - max).exp();
+                        sum += *value;
+                    }
+                    if !sum.is_finite() || sum <= 0.0 {
+                        row.fill(1.0 / tokens as f32);
+                    } else {
+                        let inverse = 1.0 / (sum + 1.0e-9);
+                        for value in row.iter_mut() {
+                            *value *= inverse;
+                        }
+                    }
+                    for d in 0..head_dim {
+                        let mut acc = 0.0;
+                        for k in 0..tokens {
+                            acc += row[k]
+                                * qkv[(w * tokens + k) * 3 * channels + 2 * channels + h * head_dim + d];
+                        }
+                        context[(w * tokens + q) * channels + h * head_dim + d] = acc;
+                    }
+                }
+            }
+        }
+        let matrix_shape = [total_windows, heads, tokens, tokens];
+        Ok((
+            self.upload_f32(&[rows, channels], &context)?,
+            self.upload_f32(&matrix_shape, &probabilities)?,
+            self.upload_f32(&matrix_shape, &active)?,
+        ))
+    }
+    /// Exact piecewise adjoint of [`Self::swin_window_attention_f32`] from its
+    /// probabilities and activity: returns the fused QKV gradient `[rows,
+    /// 3 * channels]` and the relative-position bias gradient summed over
+    /// every window, `[heads, (2 * window - 1)^2]`. Q/K and score clamp
+    /// derivatives are zero outside their open intervals.
+    fn swin_window_attention_backward_f32(
+        &self,
+        qkv: &Self::Tensor,
+        probabilities: &Self::Tensor,
+        active: &Self::Tensor,
+        context_grad: &Self::Tensor,
+        total_windows: usize,
+        window: usize,
+        channels: usize,
+        heads: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        let qkv = self.download_f32(qkv)?;
+        let p = self.download_f32(probabilities)?;
+        let live = self.download_f32(active)?;
+        let dctx = self.download_f32(context_grad)?;
+        let constrain = |v: f32, limit: f32| if v.is_nan() { -limit } else { v.clamp(-limit, limit) };
+        let inside = |v: f32| v.is_finite() && v > -256.0 && v < 256.0;
+        let tokens = window * window;
+        let head_dim = channels / heads;
+        let table_width = 2 * window - 1;
+        let table_len = table_width * table_width;
+        let rows = total_windows * tokens;
+        assert_eq!(qkv.len(), rows * 3 * channels, "swin_window_attention_backward_f32: QKV");
+        assert_eq!(p.len(), total_windows * heads * tokens * tokens, "swin_window_attention_backward_f32: P");
+        assert_eq!(live.len(), p.len(), "swin_window_attention_backward_f32: activity");
+        assert_eq!(dctx.len(), rows * channels, "swin_window_attention_backward_f32: dctx");
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let mut dqkv = vec![0.0; rows * 3 * channels];
+        let mut dbias = vec![0.0; heads * table_len];
+        let mut ds = vec![0.0; tokens * tokens];
+        for w in 0..total_windows {
+            for h in 0..heads {
+                let mb = (w * heads + h) * tokens * tokens;
+                let hc = h * head_dim;
+                for q in 0..tokens {
+                    for k in 0..tokens {
+                        let mut dp = 0.0;
+                        for d in 0..head_dim {
+                            dp += dctx[(w * tokens + q) * channels + hc + d]
+                                * qkv[(w * tokens + k) * 3 * channels + 2 * channels + hc + d];
+                        }
+                        ds[q * tokens + k] = dp;
+                    }
+                    let dot: f32 = (0..tokens)
+                        .map(|k| p[mb + q * tokens + k] * ds[q * tokens + k])
+                        .sum();
+                    for k in 0..tokens {
+                        let i = q * tokens + k;
+                        ds[i] = if live[mb + i] != 0.0 { p[mb + i] * (ds[i] - dot) } else { 0.0 };
+                        let dy = q / window + window - 1 - k / window;
+                        let dx = q % window + window - 1 - k % window;
+                        dbias[h * table_len + dy * table_width + dx] += ds[i];
+                    }
+                }
+                for t in 0..tokens {
+                    let base = (w * tokens + t) * 3 * channels + hc;
+                    for d in 0..head_dim {
+                        let (mut dq, mut dk, mut dv) = (0.0, 0.0, 0.0);
+                        for o in 0..tokens {
+                            let other = (w * tokens + o) * 3 * channels + hc + d;
+                            dq += ds[t * tokens + o] * constrain(qkv[other + channels], 256.0);
+                            dk += ds[o * tokens + t] * constrain(qkv[other], 256.0);
+                            dv += p[mb + o * tokens + t] * dctx[(w * tokens + o) * channels + hc + d];
+                        }
+                        if inside(qkv[base + d]) {
+                            dqkv[base + d] = dq * scale;
+                        }
+                        if inside(qkv[base + channels + d]) {
+                            dqkv[base + channels + d] = dk * scale;
+                        }
+                        dqkv[base + 2 * channels + d] = dv;
+                    }
+                }
+            }
+        }
+        Ok((
+            self.upload_f32(&[rows, 3 * channels], &dqkv)?,
+            self.upload_f32(&[heads * table_len], &dbias)?,
+        ))
+    }
     /// Concatenate WMHF 3x/5x/7x local branch tensors in channel-major order.
     fn wmhf_concat_local_f32(
         &self,
@@ -3125,12 +3514,21 @@ pub trait F32TensorOpsBackend {
         width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let _ = (
-            branch3, branch5, branch7, batch, channels, height, width, config,
-        );
-        panic!("wmhf_concat_local_f32 is not implemented by this CUDA backend")
+        let _ = config;
+        let values = host_ops::wmhf::concat_local(
+            &self.download_f32(branch3)?,
+            &self.download_f32(branch5)?,
+            &self.download_f32(branch7)?,
+            batch,
+            channels,
+            height,
+            width,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(&[batch, 3 * channels, height, width], &values)
     }
-    /// WMHF gated residual fusion and its exact adjoint.
+    /// WMHF gated residual fusion and its exact adjoint. `shape` is the NCHW
+    /// shape shared by every operand and result.
     fn wmhf_apply_gate_f32(
         &self,
         fuse: &Self::Tensor,
@@ -3138,10 +3536,20 @@ pub trait F32TensorOpsBackend {
         projected: &Self::Tensor,
         shortcut: Option<&Self::Tensor>,
         freq_scale: f32,
+        shape: &[usize],
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let _ = (fuse, gate, projected, shortcut, freq_scale, config);
-        panic!("wmhf_apply_gate_f32 is not implemented by this CUDA backend")
+        let _ = config;
+        let shortcut = shortcut.map(|tensor| self.download_f32(tensor)).transpose()?;
+        let values = host_ops::wmhf::apply_gate(
+            &self.download_f32(fuse)?,
+            &self.download_f32(gate)?,
+            &self.download_f32(projected)?,
+            shortcut.as_deref(),
+            freq_scale,
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        self.upload_f32(shape, &values)
     }
     fn wmhf_apply_gate_backward_f32(
         &self,
@@ -3150,17 +3558,25 @@ pub trait F32TensorOpsBackend {
         projected: &Self::Tensor,
         freq_scale: f32,
         use_shortcut: bool,
+        shape: &[usize],
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
-        let _ = (
-            output_grad,
-            gate,
-            projected,
-            freq_scale,
-            use_shortcut,
-            config,
-        );
-        panic!("wmhf_apply_gate_backward_f32 is not implemented by this CUDA backend")
+        let _ = config;
+        let [fuse_grad, gate_grad, projected_grad, shortcut_grad] =
+            host_ops::wmhf::apply_gate_backward(
+                &self.download_f32(output_grad)?,
+                &self.download_f32(gate)?,
+                &self.download_f32(projected)?,
+                freq_scale,
+                use_shortcut,
+            )
+            .unwrap_or_else(|err| panic!("{err}"));
+        Ok((
+            self.upload_f32(shape, &fuse_grad)?,
+            self.upload_f32(shape, &gate_grad)?,
+            self.upload_f32(shape, &projected_grad)?,
+            self.upload_f32(shape, &shortcut_grad)?,
+        ))
     }
     fn upsample_f32(
         &self,
@@ -4672,6 +5088,132 @@ pub trait F32TensorOpsBackend {
             self.upload_f32(shape, &d_source)?,
         ))
     }
+    /// One Clifford rolling block in NCHW order. `pooled` context is `[B,C]`;
+    /// otherwise it has the state shape. Inner blocks apply SiLU to the product.
+    fn clifford_interaction_f32(
+        &self, state: &Self::Tensor, context: &Self::Tensor,
+        batch: usize, channels: usize, spatial: usize, shift: usize,
+        inner: bool, pooled: bool, config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert!(batch > 0 && channels > 0 && spatial > 0);
+        let x = self.download_f32(state)?;
+        let ctx = self.download_f32(context)?;
+        assert_eq!(x.len(), batch * channels * spatial);
+        assert_eq!(ctx.len(), batch * channels * if pooled { 1 } else { spatial });
+        let mut out = vec![0.0; x.len()];
+        let shift = shift % channels;
+        for b in 0..batch {
+            for c in 0..channels {
+                let r = (c + shift) % channels;
+                for p in 0..spatial {
+                    let i = (b * channels + c) * spatial + p;
+                    let j = (b * channels + r) * spatial + p;
+                    let ci = if pooled { b * channels + c } else { i };
+                    let cj = if pooled { b * channels + r } else { j };
+                    let product = x[i] * ctx[cj];
+                    out[i] = if inner { product / (1.0 + (-product).exp()) }
+                        else { product - ctx[ci] * x[j] };
+                }
+            }
+        }
+        self.upload_f32(&[batch, channels, 1, spatial], &out)
+    }
+
+    /// Exact adjoint of one rolling block, returning `(d_state, d_context)`.
+    fn clifford_interaction_backward_f32(
+        &self, state: &Self::Tensor, context: &Self::Tensor, grad: &Self::Tensor,
+        batch: usize, channels: usize, spatial: usize, shift: usize,
+        inner: bool, pooled: bool, config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        assert!(batch > 0 && channels > 0 && spatial > 0);
+        let x = self.download_f32(state)?;
+        let ctx = self.download_f32(context)?;
+        let g = self.download_f32(grad)?;
+        assert_eq!(x.len(), batch * channels * spatial);
+        assert_eq!(g.len(), x.len());
+        assert_eq!(ctx.len(), batch * channels * if pooled { 1 } else { spatial });
+        let mut dx = vec![0.0; x.len()];
+        let mut dc = vec![0.0; ctx.len()];
+        let shift = shift % channels;
+        for b in 0..batch {
+            for c in 0..channels {
+                let r = (c + shift) % channels;
+                for p in 0..spatial {
+                    let i = (b * channels + c) * spatial + p;
+                    let j = (b * channels + r) * spatial + p;
+                    let ci = if pooled { b * channels + c } else { i };
+                    let cj = if pooled { b * channels + r } else { j };
+                    if inner {
+                        let product = x[i] * ctx[cj];
+                        let sig = 1.0 / (1.0 + (-product).exp());
+                        let d = g[i] * (sig + product * sig * (1.0 - sig));
+                        dx[i] += d * ctx[cj];
+                        dc[cj] += d * x[i];
+                    } else {
+                        dx[i] += g[i] * ctx[cj];
+                        dx[j] -= g[i] * ctx[ci];
+                        dc[cj] += g[i] * x[i];
+                        dc[ci] -= g[i] * x[j];
+                    }
+                }
+            }
+        }
+        Ok((self.upload_f32(&[batch, channels, 1, spatial], &dx)?,
+            self.upload_f32(&[batch, channels, 1, if pooled { 1 } else { spatial }], &dc)?))
+    }
+
+    /// Clifford residual `input + mixed * scale[channel] * mask[sample]`.
+    fn clifford_residual_f32(
+        &self, input: &Self::Tensor, mixed: &Self::Tensor, scale: &Self::Tensor,
+        mask: &Self::Tensor, batch: usize, channels: usize, spatial: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        assert!(batch > 0 && channels > 0 && spatial > 0);
+        let mut x = self.download_f32(input)?;
+        let m = self.download_f32(mixed)?;
+        let s = self.download_f32(scale)?;
+        let mask = self.download_f32(mask)?;
+        assert_eq!(x.len(), batch * channels * spatial);
+        assert_eq!(m.len(), x.len());
+        assert_eq!(s.len(), channels);
+        assert_eq!(mask.len(), batch);
+        for i in 0..x.len() {
+            x[i] += m[i] * (s[(i / spatial) % channels] * mask[i / (channels * spatial)]);
+        }
+        self.upload_f32(&[batch, channels, 1, spatial], &x)
+    }
+
+    /// Residual adjoint `(d_mixed, d_scale)`; `d_input` also receives `grad`.
+    fn clifford_residual_backward_f32(
+        &self, mixed: &Self::Tensor, grad: &Self::Tensor, scale: &Self::Tensor,
+        mask: &Self::Tensor, batch: usize, channels: usize, spatial: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        let _ = config;
+        assert!(batch > 0 && channels > 0 && spatial > 0);
+        let m = self.download_f32(mixed)?;
+        let g = self.download_f32(grad)?;
+        let s = self.download_f32(scale)?;
+        let mask = self.download_f32(mask)?;
+        assert_eq!(g.len(), batch * channels * spatial);
+        assert_eq!(m.len(), g.len());
+        assert_eq!(s.len(), channels);
+        assert_eq!(mask.len(), batch);
+        let mut dm = vec![0.0; g.len()];
+        let mut ds = vec![0.0; channels];
+        for i in 0..g.len() {
+            let c = (i / spatial) % channels;
+            let b = i / (channels * spatial);
+            dm[i] = g[i] * mask[b] * s[c];
+            ds[c] += g[i] * mask[b] * m[i];
+        }
+        Ok((self.upload_f32(&[batch, channels, 1, spatial], &dm)?,
+            self.upload_f32(&[channels], &ds)?))
+    }
+
     /// Connected layer pre-activation `out[b, o] = x[b, :] . w[o, :] + bias[o]`
     /// (weights `[outputs][inputs]`, Darknet layout), output `[batch, outputs]`.
     fn connected_f32(

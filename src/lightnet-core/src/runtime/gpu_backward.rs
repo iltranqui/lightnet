@@ -512,6 +512,27 @@ where
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::Wmhf(spec), Some(LayerParams::Wmhf(params))) => {
+                    self.backward_wmhf_gpu(
+                        layer,
+                        spec,
+                        params,
+                        forward,
+                        grad,
+                        config,
+                        &mut layer_output_gradients,
+                    )?;
+                }
+                (LayerKind::Clifford(spec), Some(LayerParams::Clifford(params))) => {
+                    self.backward_clifford_gpu(
+                        layer,
+                        spec,
+                        params,
+                        grad,
+                        config,
+                        &mut layer_output_gradients,
+                    )?;
+                }
                 (LayerKind::Vit(spec), Some(LayerParams::Vit(weights))) => {
                     self.backward_vit_gpu(
                         layer,
@@ -543,6 +564,8 @@ where
 
         self.update_gpu_batch_norm_running_stats_from_forward(forward)?;
         self.update_dcnv4_rolling_stats_gpu(forward)?;
+        self.update_clifford_rolling_stats_gpu()?;
+        self.update_wmhf_rolling_stats_gpu()?;
         if self.network.layers.iter().any(|layer| {
             matches!(&layer.kind, LayerKind::Rnn(spec) if spec.batch_normalize)
                 || matches!(&layer.kind, LayerKind::Lstm(spec) if spec.batch_normalize)

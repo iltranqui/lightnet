@@ -2157,16 +2157,10 @@ num_dwconv=1
 }
 
 #[test]
-fn clifford_gpu_execution_compact_and_updates_reject_explicitly() {
+fn clifford_gpu_compact_rejects_explicitly() {
     let network = clifford_test_network("");
     let gpu = GpuExecutableNetwork::new(network, FakeBackend);
     let input = Tensor::from_data(TensorShape::new(2, 1, 2, 2), vec![0.1; 8]).unwrap();
-    assert!(
-        gpu.forward(&input)
-            .unwrap_err()
-            .to_string()
-            .contains("[clifford] GPU execution is not implemented in the Stage-1 CPU port")
-    );
     assert!(
         gpu.forward_compact(&input)
             .unwrap_err()
@@ -2175,17 +2169,10 @@ fn clifford_gpu_execution_compact_and_updates_reject_explicitly() {
                 "[clifford] compact GPU execution is not implemented in the Stage-1 CPU port"
             )
     );
-    let mut gpu = GpuExecutableNetwork::new(clifford_test_network(""), FakeBackend);
-    assert!(
-        gpu.update_weights_gpu(0.01, 0.9, 0.0, 1)
-            .unwrap_err()
-            .to_string()
-            .contains("[clifford] GPU updates are not implemented in the Stage-1 CPU port")
-    );
 }
 
 #[test]
-fn wmhf_sgd_updates_every_block_and_gpu_paths_reject() {
+fn wmhf_sgd_updates_every_block_and_gpu_forward_matches_cpu() {
     let network = Network::from_config(
             ConfigFile::parse_str(
                 "wmhf-sgd.cfg",
@@ -2254,25 +2241,157 @@ fn wmhf_sgd_updates_every_block_and_gpu_paths_reject() {
     }
     assert!((params.scan_weights[0] - 2.015).abs() < 1.0e-6);
 
+    // The full GPU forward is native (FakeBackend runs the trait host
+    // defaults for the WMHF primitives); compact inference stays rejected
+    // because WMHF is not on the f16 inference list.
     let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+    gpu.params = executable.params.clone();
     let input = Tensor::from_data(TensorShape::new(1, 1, 2, 1), vec![0.1, 0.2]).unwrap();
-    assert!(
-        gpu.forward(&input)
-            .unwrap_err()
-            .to_string()
-            .contains("[wmhf] GPU execution is not implemented")
-    );
+    let expected = executable.forward(&input).unwrap().final_output().unwrap().clone();
+    let actual = gpu.forward(&input).unwrap().final_output().unwrap().clone();
+    assert_eq!(actual.shape, expected.shape);
+    assert_wmhf_close("GPU inference forward", &actual.data, &expected.data, 1.0e-5);
     assert!(
         gpu.forward_compact(&input)
             .unwrap_err()
             .to_string()
             .contains("[wmhf] compact GPU execution is not implemented")
     );
-    assert!(
-        gpu.update_weights_gpu(0.01, 0.9, 0.0, 1)
-            .unwrap_err()
-            .to_string()
-            .contains("[wmhf] GPU updates are not implemented")
+}
+
+fn wmhf_buffer_blob(buffers: &LayerTrainBuffers) -> Vec<f32> {
+    let LayerTrainBuffers::Wmhf(train) = buffers else {
+        panic!("wmhf train buffers")
+    };
+    let mut blob = Vec::new();
+    for conv in [
+        &train.pre,
+        &train.local_dw3,
+        &train.local_dw5,
+        &train.local_dw7,
+        &train.local_mix,
+        &train.hf_gate,
+        &train.fuse,
+    ] {
+        blob.extend_from_slice(&conv.weight_updates);
+        blob.extend_from_slice(&conv.bias_updates);
+        if let Some(batch_norm) = &conv.batch_norm {
+            blob.extend_from_slice(&batch_norm.scale_updates);
+        }
+    }
+    blob.extend_from_slice(&train.scan_weight_updates);
+    blob
+}
+
+fn wmhf_param_blob(params: &LayerParams) -> Vec<f32> {
+    let LayerParams::Wmhf(params) = params else {
+        panic!("wmhf params")
+    };
+    let mut blob = Vec::new();
+    for conv in [
+        &params.pre,
+        &params.local_dw3,
+        &params.local_dw5,
+        &params.local_dw7,
+        &params.local_mix,
+        &params.hf_gate,
+        &params.fuse,
+    ] {
+        blob.extend_from_slice(&conv.weights);
+        blob.extend_from_slice(&conv.biases);
+        if let Some(batch_norm) = &conv.batch_norm {
+            blob.extend_from_slice(&batch_norm.scales);
+            blob.extend_from_slice(&batch_norm.rolling_mean);
+            blob.extend_from_slice(&batch_norm.rolling_variance);
+        }
+    }
+    blob.extend_from_slice(&params.scan_weights);
+    blob
+}
+
+fn assert_wmhf_close(name: &str, got: &[f32], want: &[f32], tolerance: f32) {
+    assert_eq!(got.len(), want.len(), "[wmhf] {name}: length");
+    let scale = want.iter().fold(1.0f32, |max, value| max.max(value.abs()));
+    for (index, (got, want)) in got.iter().zip(want).enumerate() {
+        assert!(
+            (got - want).abs() <= tolerance * scale,
+            "[wmhf] {name}[{index}]: got {got}, want {want}"
+        );
+    }
+}
+
+/// GPU-runtime composition (native forward, backward, staged gradients,
+/// rolling statistics and the host-staged SGD step) against the CPU reference
+/// on the FakeBackend host defaults; the Oxide suite repeats it on the device.
+fn check_wmhf_fake_gpu_training(cfg: &str) {
+    let network =
+        Network::from_config(ConfigFile::parse_str("wmhf-fake-gpu.cfg", cfg).unwrap()).unwrap();
+    let mut cpu = ExecutableNetwork::new(network.clone());
+    fill_wmhf_test_params(&mut cpu);
+    let shape = network.net.input_shape();
+    let input = Tensor::from_data(
+        shape,
+        (0..shape.element_count() * shape.batch)
+            .map(|index| ((index * 7 + index / 5) % 19) as f32 * 0.071 - 0.55)
+            .collect(),
+    )
+    .unwrap();
+    let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().unwrap();
+
+    let cpu_forward = cpu.forward_training(&input).unwrap();
+    let gpu_state = gpu.forward_training_with_state(&input).unwrap();
+    let expected = cpu_forward.final_output().unwrap().clone();
+    let actual = gpu_state.cpu_forward.final_output().unwrap().clone();
+    assert_wmhf_close("forward", &actual.data, &expected.data, 1.0e-5);
+
+    let seeds = [Some(wmhf_test_seed(expected.shape))];
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().unwrap();
+    let cpu_backward = cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds).unwrap();
+    let gpu_input_gradient = gpu
+        .backward_accumulate_seeded_gpu_with_input_gradient(&gpu_state, &seeds)
+        .unwrap()
+        .expect("native [wmhf] input gradient");
+    assert_wmhf_close(
+        "input gradient",
+        &gpu_input_gradient.data,
+        &cpu_backward.input_gradient.data,
+        1.0e-4,
+    );
+    assert_wmhf_close(
+        "staged gradients",
+        &wmhf_buffer_blob(&gpu.host_fallback_train_buffers()[0]),
+        &wmhf_buffer_blob(&cpu.train_buffers[0]),
+        1.0e-4,
+    );
+    assert_wmhf_close(
+        "rolling statistics",
+        &wmhf_param_blob(&gpu.params[0]),
+        &wmhf_param_blob(&cpu.params[0]),
+        1.0e-5,
+    );
+
+    cpu.update_weights(0.01, 0.9, 0.0005, 2);
+    gpu.update_weights_gpu(0.01, 0.9, 0.0005, 2).unwrap();
+    assert_wmhf_close(
+        "updated parameters",
+        &wmhf_param_blob(&gpu.params[0]),
+        &wmhf_param_blob(&cpu.params[0]),
+        1.0e-4,
+    );
+}
+
+#[test]
+fn wmhf_gpu_runtime_training_matches_cpu_on_host_defaults() {
+    // Batch-statistics BN, identity channels, no shortcut, leaky output.
+    check_wmhf_fake_gpu_training(
+        "[net]\nwidth=3\nheight=3\nchannels=2\nbatch=2\n[wmhf]\nfilters=4\nbatch_normalize=1\nshortcut=0\nactivation=leaky\n",
+    );
+    // No BN, no identity channels, shortcut, odd non-square spatial shape.
+    check_wmhf_fake_gpu_training(
+        "[net]\nwidth=5\nheight=3\nchannels=4\nbatch=2\n[wmhf]\nfilters=4\nidentity_ratio=0\nbatch_normalize=0\nshortcut=1\nfreq_scale=0.31\nactivation=linear\n",
     );
 }
 

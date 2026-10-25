@@ -3,6 +3,7 @@
 //! `cargo oxide`; plain `cargo build` cannot compile the device code.
 
 pub mod conv;
+mod clifford;
 mod dcnv4_native;
 mod deconvolutional;
 mod graph_conv;
@@ -241,6 +242,7 @@ pub struct OxideBackend {
     attention: attention::kernels::LoadedModule,
     vit: vit::kernels::LoadedModule,
     swin: kernels::swin::kernels::LoadedModule,
+    clifford: kernels::clifford::kernels::LoadedModule,
     residual_epilogue: layers_extra::residual::LoadedModule,
     conv_mode: ConvMode,
     /// FP8 formats for the dgrad / wgrad GEMMs when the FP8 backward is
@@ -1934,6 +1936,8 @@ impl OxideBackend {
             .map_err(|err| OxideError::Shape(format!("load vit module: {err:?}")))?;
         let swin = kernels::swin::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load swin module: {err:?}")))?;
+        let clifford = kernels::clifford::kernels::load(&ctx)
+            .map_err(|err| OxideError::Shape(format!("load clifford module: {err:?}")))?;
         let attention = attention::kernels::load(&ctx)
             .map_err(|err| OxideError::Shape(format!("load attention module: {err:?}")))?;
         let moe = moe::kernels::load(&ctx)
@@ -2052,6 +2056,7 @@ impl OxideBackend {
             dcnv4,
             dcnv4_backward,
             dcnv4_projection,
+            clifford,
             residual_epilogue,
             conv_mode: ConvMode::from_env(),
             bwd_fp8: fp8_backward_from_env(),
@@ -11636,6 +11641,38 @@ impl F32TensorOpsBackend for OxideBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         OxideBackend::vit_pos_embed_backward_f32(self, grad, batch, table, config)
+    }
+
+    fn clifford_interaction_f32(
+        &self, state: &Self::Tensor, context: &Self::Tensor,
+        batch: usize, channels: usize, spatial: usize, shift: usize,
+        inner: bool, pooled: bool, config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        self.clifford_interaction_native(state, context, batch, channels, spatial, shift, inner, pooled, config)
+    }
+
+    fn clifford_interaction_backward_f32(
+        &self, state: &Self::Tensor, context: &Self::Tensor, grad: &Self::Tensor,
+        batch: usize, channels: usize, spatial: usize, shift: usize,
+        inner: bool, pooled: bool, config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        self.clifford_interaction_backward_native(state, context, grad, batch, channels, spatial, shift, inner, pooled, config)
+    }
+
+    fn clifford_residual_f32(
+        &self, input: &Self::Tensor, mixed: &Self::Tensor, scale: &Self::Tensor,
+        mask: &Self::Tensor, batch: usize, channels: usize, spatial: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        self.clifford_residual_native(input, mixed, scale, mask, batch, channels, spatial, config)
+    }
+
+    fn clifford_residual_backward_f32(
+        &self, mixed: &Self::Tensor, grad: &Self::Tensor, scale: &Self::Tensor,
+        mask: &Self::Tensor, batch: usize, channels: usize, spatial: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
+        self.clifford_residual_backward_native(mixed, grad, scale, mask, batch, channels, spatial, config)
     }
 
     fn swin_window_partition_f32(
