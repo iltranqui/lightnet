@@ -88,7 +88,7 @@ src/lightnet-cuda-oxide/tests/oxide_<layer>.rs   CPU-versus-GPU parity for that 
 ```
 
 - `src/lightnet-cuda-oxide` stays outside the workspace and builds only through `cargo xtask oxide`.
-- `tasks/rust/layer-map.md` (to be written) lists, per layer, its CPU file, GPU glue, kernel file and parity test.
+- `tasks/rust/layer-map.md` lists, per layer, its CPU file, GPU glue, kernel file and parity test.
 - Keep every old path working through re-exports, so moving a layer never forces edits elsewhere.
 - Widen visibility only as far as needed (`pub(crate)`); never widen to `pub` just to compile.
 
@@ -114,7 +114,7 @@ Status on 2026-10-24, each move a refactor commit without a version tag (`refact
 - Done, compact arms in `runtime/gpu_forward_compact.rs` (`gpu.rs` `forward_<layer>_compact_gpu`): `convolutional`, `deconvolutional`, `graph_conv`, `connected`, `route`, `scale_channels`, `channel_slice`, `reorg`, `laya_marker_gather`, `laya_act_head`, `shortcut`, `sam`; the pool and `upsample` compact arms reuse the f32 methods. Open: the other compact arms (thin delegations). Done, backward arms (`backward_<layer>_gpu`): `batch_norm`, `maxpool`, `local_avgpool`, `avgpool`, `crop`, `route`, `laya_marker_gather`, `upsample`, `softmax`, `channel_slice`, `channel_shuffle`, `reorg`, `sam`, `scale_channels`, `rnn`, `lstm`, `crnn`, `dcnv4`, `dsconv`, `local`, `deconvolutional`, `connected`, `eml_convolutional`, `graph_conv`, `shortcut` (weighted and plain), `moe`, `convolutional`, `deform_conv`, `foveation_film`, `hyperbolic_foveation`. Open: the remaining backward arms (`region`, `dropout`) in `runtime/gpu_backward.rs`. Move backward one layer per commit and run that layer's Oxide parity suite before committing.
 - Done, device kernels: `kernels/layers_extra.rs` is split per layer into `kernels/*.rs` (wmhf, vit, attention, moe, laya, dense_loss, softmax, reorg, channel_shuffle, dropout, scale_channels, shortcut, recurrent, eml, normalize_channels), kernel names and signatures unchanged.
 - Open, backend methods: split the `OxideBackend` methods in `lightnet-cuda-oxide/src/lib.rs` per layer.
-- Open, `layer-map.md`: write it once the moves above are done.
+- Done, `layer-map.md`: written (layout only; regenerate from the file tree when layers move).
 
 Order of work: finish the moves first, then work through the completion queue in [Open Work](#open-work). A move changes no behaviour; if a move needs a behaviour change, make it a separate versioned commit.
 

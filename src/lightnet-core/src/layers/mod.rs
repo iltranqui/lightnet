@@ -40,6 +40,8 @@ pub(crate) mod pool;
 pub(crate) mod upsample;
 pub(crate) mod reorg;
 pub(crate) mod softmax;
+pub(crate) mod region;
+pub(crate) mod dropout;
 pub(crate) mod scale_channels;
 pub(crate) mod sam;
 pub(crate) mod shortcut;

@@ -253,28 +253,12 @@ where
                     )?;
                 }
                 (LayerKind::Region(spec), Some(LayerParams::None)) => {
-                    let output = forward.gpu_layer_outputs.get(layer.index).ok_or_else(|| {
-                        Error::InvalidConfig(format!(
-                            "missing GPU Region output for layer #{}",
-                            layer.index
-                        ))
-                    })?;
-                    let input_grad = self
-                        .backend
-                        .region_backward_f32(
-                            output,
-                            &grad,
-                            &tensor_backend_shape(layer.input_shape),
-                            spec.num,
-                            spec.coords + spec.classes + 1,
-                            spec.classes,
-                            spec.softmax,
-                            config,
-                        )
-                        .map_err(|err| backend_error("GPU Region backward", err))?;
-                    self.accumulate_previous_gpu_gradient(
-                        layer.index,
-                        input_grad,
+                    self.backward_region_gpu(
+                        layer,
+                        spec,
+                        forward,
+                        grad,
+                        config,
                         &mut layer_output_gradients,
                     )?;
                 }
@@ -316,26 +300,11 @@ where
                     )?;
                 }
                 (LayerKind::Dropout { .. }, Some(LayerParams::None)) => {
-                    let input_grad = match forward.cpu_forward.dropout_masks[layer.index].as_ref() {
-                        Some(mask) => {
-                            let mask_gpu = self
-                                .backend
-                                .upload_f32(&tensor_backend_shape(mask.shape), &mask.data)
-                                .map_err(|err| backend_error("upload dropout mask", err))?;
-                            self.backend
-                                .dropout_backward_f32(
-                                    &grad,
-                                    &mask_gpu,
-                                    &tensor_backend_shape(mask.shape),
-                                    config,
-                                )
-                                .map_err(|err| backend_error("GPU dropout backward", err))?
-                        }
-                        None => grad,
-                    };
-                    self.accumulate_previous_gpu_gradient(
-                        layer.index,
-                        input_grad,
+                    self.backward_dropout_gpu(
+                        layer,
+                        forward,
+                        grad,
+                        config,
                         &mut layer_output_gradients,
                     )?;
                 }
