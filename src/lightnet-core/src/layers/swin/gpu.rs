@@ -430,6 +430,7 @@ where
         layer: &Layer,
         geometry: &SwinGeometry,
         weights: &super::SwinWeights,
+        forward: &crate::runtime::GpuForwardState<B::Tensor>,
         grad: B::Tensor,
         config: ElementwiseLaunchConfig,
         layer_output_gradients: &mut [Option<B::Tensor>],
@@ -440,7 +441,7 @@ where
                 name: format!("[swin] unsupported GPU activation {:?}", geometry.activation),
             }
         })?;
-        let caches = self.swin_device_caches.borrow();
+        let caches = &forward.swin_device_caches;
         let cache = caches
             .get(layer.index)
             .and_then(Option::as_ref)
@@ -672,7 +673,6 @@ where
                 }
             }
         }
-        drop(caches);
         self.accumulate_previous_gpu_gradient(layer.index, d_input, layer_output_gradients)
     }
 }

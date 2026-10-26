@@ -172,10 +172,11 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
     }
 
     pub(crate) fn backward_dpt_head_gpu(&self, layer: &Layer, spec: &DptHeadSpec,
+        forward: &crate::runtime::GpuForwardState<B::Tensor>,
         grad: B::Tensor, config: ElementwiseLaunchConfig,
         layer_output_gradients: &mut [Option<B::Tensor>]) -> Result<()> {
         if crate::runtime::GradMode::from_env() == crate::runtime::GradMode::Cpp { return Ok(()); }
-        let caches = self.dpt_head_device_caches.borrow();
+        let caches = &forward.dpt_head_device_caches;
         let cache = caches.get(layer.index).and_then(Option::as_ref).ok_or_else(||
             Error::InvalidConfig("missing DPT GPU training cache".into()))?;
         if cache.geometry != spec.geometry(layer.input_shape) {
@@ -257,7 +258,7 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
         }
         train.has_gradient |= dparams.iter().any(|&x| x != 0.0);
         for (dst, gradient) in train.weight_updates.iter_mut().zip(dparams) { *dst -= gradient; }
-        drop(buffers); drop(caches);
+        drop(buffers);
         self.accumulate_previous_gpu_gradient(layer.index, dx, layer_output_gradients)
     }
 }

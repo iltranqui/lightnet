@@ -128,11 +128,12 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
     }
 
     pub(crate) fn backward_depth_anything_gpu(&self, layer: &Layer, spec: &DepthAnythingSpec,
+        forward: &crate::runtime::GpuForwardState<B::Tensor>,
         grad: B::Tensor, config: ElementwiseLaunchConfig,
         layer_output_gradients: &mut [Option<B::Tensor>]) -> Result<()> {
         if crate::runtime::GradMode::from_env() == crate::runtime::GradMode::Cpp { return Ok(()); }
         let g = spec.geometry(layer.input_shape);
-        let caches = self.depth_anything_device_caches.borrow();
+        let caches = &forward.depth_anything_device_caches;
         let cache = caches.get(layer.index).and_then(Option::as_ref).ok_or_else(|| Error::InvalidConfig("missing DepthAnything device cache".into()))?;
         if cache.geometry != g { return Err(Error::InvalidConfig("DepthAnything device cache geometry mismatch".into())); }
         let be = &self.backend;
@@ -190,7 +191,6 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
             let scale = be.upload_f32(&[3],&g.imagenet_std.map(|x|1.0/x)).map_err(err)?;
             dx = be.channel_scale_f32(&dx,&scale,3,g.height*g.width,config).map_err(err)?;
         }
-        drop(caches);
         self.accumulate_previous_gpu_gradient(layer.index,dx,layer_output_gradients)
     }
 }

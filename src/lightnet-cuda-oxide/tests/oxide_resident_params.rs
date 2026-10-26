@@ -358,6 +358,61 @@ fn mixer_updates(t: &LayerTrainBuffers) -> Vec<f32> {
 }
 
 #[test]
+fn resident_overlapping_forwards_keep_their_own_backward_tapes() {
+    for kind in 0..3 {
+        let (mut cpu, mut gpu, input_a) = mixer_fixture(kind, "adam=1\n");
+        let input_b = Tensor::from_data(input_a.shape, input_a.data.iter().enumerate()
+            .map(|(i, x)| -2.7 * x + (i as f32 * 0.37).sin() * 0.4).collect()).unwrap();
+        let host_a = cpu.forward_training(&input_a).unwrap();
+        let host_b = cpu.forward_training(&input_b).unwrap();
+        let device_a = gpu.forward_training_device(&input_a).unwrap();
+        let device_b = gpu.forward_training_device(&input_b).unwrap();
+        let shape = host_a.final_output().unwrap().shape;
+        let seed = Tensor::from_data(shape, (0..shape.batch * shape.element_count())
+            .map(|i| (i as f32 * 0.19).cos() * 0.3).collect()).unwrap();
+        let scaled = Tensor::from_data(shape, seed.data.iter().map(|x| x * gpu.loss_scale()).collect()).unwrap();
+        // The earlier tape must survive both a later training forward and
+        // inference. Repeated backward must accumulate without consuming it.
+        gpu.forward_compact(&input_b).unwrap();
+        for (input, host, device) in [(&input_a, &host_a, &device_a),
+            (&input_b, &host_b, &device_b), (&input_a, &host_a, &device_a)] {
+            let expected = cpu.backward_accumulate_seeded(input, host, &[Some(scaled.clone())]).unwrap();
+            let actual = gpu.backward_accumulate_seeded_gpu_with_input_gradient(device,
+                &[Some(seed.clone())]).unwrap().expect("native input gradient");
+            close("overlapping forward input gradient", &actual.data, &expected.input_gradient.data);
+            gpu.synchronize_resident_parameter_gradients().unwrap();
+            close("overlapping forward parameter gradients",
+                &mixer_updates(&gpu.host_fallback_train_buffers()[0]),
+                &mixer_updates(&cpu.train_buffers[0]));
+        }
+    }
+}
+
+#[test]
+fn resident_reload_cannot_reuse_an_old_forward_generation() {
+    for kind in 0..3 {
+        let (_, mut gpu, input) = mixer_fixture(kind, "adam=1\n");
+        let old = gpu.forward_training_device(&input).unwrap();
+        let path = std::env::temp_dir().join(format!("resident-epoch-{kind}-{}.opt", std::process::id()));
+        gpu.save_optimizer_state(&path).unwrap();
+        gpu.load_optimizer_state(&path).unwrap();
+        let fresh = gpu.forward_training_device(&input).unwrap();
+        let shape = gpu.network.layers[0].output_shape;
+        let seed = Tensor::from_data(shape, vec![0.2; shape.batch * shape.element_count()]).unwrap();
+        let error = gpu.backward_accumulate_seeded_gpu(&old, &[Some(seed.clone())]).unwrap_err();
+        assert!(error.to_string().contains("resident gradient snapshot/range mismatch"),
+            "a retired bank must reject the old generation: {error}");
+        gpu.synchronize_resident_parameter_gradients().unwrap();
+        assert!(mixer_updates(&gpu.host_fallback_train_buffers()[0]).iter().all(|&x| x == 0.0),
+            "rejected backward must leave resident gradients unchanged");
+        gpu.backward_accumulate_seeded_gpu(&fresh, &[Some(seed)]).unwrap();
+        gpu.synchronize_resident_parameter_gradients().unwrap();
+        assert!(mixer_updates(&gpu.host_fallback_train_buffers()[0]).iter().any(|&x| x != 0.0));
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
 fn resident_muon_three_steps_deferred_momentum_and_dnopt6_resume() {
     for kind in 0..3 {
         let (mut cpu,mut gpu,input)=mixer_fixture(kind,"muon=1\nadam=0\ndecoupled_decay=1\neps=0.001\n");

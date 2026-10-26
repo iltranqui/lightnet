@@ -858,7 +858,7 @@ where
             }
         })?;
         let g = Geometry::new(layer, spec, params)?;
-        let caches = self.wmhf_device_caches.borrow();
+        let caches = &forward.wmhf_device_caches;
         let cache = caches
             .get(layer.index)
             .and_then(Option::as_ref)
@@ -1044,7 +1044,6 @@ where
             .vector_add_f32(&d_pre_gate, &d_pre_branches, config)
             .map_err(err("pre gradient sum"))?;
         let pre = self.wmhf_sub_conv_backward(&b.pre, &cache.pre, &d_pre, projected_shape, config)?;
-        drop(caches);
 
         // Parameter staging: one download per tensor at the optimizer boundary.
         let host = |what: String, tensor: &B::Tensor| {
@@ -1110,8 +1109,9 @@ where
     /// training forward to the host BN parameters of `pre`, `local_mix` and
     /// `fuse`, with the CPU rule of the accumulation (`keep = 0.9`, biased
     /// batch variance). Called once after the native backward.
-    pub(crate) fn update_wmhf_rolling_stats_gpu(&mut self) -> Result<()> {
-        let caches = self.wmhf_device_caches.borrow();
+    pub(crate) fn update_wmhf_rolling_stats_gpu(&mut self,
+        forward: &GpuForwardState<B::Tensor>) -> Result<()> {
+        let caches = &forward.wmhf_device_caches;
         let update = 1.0 - BATCH_NORM_ROLLING_KEEP_CPU;
         for (index, cache) in caches.iter().enumerate() {
             let Some(cache) = cache.as_ref().filter(|cache| cache.training) else {

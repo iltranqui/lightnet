@@ -62,6 +62,13 @@ fn same_bits(a: &[f32], b: &[f32]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(a,b)| a.to_bits() == b.to_bits())
 }
 
+fn next_resident_generation(epoch: &Cell<u64>) -> Result<u64> {
+    let next = epoch.get().checked_add(1)
+        .ok_or_else(|| Error::InvalidConfig("resident parameter generation exhausted".into()))?;
+    epoch.set(next);
+    Ok(next)
+}
+
 fn host_values_match(params: &LayerParams, snapshot: &[f32]) -> Result<bool> {
     let split_matches = |biases: &[f32], weights: &[f32]| {
         snapshot.len() == biases.len() + weights.len()
@@ -188,7 +195,7 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
                 }
                 state.weights = be.upload_f32(&[host.len()], host).map_err(err)?;
                 state.snapshot = host.to_vec();
-                state.generation = state.generation.wrapping_add(1);
+                state.generation = next_resident_generation(&self.resident_parameter_epoch)?;
             }
         } else {
             let mut mask = vec![0.0;host.len()];
@@ -227,7 +234,7 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
                 updates, moments, decay_mask:be.upload_f32(&[host.len()],&mask).map_err(err)?, layout,
                 coupled_decay_mask:be.upload_f32(&[host.len()],&coupled_mask).map_err(err)?,
                 muon_matrices:Vec::new(), muon_adam_mask:None,
-                snapshot:host.to_vec(), generation:0, dirty:false });
+                snapshot:host.to_vec(), generation:next_resident_generation(&self.resident_parameter_epoch)?, dirty:false });
         }
         let state = slot.as_ref().ok_or_else(||Error::InvalidConfig("missing resident parameter bank".into()))?;
         let mut output = Vec::with_capacity(slices.len());
@@ -449,7 +456,7 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
                 return Err(Error::InvalidConfig("resident Muon AdamW fallback became nonfinite".into()));
             }
             next.moments=Some((m,v)); next.updates=be.zeros_f32(&[total]).map_err(err)?;
-            next.generation=next.generation.wrapping_add(1); next.dirty=true;
+            next.generation=next_resident_generation(&self.resident_parameter_epoch)?; next.dirty=true;
             *slot=Some(next); self.host_weights_stale=true;
         }
         Ok(())
@@ -497,7 +504,7 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
                     next.moments=Some((m,v));next.updates=be.zeros_f32(&[old.snapshot.len()]).map_err(err)?;
                 }
             }
-            next.dirty=true;next.generation=next.generation.wrapping_add(1);*slot=Some(next);
+            next.dirty=true;next.generation=next_resident_generation(&self.resident_parameter_epoch)?;*slot=Some(next);
             // A later layer can fail. Preserve the staleness marker as soon
             // as this layer publishes a new authoritative device state.
             self.host_weights_stale=true;

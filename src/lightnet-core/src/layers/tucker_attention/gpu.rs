@@ -202,7 +202,8 @@ where
     }
 
     pub(crate) fn backward_tucker_attention_gpu(
-        &self, layer: &Layer, spec: &TuckerAttentionSpec, grad: B::Tensor,
+        &self, layer: &Layer, spec: &TuckerAttentionSpec,
+        forward: &crate::runtime::GpuForwardState<B::Tensor>, grad: B::Tensor,
         config: ElementwiseLaunchConfig, layer_output_gradients: &mut [Option<B::Tensor>],
     ) -> Result<()> {
         let g = geometry(layer, spec);
@@ -210,8 +211,7 @@ where
         let activation = device_activation(&g.activation).ok_or_else(|| Error::UnsupportedLayer {
             layer_index: layer.index, name: "tucker_attention GPU backward activation".into(),
         })?;
-        let caches = self.tucker_attention_device_caches.borrow();
-        let cache = caches.get(layer.index).and_then(Option::as_ref).ok_or_else(||
+        let cache = forward.tucker_attention_device_caches.get(layer.index).and_then(Option::as_ref).ok_or_else(||
             Error::InvalidConfig(format!("missing Tucker attention device training cache for layer #{}", layer.index)))?;
         if cache.geometry != g {
             return Err(Error::InvalidConfig("Tucker device cache geometry mismatch".into()));
@@ -293,7 +293,6 @@ where
             for (dst, src) in train.weight_updates.iter_mut().zip(d_weights) { *dst -= src; }
             for (dst, src) in train.bias_updates.iter_mut().zip(d_bias) { *dst -= src; }
         }
-        drop(caches);
         self.accumulate_previous_gpu_gradient(layer.index, d_input, layer_output_gradients)
     }
 }

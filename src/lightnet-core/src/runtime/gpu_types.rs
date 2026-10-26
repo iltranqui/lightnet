@@ -111,6 +111,18 @@ where
     pub(crate) gpu_crnn_caches: Vec<Option<GpuCrnnBackwardCache<T>>>,
     pub(crate) gpu_lstm_caches: Vec<Option<GpuLstmBackwardCache<T>>>,
     pub(crate) gpu_gru_caches: Vec<Option<crate::layers::gru::gpu::DeviceCache<T>>>,
+    pub(crate) tucker_attention_device_caches: Vec<Option<crate::layers::tucker_attention::gpu::DeviceCache<T>>>,
+    pub(crate) mambavision_device_caches: Vec<Option<crate::layers::mambavision::gpu::DeviceCache<T>>>,
+    pub(crate) kimi_kda_device_caches: Vec<Option<crate::layers::kimi_kda::gpu::DeviceCache<T>>>,
+    /// Native layer tapes are owned by this forward, never by the network.
+    pub(crate) deform_device_caches: Vec<Option<DeformDeviceCache<T>>>,
+    pub(crate) vit_device_caches: Vec<Option<vit_gpu::DeviceCache<T>>>,
+    pub(crate) wmhf_device_caches: Vec<Option<crate::layers::wmhf::gpu::DeviceCache<T>>>,
+    pub(crate) swin_device_caches: Vec<Option<crate::layers::swin::gpu::DeviceCache<T>>>,
+    pub(crate) dpt_head_device_caches: Vec<Option<crate::layers::dpt_head::gpu::DeviceCache<T>>>,
+    pub(crate) depth_anything_device_caches: Vec<Option<crate::layers::depth_anything::gpu::DeviceCache<T>>>,
+    pub(crate) recursive_block_device_caches: Vec<Option<crate::layers::recursive_block::gpu::DeviceCache<T>>>,
+    pub(crate) clifford_device_caches: Vec<Option<crate::layers::clifford::gpu::DeviceCache<T>>>,
     pub(crate) gpu_moe_caches: Vec<Option<GpuMoeBackwardCache<T>>>,
     pub(crate) gpu_eml_caches: Vec<Option<GpuEmlBackwardCache<T>>>,
     pub(crate) gpu_dcnv4_caches: Vec<Option<dcnv4_gpu::ForwardCache<T>>>,
@@ -225,39 +237,11 @@ where
     pub(crate) dcnv4_device_params: RefCell<Vec<Option<dcnv4_gpu::DeviceParameters<B::Tensor>>>>,
     pub(crate) cpu_fallback_train_buffers: RefCell<Vec<LayerTrainBuffers>>,
     pub(crate) resident_parameter_banks: RefCell<Vec<Option<ResidentParameterState<B::Tensor>>>>,
+    /// Never reset when banks are retired: outstanding forward tapes retain
+    /// their old generation and must not match a newly allocated bank.
+    pub(crate) resident_parameter_epoch: Cell<u64>,
     pub(super) capture_input_gradient: Cell<bool>,
     pub(super) captured_input_gradient: RefCell<Option<Tensor>>,
-    /// One slot per layer; only `[deform_conv]` uses it, and only on the
-    /// device-trainable path (see `DeformDeviceCache`).
-    pub(crate) deform_device_caches: RefCell<Vec<Option<DeformDeviceCache<B::Tensor>>>>,
-    /// One slot per layer; only `[vit]` uses it, filled by the native training
-    /// forward when the network takes the native backward (see `vit_gpu`).
-    pub(crate) vit_device_caches: RefCell<Vec<Option<vit_gpu::DeviceCache<B::Tensor>>>>,
-    /// One slot per layer; only `[wmhf]` uses it, filled by the native forward
-    /// when the network takes the native backward (see `layers::wmhf::gpu`).
-    pub(crate) wmhf_device_caches:
-        RefCell<Vec<Option<crate::layers::wmhf::gpu::DeviceCache<B::Tensor>>>>,
-    /// One slot per layer; only `[swin]` uses it, filled by the native training
-    /// forward when the network takes the native backward (see `layers::swin::gpu`).
-    pub(crate) swin_device_caches:
-        RefCell<Vec<Option<crate::layers::swin::gpu::DeviceCache<B::Tensor>>>>,
-    /// Tucker factor projections and attention routes of the native training forward.
-    pub(crate) tucker_attention_device_caches:
-        RefCell<Vec<Option<crate::layers::tucker_attention::gpu::DeviceCache<B::Tensor>>>>,
-    /// Native MambaVision scan, depthwise and FFN intermediates.
-    pub(crate) mambavision_device_caches:
-        RefCell<Vec<Option<crate::layers::mambavision::gpu::DeviceCache<B::Tensor>>>>,
-    pub(crate) kimi_kda_device_caches:
-        RefCell<Vec<Option<crate::layers::kimi_kda::gpu::DeviceCache<B::Tensor>>>>,
-    pub(crate) dpt_head_device_caches:
-        RefCell<Vec<Option<crate::layers::dpt_head::gpu::DeviceCache<B::Tensor>>>>,
-    pub(crate) depth_anything_device_caches:
-        RefCell<Vec<Option<crate::layers::depth_anything::gpu::DeviceCache<B::Tensor>>>>,
-    pub(crate) recursive_block_device_caches:
-        RefCell<Vec<Option<crate::layers::recursive_block::gpu::DeviceCache<B::Tensor>>>>,
-    /// Native Clifford intermediates, populated by the training forward.
-    pub(crate) clifford_device_caches:
-        RefCell<Vec<Option<crate::layers::clifford::gpu::DeviceCache<B::Tensor>>>>,
     /// Per-owner-layer convolution Adam moments (device), created lazily on the
     /// first Adam update.
     pub(super) adam_state: Vec<Option<GpuAdamLayerState<B::Tensor>>>,

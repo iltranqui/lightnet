@@ -153,6 +153,19 @@ remain outside this checkpoint.
 
 ## Evidence and remaining work
 
+Checkpoint `2ee6840` records the Muon/AMP/GRU implementation and fixes covered
+below. A later lifecycle continuation moves Mamba/Kimi/Tucker
+training tapes into GpuForwardState and makes resident generations monotonic
+across bank retirement/reload. Two new device regressions cover overlapping
+forwards (input and parameter adjoints) and stale sidecar-reload tapes.
+The same source change now covers DeformConv, ViT, Swin, WMHF, Clifford, DPT,
+DepthAnything and RecursiveBlock; WMHF/Clifford rolling-stat accumulation
+also reads the supplied forward state. `oxide_forward_tapes` adds isolated
+versus interleaved GPU input-adjoint/BN-stat checks across those eight families.
+These later edits are **uncompiled/unrun** while the prior checkpoint's full
+core invocation continues in cfg-corpus integration. Do not apply the older
+passing results to this continuation.
+
 Current authorized verification uses at most two jobs/test threads and a 3G
 soft RAM cap, one Cargo invocation at a time:
 

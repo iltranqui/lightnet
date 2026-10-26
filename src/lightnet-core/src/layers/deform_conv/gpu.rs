@@ -304,10 +304,9 @@ where
         );
         let (mask_weights, mask_biases) =
             (params.mask_weights.clone(), params.mask_biases.clone());
-        // Clone the device intermediates out of the RefCell so the
-        // following `&mut self` calls can borrow freely.
+        // Read the exact forward's intermediates; later forwards may coexist.
         let (input_sanitized, raw_offsets, mean, inv_std, stddev, normalize, offsets, masks, mask_logits) = {
-            let caches = self.deform_device_caches.borrow();
+            let caches = &forward.deform_device_caches;
             let c = caches[layer.index].as_ref().ok_or_else(|| {
                 Error::InvalidConfig(format!(
                     "missing device [deform_conv] cache for layer #{}",

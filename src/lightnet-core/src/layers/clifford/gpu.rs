@@ -343,11 +343,12 @@ where B::Error: std::fmt::Display {
 
     pub(crate) fn backward_clifford_gpu(
         &self, layer: &Layer, spec: &CliffordSpec, params: &CliffordParams,
+        forward: &crate::runtime::GpuForwardState<B::Tensor>,
         grad: B::Tensor, config: ElementwiseLaunchConfig,
         layer_output_gradients: &mut [Option<B::Tensor>],
     ) -> Result<()> {
         validate_params(spec, params, layer.input_shape)?;
-        let caches = self.clifford_device_caches.borrow();
+        let caches = &forward.clifford_device_caches;
         let cache = caches.get(layer.index).and_then(Option::as_ref).ok_or_else(||
             Error::InvalidConfig(format!("missing [clifford] device training cache at layer #{}", layer.index)))?;
         if cache.shape != layer.input_shape || cache.spec != *spec || !cache.training {
@@ -440,14 +441,14 @@ where B::Error: std::fmt::Display {
             }
         }
         drop(buffers);
-        drop(caches);
         self.accumulate_previous_gpu_gradient(layer.index, dx, layer_output_gradients)
     }
 
     /// CPU-compatible biased batch variance and EMA (0.9 keep), applied at
     /// the same boundary as CPU backward accumulation, never during forward.
-    pub(crate) fn update_clifford_rolling_stats_gpu(&mut self) -> Result<()> {
-        let caches = self.clifford_device_caches.borrow();
+    pub(crate) fn update_clifford_rolling_stats_gpu(&mut self,
+        forward: &crate::runtime::GpuForwardState<B::Tensor>) -> Result<()> {
+        let caches = &forward.clifford_device_caches;
         for (index, cache) in caches.iter().enumerate() {
             let Some(cache) = cache.as_ref().filter(|c| c.training) else { continue; };
             let Some(local) = &cache.local else { continue; };

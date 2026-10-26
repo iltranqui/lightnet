@@ -8,6 +8,7 @@
 - [Implementation sequence](#implementation-sequence)
 - [Review](#review)
 - [Muon, AMP and GRU continuation](#muon-amp-and-gru-continuation)
+- [Lifecycle continuation and next residency contract](#lifecycle-continuation-and-next-residency-contract)
 
 ## Priority and constraints
 
@@ -198,3 +199,40 @@ RecursiveBlock controller/lattice/BN/body variants, other documented ViT and
 Clifford variants, GRU BN training, dense-loss gaps, DSConv variants and YOLO-3D.
 Dense AMP supplies real half arithmetic for projections; it does not establish
 native half coverage of all scan/attention/normalization operations or all layers.
+
+## Lifecycle continuation and next residency contract
+
+Checkpoint `2ee6840` contains the Muon/AMP/GRU slice, with focused verification
+recorded in source-wip.md. The full core invocation passed 1,016 unit tests
+and is still running cfg-corpus integration. Latest source edits after that
+checkpoint are uncompiled: Mamba/Kimi/Tucker device tapes move to the returned
+GpuForwardState, and resident bank epochs no longer reset on retirement/reload.
+Overlapping-forward and stale-reload device regressions are queued for the
+next serial test slot. Do not attribute the checkpoint's green evidence to
+these later edits.
+The tape migration also covers DeformConv, ViT, Swin, WMHF, Clifford, DPT,
+DepthAnything and RecursiveBlock, including WMHF/Clifford rolling-stat consumers.
+New `oxide_forward_tapes` isolates the lifecycle property from numeric CPU
+parity by comparing interleaved and isolated GPU input adjoints/BN statistics.
+
+Next residency candidate is DPT, but its source contract needs more than
+adding a parameter enum arm. Source audit (not an implementation):
+
+- `layers/dpt_head/cpu.rs` declares 66 serialized slots: 32 active matrix
+  slots and 28 active bias slots; 12/13 are empty, and 28/29/36/37 contain
+  serialized parameters unused by the executed graph and optimizer.
+- Native banks must preserve inactive parameters and update accumulators,
+  including explicitly populated host accumulators. A zero decay mask alone
+  does not freeze an SGD momentum accumulator. Device gradient packing must
+  cover the full arena while keeping unused slots zero on backward.
+- `runtime/param_updates.rs::{update_dpt_head_sgd,apply_host_adam_dpt}` and
+  `runtime/host_adam.rs::validate_dpt_head_adam_state` define per-slot child
+  weights/biases moments, not root arrays. Empty/inactive slots must not
+  acquire checkpoint moments.
+- DPT's Muon host fallback skips matrix Adam updates/moments, unlike the
+  common mixer fallback that advances resumed matrix moments with zero new
+  gradient. Preserve this distinction; test switching/resume explicitly.
+- Forward currently uploads every slot, backward downloads each conv
+  parameter gradient, and updates remain hybrid. A resident implementation
+  must remove those transfers while preserving transpose-conv storage,
+  source matrix shapes/order, update gates and explicit checkpoint boundaries.

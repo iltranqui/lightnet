@@ -1199,17 +1199,6 @@ where
             foveation_film_caches.push(foveation_film_cache);
         }
 
-        *self.deform_device_caches.borrow_mut() = deform_device_caches;
-        *self.clifford_device_caches.borrow_mut() = clifford_device_caches;
-        *self.vit_device_caches.borrow_mut() = vit_device_caches;
-        *self.wmhf_device_caches.borrow_mut() = wmhf_device_caches;
-        *self.swin_device_caches.borrow_mut() = swin_device_caches;
-        *self.tucker_attention_device_caches.borrow_mut() = tucker_attention_device_caches;
-        *self.mambavision_device_caches.borrow_mut() = mambavision_device_caches;
-        *self.kimi_kda_device_caches.borrow_mut() = kimi_kda_device_caches;
-        *self.dpt_head_device_caches.borrow_mut() = dpt_head_device_caches;
-        *self.depth_anything_device_caches.borrow_mut() = depth_anything_device_caches;
-        *self.recursive_block_device_caches.borrow_mut() = recursive_block_device_caches;
         Ok(GpuForwardState {
             input_gpu,
             gpu_layer_outputs,
@@ -1219,6 +1208,17 @@ where
             gpu_crnn_caches,
             gpu_lstm_caches,
             gpu_gru_caches,
+            tucker_attention_device_caches,
+            mambavision_device_caches,
+            kimi_kda_device_caches,
+            deform_device_caches,
+            clifford_device_caches,
+            vit_device_caches,
+            wmhf_device_caches,
+            swin_device_caches,
+            dpt_head_device_caches,
+            depth_anything_device_caches,
+            recursive_block_device_caches,
             gpu_moe_caches,
             gpu_eml_caches,
             gpu_dcnv4_caches,

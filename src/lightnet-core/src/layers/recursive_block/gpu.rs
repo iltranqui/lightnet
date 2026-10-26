@@ -88,8 +88,9 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
     }
 
     pub(crate) fn backward_recursive_block_gpu(&self,layer:&Layer,spec:&RecursiveBlockSpec,
+        forward:&crate::runtime::GpuForwardState<B::Tensor>,
         grad:B::Tensor,config:ElementwiseLaunchConfig,layer_output_gradients:&mut[Option<B::Tensor>])->Result<()> {
-        let caches=self.recursive_block_device_caches.borrow();
+        let caches=&forward.recursive_block_device_caches;
         let cache=caches.get(layer.index).and_then(Option::as_ref).ok_or_else(||
             Error::InvalidConfig("missing recursive native training cache".into()))?;
         if cache.spec!=*spec || cache.passes.len()!=spec.loops {
@@ -169,7 +170,7 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
             for (dst,src) in w.iter_mut().zip(dw){*dst-=src;}
             for (dst,src) in b.iter_mut().zip(db){*dst-=src;}
         }
-        drop(buffers);drop(caches);
+        drop(buffers);
         self.accumulate_previous_gpu_gradient(layer.index,input_grad,layer_output_gradients)
     }
 }

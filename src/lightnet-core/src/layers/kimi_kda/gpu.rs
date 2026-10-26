@@ -159,12 +159,12 @@ where
     }
 
     pub(crate) fn backward_kimi_kda_gpu(
-        &self, layer: &Layer, spec: &KimiKdaSpec, grad: B::Tensor,
+        &self, layer: &Layer, spec: &KimiKdaSpec,
+        forward: &crate::runtime::GpuForwardState<B::Tensor>, grad: B::Tensor,
         config: ElementwiseLaunchConfig, layer_output_gradients: &mut [Option<B::Tensor>],
     ) -> Result<()> {
         let g = KimiKdaGeometry::from_layer(layer.input_shape, spec).map_err(Error::InvalidConfig)?;
-        let caches = self.kimi_kda_device_caches.borrow();
-        let cache = caches.get(layer.index).and_then(Option::as_ref).ok_or_else(||
+        let cache = forward.kimi_kda_device_caches.get(layer.index).and_then(Option::as_ref).ok_or_else(||
             Error::InvalidConfig(format!("missing Kimi KDA device cache for layer #{}", layer.index)))?;
         if cache.geometry != g { return Err(Error::InvalidConfig("Kimi KDA cache geometry mismatch".into())); }
         let activation = device_activation(&g.activation).ok_or_else(|| Error::UnsupportedLayer {
@@ -262,7 +262,6 @@ where
             for (dst, src) in train.weight_updates.iter_mut().zip(dweights) { *dst -= src; }
             for (dst, src) in train.bias_updates.iter_mut().zip(dbiases) { *dst -= src; }
         }
-        drop(caches);
         self.accumulate_previous_gpu_gradient(layer.index, dx, layer_output_gradients)
     }
 

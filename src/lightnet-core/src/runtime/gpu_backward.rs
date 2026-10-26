@@ -102,7 +102,7 @@ where
 
             match (&layer.kind, self.params.get(layer.index)) {
                 (LayerKind::RecursiveBlock(spec), Some(LayerParams::RecursiveBlock(_))) => {
-                    self.backward_recursive_block_gpu(layer, spec, grad, config, &mut layer_output_gradients)?;
+                    self.backward_recursive_block_gpu(layer, spec, forward, grad, config, &mut layer_output_gradients)?;
                 }
                 (LayerKind::FoveationFilm(spec), Some(LayerParams::FoveationFilm(params))) => {
                     self.backward_foveation_film_gpu(
@@ -534,6 +534,7 @@ where
                         layer,
                         spec,
                         params,
+                        forward,
                         grad,
                         config,
                         &mut layer_output_gradients,
@@ -544,6 +545,7 @@ where
                         layer,
                         &vit_geometry(layer, spec),
                         weights,
+                        forward,
                         grad,
                         config,
                         &mut layer_output_gradients,
@@ -554,6 +556,7 @@ where
                         layer,
                         &crate::layers::swin::gpu::geometry(layer, spec),
                         weights,
+                        forward,
                         grad,
                         config,
                         &mut layer_output_gradients,
@@ -561,27 +564,27 @@ where
                 }
                 (LayerKind::TuckerAttention(spec), Some(LayerParams::TuckerAttention(_))) => {
                     self.backward_tucker_attention_gpu(
-                        layer, spec, grad, config, &mut layer_output_gradients,
+                        layer, spec, forward, grad, config, &mut layer_output_gradients,
                     )?;
                 }
                 (LayerKind::MambaVision(spec), Some(LayerParams::MambaVision(_))) => {
                     self.backward_mambavision_gpu(
-                        layer, spec, grad, config, &mut layer_output_gradients,
+                        layer, spec, forward, grad, config, &mut layer_output_gradients,
                     )?;
                 }
                 (LayerKind::KimiKda(spec), Some(LayerParams::KimiKda(_))) => {
                     self.backward_kimi_kda_gpu(
-                        layer, spec, grad, config, &mut layer_output_gradients,
+                        layer, spec, forward, grad, config, &mut layer_output_gradients,
                     )?;
                 }
                 (LayerKind::DptHead(spec), Some(LayerParams::DptHead(_))) => {
                     self.backward_dpt_head_gpu(
-                        layer, spec, grad, config, &mut layer_output_gradients,
+                        layer, spec, forward, grad, config, &mut layer_output_gradients,
                     )?;
                 }
                 (LayerKind::DepthAnything(spec), Some(LayerParams::DepthAnything(_))) => {
                     self.backward_depth_anything_gpu(
-                        layer, spec, grad, config, &mut layer_output_gradients,
+                        layer, spec, forward, grad, config, &mut layer_output_gradients,
                     )?;
                 }
                 _ => {
@@ -595,8 +598,8 @@ where
 
         self.update_gpu_batch_norm_running_stats_from_forward(forward)?;
         self.update_dcnv4_rolling_stats_gpu(forward)?;
-        self.update_clifford_rolling_stats_gpu()?;
-        self.update_wmhf_rolling_stats_gpu()?;
+        self.update_clifford_rolling_stats_gpu(forward)?;
+        self.update_wmhf_rolling_stats_gpu(forward)?;
         if self.network.layers.iter().any(|layer| {
             matches!(&layer.kind, LayerKind::Rnn(spec) if spec.batch_normalize)
                 || matches!(&layer.kind, LayerKind::Lstm(spec) if spec.batch_normalize)

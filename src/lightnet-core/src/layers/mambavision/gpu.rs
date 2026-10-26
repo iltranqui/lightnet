@@ -173,12 +173,12 @@ where
     }
 
     pub(crate) fn backward_mambavision_gpu(
-        &self, layer: &Layer, spec: &MambaVisionSpec, grad: B::Tensor,
+        &self, layer: &Layer, spec: &MambaVisionSpec,
+        forward: &crate::runtime::GpuForwardState<B::Tensor>, grad: B::Tensor,
         config: ElementwiseLaunchConfig, layer_output_gradients: &mut [Option<B::Tensor>],
     ) -> Result<()> {
         let g = MambaVisionGeometry::from_layer(layer.input_shape, spec).map_err(Error::InvalidConfig)?;
-        let caches = self.mambavision_device_caches.borrow();
-        let cache = caches.get(layer.index).and_then(Option::as_ref).ok_or_else(||
+        let cache = forward.mambavision_device_caches.get(layer.index).and_then(Option::as_ref).ok_or_else(||
             Error::InvalidConfig(format!("missing MambaVision device cache for layer #{}", layer.index)))?;
         if cache.geometry != g {
             return Err(Error::InvalidConfig("MambaVision device cache geometry mismatch".into()));
@@ -270,7 +270,6 @@ where
             let gradients = parameter_grads.into_iter()
                 .map(|(block,tensor)|(descriptions[block].clone(),tensor)).collect();
             self.accumulate_resident_parameter_gradients(layer.index,generation,gradients,config)?;
-            drop(caches);
             return self.accumulate_previous_gpu_gradient(layer.index,dx,layer_output_gradients);
         }
         // Stage complete gradients before mutating accumulation buffers.
@@ -292,7 +291,6 @@ where
         }
         for (dst, gradient) in train.updates.iter_mut().zip(updates) { *dst -= gradient; }
         drop(buffers);
-        drop(caches);
         self.accumulate_previous_gpu_gradient(layer.index, dx, layer_output_gradients)
     }
 

@@ -149,6 +149,18 @@ second full resident-suite run.
 Verification remains serialized,
 with two build jobs, one GPU test thread and MemoryHigh=3G.
 
+Local WIP checkpoint: `2ee6840`. Its full core unit suite passed 1,016 tests;
+cfg-corpus integration is still running and CLI full tests are pending.
+After that checkpoint, an uncompiled lifecycle continuation moves the three
+resident mixer tapes into each GpuForwardState and adds a network-wide
+monotonic bank generation. Added device regressions cover interleaved forward
+tapes and stale generations after sidecar reload. Run those after the active
+corpus invocation ends; do not overlap Cargo commands.
+The ownership change also covers the other eight network-global native tape
+families, including WMHF/Clifford BN-stat reads. New `oxide_forward_tapes`
+checks interleaving against isolated GPU execution for all eight. This later
+source remains uncompiled and unrun; it is not part of checkpoint `2ee6840`.
+
 ## Current implementation
 
 ### MambaVision
