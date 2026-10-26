@@ -1,6 +1,6 @@
 # Device completion handoff
 
-Updated: **2026-10-26**. Branch: `main`. Latest code: **`0e93bcb`**.
+Updated: **2026-10-26**. Branch: `main`. Latest code: **`627d115`**.
 
 ## Stop handoff contents
 
@@ -49,7 +49,8 @@ moments in Muon. The same host regression saves and reloads Adam and Muon
 child moments through DNOPT, comparing all restored DPT child slots. The full
 suite was rerun after resident Muon changes:
 `oxide_resident_params` passed **17/17** (1117.58s). Explicit DPT DNOPT
-Adam-to-Muon checkpoint-switch behavior remains open; DPT is not complete. The first
+At the time of this earlier checkpoint, Adam-to-Muon switching remained open;
+DPT is not complete. The first
 runtime rerun found a gradient tensor shape mismatch (323/324); preserving
 convolution tensor shapes until flat arena packing fixed it, and the focused
 DPT runtime test passed 1/1. `oxide_depth_anything`
@@ -76,18 +77,31 @@ f16 dispatch were added; host check and gpu-check passed, `runtime::` passed
 **325/325** (cfg-corpus selected zero), and full `oxide_vit` passed **7/7**
 (364.28s), including f16 storage-boundary checks before/after deferred updates.
 The half path uses f32 ViT arithmetic and resident f32 masters. MSA/VC backward,
-ViT Muon and all-layer completion remain open. The named-path DPT commit retry
+resident ViT Muon and all-layer completion remain open. The existing hybrid
+ViT Muon path later passed its focused CPU-comparison test (1/1, 23.91s). The named-path DPT commit retry
 again failed at `git add` with `.git/index.lock: Read-only file system`; no
 lock was inspected or removed. Full CLI/layer reruns after this continuation,
 cfg-corpus and diff whitespace validation remain outstanding.
+
+At `627d115`, DPT Adam-to-Muon DNOPT switching is covered as an intentional
+rejection when the Adam sidecar contains matrix moments. The host regression
+verifies that the failed load leaves Muon weights, optimizer step, Adam state
+and Muon state unchanged. Host check passed (4.95s), gpu-check passed (3.96s),
+`PKGS=lightnet-core runtime::` passed **326/326** (20.03s; corpus filter
+selected zero), and `oxide_dpt_head` passed **1/1** (68.88s). A requested fresh
+`oxide_forward_tapes` run passed **1/1** (324.59s). Hybrid ViT Muon coverage:
+`cargo xtask oxide --test oxide_vit
+vit_gpu_muon_hybrid_backward_and_adamw_update_match_cpu` passed **1/1**
+(23.91s), comparing host-staged parameter gradients and GPU orthogonalization
+against CPU. It does not establish resident ViT Muon updates.
 
 The substantive objective remains full native GPU backward/updates, Muon,
 FP16 training and every-layer completion under `tasks/rust/AGENTS.md`.
 It is not complete. The standalone CPU detector/oracle milestone stays lower
 priority. No training, benchmarks, release tags or pushing occurred.
 
-`0e93bcb` remains HEAD. The DPT and ViT continuation edits and status refresh
-are uncommitted because `.git` is read-only. Preserve the unrelated root
+`627d115` is now HEAD; the orchestrator committed the DPT and ViT residency
+slice. Preserve the unrelated root
 Cargo.lock, examples, Latin/dataset files and untracked task notes listed at
 the bottom.
 
@@ -147,16 +161,13 @@ request takes precedence until an explicit resume.
    corpus OOM/timeout cases and warns it may take over an hour. Do not reuse
    a narrow result to claim a green full suite.
 5. Continue the actual remaining layer/FP16/residency queue. DPT resident
-   SGD/Adam/Muon and child-state save/reload are covered, while optimizer-mode
-   switch behavior still needs a named test. The DPT residency
-   audit in device_completion_plan.md identifies 66 serialized slots, 32 active
-   matrices, 28 active bias slots, empty 12/13 and inactive 28/29/36/37.
-   Freeze inactive parameters and accumulators exactly; zero decay alone
-   does not freeze SGD momentum. Preserve per-slot child DNOPT moments and
-   DPT SGD/Adam residency is partially implemented and passed its named GPU
-   suite; seeded inactive-accumulator and child-moment checkpoint tests remain
-   open; DPT now has resident SGD/Adam/Muon updates and child-state round trips,
-   but Adam-to-Muon checkpoint switching remains open.
+   SGD/Adam/Muon and child-state save/reload are covered. At `627d115`, an
+   Adam-to-Muon mode switch has a named test: loading is rejected when the
+   Adam sidecar contains matrix moments, with receiver state unchanged. The
+   DPT residency audit in device_completion_plan.md identifies 66 serialized
+   slots, 32 active matrices, 28 active bias slots, empty 12/13 and inactive
+   28/29/36/37. Preserve inactive parameters, accumulators and per-slot DNOPT
+   moments; DPT remains partial, not complete.
 
 Other open requirements include other families' residency, RecursiveBlock
 controllers/lattice/BN/body variants, documented ViT/Clifford variants, GRU BN,

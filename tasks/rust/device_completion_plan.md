@@ -240,7 +240,8 @@ requirements are still open:
   downloaded each conv parameter gradient, and updates were hybrid. The slice
   removes the SGD/Adam parameter transfers while preserving transpose-conv
 storage, source order and update gates. Explicit child-state checkpoint
-round-trips are now covered; switching an Adam checkpoint to Muon remains open.
+round-trips are covered. Adam-to-Muon switching now has a named atomic
+rejection test for sidecars containing matrix Adam moments.
 
 ### DPT SGD/Adam residency slice, 2026-10-26
 
@@ -260,8 +261,9 @@ tensor-shape mismatch (323/324); the focused test and full runtime rerun passed
 after preserving convolution gradient shapes until flat packing. The Oxide
 test checks gradients through an explicit diagnostic and updated weights. A
 host regression round-trips Adam and Muon child moments through DNOPT, including
-the absence of inactive and Muon matrix moments. Adam-to-Muon checkpoint
-switching and full layer completion remain open.
+the absence of inactive and Muon matrix moments. A separate regression now
+verifies that loading an Adam sidecar containing matrix moments into Muon mode
+is rejected atomically. Full layer completion remains open.
 
 ## ViT residency continuation
 
@@ -297,9 +299,11 @@ Validation on the resumed tree: host check passed; gpu-check passed; core
 `runtime::` passed **325/325** (corpus filter selected zero); `oxide_vit`
 passed **7/7** (364.28s), including dense and flash backward comparisons,
 resident SGD/Adam/AdamW and half-storage inference before and after deferred
-updates. `oxide_forward_tapes` passed **1/1** (297.20s) before the half-storage
-edit; it remains lifecycle-equivalence evidence. No C++ golden or all-variant
-completion claim is made. The next transformer family in the queue is Swin.
+updates. A focused hybrid Muon test passed **1/1** (23.91s), comparing
+host-staged ViT gradients and GPU orthogonalization with CPU; resident ViT
+Muon is still open. `oxide_forward_tapes` passed **1/1** (297.20s) before the
+half-storage edit; it remains lifecycle-equivalence evidence. No C++ golden or
+all-variant completion claim is made. The next transformer family in the queue is Swin.
 
 ## Swin residency continuation
 

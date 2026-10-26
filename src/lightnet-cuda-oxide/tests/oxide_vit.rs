@@ -396,6 +396,54 @@ fn vit_native_training_backward_and_update_match_cpu() {
 }
 
 #[test]
+fn vit_gpu_muon_hybrid_backward_and_adamw_update_match_cpu() {
+    let mut cpu = network("patch_size=1\nflash_attention=1", 3, 2);
+    cpu.network.net.muon = true;
+    cpu.network.net.adam = false;
+    cpu.network.net.decoupled_decay = true;
+    cpu.network.net.decay = 0.02;
+    cpu.network.net.muon_momentum = 0.8;
+    let shape = cpu.network.net.input_shape();
+    let mut rng = Rng(941);
+    let input = Tensor::from_data(shape, rng.vec(shape.batch * shape.element_count())).unwrap();
+    let mut gpu = GpuExecutableNetwork::new(cpu.network.clone(), OxideBackend::new().unwrap());
+    gpu.params = cpu.params.clone();
+    gpu.init_train_buffers_gpu().unwrap();
+    cpu.zero_train_buffers();
+    gpu.zero_train_buffers_gpu().unwrap();
+
+    let cpu_forward = cpu.forward_training(&input).unwrap();
+    let device_forward = gpu.forward_training_device(&input).unwrap();
+    let expected = cpu_forward.final_output().unwrap();
+    let actual = gpu.backend.download_f32(&device_forward.gpu_layer_outputs[0]).unwrap();
+    close("ViT Muon native forward", &actual, &expected.data, 2e-4);
+
+    let seed = Tensor::from_data(expected.shape, rng.vec(expected.len())).unwrap();
+    let seeds = [Some(seed)];
+    let cpu_backward = cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds).unwrap();
+    let gpu_input = gpu
+        .backward_accumulate_seeded_gpu_with_input_gradient(&device_forward, &seeds)
+        .unwrap()
+        .expect("native ViT Muon input gradient");
+    close("ViT Muon input gradient", &gpu_input.data, &cpu_backward.input_gradient.data, 5e-4);
+    close(
+        "ViT Muon staged gradients",
+        &vit_updates(&gpu.host_fallback_train_buffers()[0]),
+        &vit_updates(&cpu.train_buffers[0]),
+        5e-4,
+    );
+
+    cpu.update_weights_muon(0.003, 1).unwrap();
+    gpu.update_weights_gpu(0.003, 0.9, 0.02, 1).unwrap();
+    close(
+        "ViT Muon and AdamW parameters",
+        &vit_blob(&gpu.params[0]),
+        &vit_blob(&cpu.params[0]),
+        5e-4,
+    );
+}
+
+#[test]
 fn vit_resident_clipping_preserves_frozen_accumulators_and_sanitizes_active_values() {
     let be=OxideBackend::new().unwrap();
     let input=be.upload_f32(&[7],&[f32::NAN,f32::INFINITY,f32::NEG_INFINITY,100.0,3.0,4.0,f32::NAN]).unwrap();

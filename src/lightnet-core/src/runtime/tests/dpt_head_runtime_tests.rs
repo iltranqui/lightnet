@@ -420,6 +420,65 @@ fn dpt_head_adamw_update_and_optimizer_state_round_trip() {
 }
 
 #[test]
+fn dpt_head_muon_rejects_adam_checkpoint_with_matrix_moments_atomically() {
+    let mut adam = make_executable(
+        "dpt_head",
+        1,
+        "adam=1\ndecoupled_decay=1\ndecay=0.02",
+        "",
+    );
+    fill_dpt_weights(&mut adam);
+    let input = dpt_input(&adam.network);
+    let forward = adam.forward(&input).unwrap();
+    let backward = adam
+        .backward_seeded_with_grad_mode(
+            &input,
+            &forward,
+            &[Some(dpt_output_seed(&adam.network))],
+            GradMode::Analytical,
+        )
+        .unwrap();
+    adam.accumulate_train_buffers(&backward.param_gradients)
+        .unwrap();
+    adam.update_weights_adam(0.01, 1).unwrap();
+    let adam_state = adam.host_adam_state[0]
+        .as_ref()
+        .expect("Adam update creates DPT child moments");
+    for &slot in &crate::dpt_head::DPT_MUON_WEIGHT_SLOTS {
+        assert!(adam_state.children[slot].weights.is_some(), "matrix slot {slot}");
+    }
+
+    let path = temp_weights_path("adam-to-muon-switch");
+    adam.save_optimizer_state(&path).unwrap();
+    let mut muon = make_executable(
+        "dpt_head",
+        1,
+        "muon=1\nadam=0\ndecoupled_decay=1\ndecay=0.02",
+        "",
+    );
+    fill_dpt_weights(&mut muon);
+    let params_before = match &muon.params[0] {
+        LayerParams::DptHead(weights) => weights.values.clone(),
+        _ => unreachable!(),
+    };
+
+    let error = muon.load_optimizer_state(&path).unwrap_err();
+    assert!(
+        matches!(error, Error::Weights(ref message)
+            if message.contains("DPT slot 0 weight moments") && message.contains("expected 0")),
+        "unexpected Adam-to-Muon checkpoint error: {error}"
+    );
+    assert_eq!(muon.adam_step, 0);
+    assert!(muon.host_adam_state[0].is_none());
+    assert!(muon.muon_state[0].is_none());
+    let LayerParams::DptHead(params_after) = &muon.params[0] else {
+        unreachable!()
+    };
+    assert_eq!(params_after.values, params_before);
+    let _ = fs::remove_file(path);
+}
+
+#[test]
 fn dpt_head_muon_uses_stable_slot_views_and_round_trips_optimizer_state() {
     let mut executable =
         make_executable("dpt_head", 1, "muon=1\ndecoupled_decay=1\ndecay=0.01", "");

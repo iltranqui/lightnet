@@ -337,3 +337,19 @@ full CLI/layer reruns after these edits and cfg-corpus remain unverified.
 The next family for native residency is Swin. Keep its optional residual
 projection and Rust-defined variable blob order explicit; do not combine this
 with ViT's unsupported attention variants in one change.
+
+DPT checkpoint-mode switch follow-up at `627d115`: a new host regression saves
+an actual DPT Adam DNOPT sidecar containing matrix moments, then verifies that
+a Muon-configured DPT executable rejects it without changing weights, step,
+Adam state or Muon state. Host check and gpu-check passed; the core `runtime::`
+filter passed **326/326** (20.03s, zero corpus tests selected), and
+`oxide_dpt_head` passed **1/1** (68.88s). A fresh `oxide_forward_tapes` run
+passed **1/1** (324.59s). The policy is rejection, not implicit moment
+discard; full DPT completion remains open.
+
+Optional ViT Muon coverage was added at `627d115`: focused
+`oxide_vit::vit_gpu_muon_hybrid_backward_and_adamw_update_match_cpu` passed
+**1/1** (23.91s). It verifies the existing hybrid path—native ViT forward and
+backward, host-staged parameter gradients, GPU Muon orthogonalization, and
+AdamW fallback—against CPU. Resident ViT Muon updates remain unimplemented and
+unverified; this test is not evidence of native resident Muon.
