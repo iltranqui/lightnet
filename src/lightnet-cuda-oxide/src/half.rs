@@ -2292,7 +2292,8 @@ impl lightnet_cuda::F16TensorOpsBackend for OxideBackend {
     }
 
     fn narrow_f32(&self, tensor: &Self::Tensor) -> Result<Self::TensorF16, Self::Error> {
-        OxideBackend::f32_to_f16(self, tensor, false)
+        let tensor=self.f32v(tensor)?;
+        OxideBackend::f32_to_f16(self, &tensor, false)
     }
 
     fn upload_f16(&self, shape: &[usize], host: &[f32]) -> Result<Self::TensorF16, Self::Error> {

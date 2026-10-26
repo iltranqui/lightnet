@@ -256,6 +256,7 @@ fn yolo_3d_rejects_gpu_execution_backward_and_updates() {
         gpu_rnn_caches: vec![],
         gpu_crnn_caches: vec![],
         gpu_lstm_caches: vec![],
+        gpu_gru_caches: vec![],
         gpu_moe_caches: vec![],
         gpu_eml_caches: vec![],
         gpu_dcnv4_caches: vec![],

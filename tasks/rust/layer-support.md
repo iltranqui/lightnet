@@ -41,6 +41,14 @@ islands, not native half training. Remaining variants and full device residency
 across all families are still open. No layer is
 certified complete by this continuation.
 
+Further unvalidated source now adds resident Muon to Mamba/Kimi/Tucker and
+non-BN GRU, including device momentum, AdamW fallback and DNOPT6 materialization.
+Dense AMP forward/dgrad/wgrad use half operands and tensor-core GEMMs, retaining
+f32 masters, optimizer state and parameter gradients. Non-BN GRU has new exact
+host BPTT and native cached BPTT, full/compact and half-storage inference, plus
+resident SGD/Adam/Muon. GRU BN training is still rejected. The old rows/counts
+below are historical evidence, not a certification of this unrun source.
+
 ## How this file was derived
 
 Read from code on 2026-10-18, not from plan prose. Line numbers drift; re-derive
@@ -113,7 +121,7 @@ with the command given rather than trusting the number.
 | `BatchNorm` | yes | C++ | fwd | exact | rust | native inference + batch-statistics training | device backward / host AdamW parameter update | yes |
 | `Crop` | yes | none | fwd | exact | rust | native inference + geometric training, RGB-shift and saturation/exposure HSV augmentation | device (atomic scatter) | no |
 | `Local` | yes | C++ | fwd | exact | rust | native f32 / host (unsupported activation) | device / CPU fallback | no |
-| `Gru` | yes | Rust | fwd | none | rust | native f32 inference incl. rolling-stat BN | training unsupported (no backward path) | no |
+| `Gru` | yes | Rust | fwd | exact non-BN BPTT (host finite differences passed) | rust | native full/compact non-BN training/inference; rolling-stat BN inference | non-BN native backward and resident SGD/Adam/Muon; oxide_gru_training passed; BN training open | half inference and dense AMP training (GPU-tested); f32 islands remain |
 | `Rnn` | yes | C++ | fwd | exact | T3 | native f32 inference/training incl. rolling-stat BN (supported activations) | mixed (unsupported activation host fallback) | no |
 | `Lstm` | yes | C++ | fwd | exact | T3 | native f32 inference/training incl. rolling-stat BN | mixed (unsupported variants host fallback) | no |
 | `Crnn` | yes | C++ | fwd | exact | T3 | native f32 inference/training incl. rolling-stat BN (supported activations) | mixed (unsupported activation host fallback) | no |

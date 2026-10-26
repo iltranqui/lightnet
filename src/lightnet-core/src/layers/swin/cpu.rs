@@ -949,7 +949,7 @@ pub(crate) fn window_attention_forward_with_indices(
         ));
     }
     let head_dim = channels / heads;
-    let head_elements = checked_product(&[tokens, channels], "attention head")?;
+    let head_elements = checked_product(&[tokens, head_dim], "attention head")?;
     let all_head_elements = checked_product(&[heads, head_elements], "attention heads")?;
     let mut q = vec![0.0; all_head_elements];
     let mut k = vec![0.0; all_head_elements];
@@ -959,7 +959,7 @@ pub(crate) fn window_attention_forward_with_indices(
     let mut probabilities =
         vec![0.0; checked_product(&[heads, matrix_len], "attention probabilities")?];
     let mut score_active = vec![false; probabilities.len()];
-    let mut context = vec![0.0; head_elements];
+    let mut context = vec![0.0; checked_product(&[tokens, channels], "attention context")?];
     let scale = 1.0 / (head_dim as f32).sqrt();
 
     for head in 0..heads {
@@ -1397,6 +1397,29 @@ mod tests {
         assert!(parameter_gradient[..4].iter().all(|&value| value == 0.0));
         assert_eq!(parameter_gradient[4], 0.0);
         assert!(parameter_gradient[5].is_finite());
+    }
+
+    #[test]
+    fn attention_multihead_qkv_adjoint_matches_finite_differences() {
+        // Cache head strides must agree in both directions. A one-head
+        // fixture cannot distinguish tokens*channels from tokens*head_dim.
+        for heads in [2,3] {
+            let channels=2*heads;
+            let qkv=(0..4*3*channels).map(|i|(i as f32*0.19).sin()*0.3).collect::<Vec<_>>();
+            let bias=(0..heads*9).map(|i|(i as f32*0.23).cos()*0.05).collect::<Vec<_>>();
+            let mask=vec![0.0;16];
+            let seed=(0..4*channels).map(|i|(i as f32*0.31).cos()*0.2).collect::<Vec<_>>();
+            let(_,cache)=window_attention_forward(&qkv,2,channels,heads,&bias,&mask).unwrap();
+            let expected=window_attention_backward(&seed,&cache).unwrap();
+            let objective=|x:&[f32]|window_attention_forward(x,2,channels,heads,&bias,&mask).unwrap().0
+                .iter().zip(&seed).map(|(x,g)|x*g).sum::<f32>();
+            let eps=0.001;
+            for i in 0..qkv.len(){
+                let mut plus=qkv.clone();plus[i]+=eps;let mut minus=qkv.clone();minus[i]-=eps;
+                let numeric=(objective(&plus)-objective(&minus))/(2.0*eps);
+                assert!((numeric-expected.qkv[i]).abs()<1e-4,"heads={heads}, QKV[{i}]: {numeric} vs {}",expected.qkv[i]);
+            }
+        }
     }
 
     #[test]

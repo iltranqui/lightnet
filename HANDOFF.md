@@ -1,13 +1,15 @@
 # Device completion handoff
 
 Date: 2026-10-25. Repository: `/home/kerrigan/src/DarkSuite/lightnet`.
-Branch at handoff: `main`. Latest implementation commit: `c9feefb`.
+Branch at handoff: `main`. Original implementation checkpoint: `c9feefb`.
+Later source continuations are described below; consult `git log` for the latest WIP.
 
 ## Contents
 
 - [User priority and execution restrictions](#user-priority-and-execution-restrictions)
 - [Read first](#read-first)
 - [Continuation after this handoff](#continuation-after-this-handoff)
+- [Muon, AMP and GRU source continuation](#muon-amp-and-gru-source-continuation)
 - [Implementation checkpoints](#implementation-checkpoints)
 - [Current implementation](#current-implementation)
 - [Code map](#code-map)
@@ -25,8 +27,10 @@ detections/parity comes later. Do not divert back to that oracle milestone.
 
 Standing user instructions:
 
-- **Write source only. Do not run Cargo check, build, test, run, training or
-  runtime probes.** The latest priority change did not lift this restriction.
+- **Latest authorization:** the user now permits Cargo checks and tests, with
+  at most **two threads** and only **one Cargo xtask check/test command at a
+  time**. Keep MemoryHigh=3G. The source-only restriction recorded below is
+  historical; training and unrelated executable probes remain outside scope.
 - Make local **WIP commits** when a feature slice is source-complete, clearly
   recording the missing validation. The user explicitly authorized these
   commits despite the AGENTS.md release-on-green rule. Do not make release tags
@@ -35,8 +39,8 @@ Standing user instructions:
 - Preserve unrelated changes listed below; stage named paths only.
 - Source/diff inspection is allowed. `git diff --check` was used; it does not
   establish compilation, correctness, GPU execution or parity.
-- If execution is later authorized: one build/test command at a time, at most
-  four jobs and `MemoryHigh=3G`. The session's 3G requirement is stricter than
+- For authorized verification: one check/test command at a time, at most
+  two jobs and `MemoryHigh=3G`. The session's 3G requirement is stricter than
   older 4G examples in the Rust handbook. Oxide uses the repository wrapper.
 
 The original handoff ended at `c9feefb`. The user subsequently requested source
@@ -98,6 +102,52 @@ editing or staging.
 
 The original per-layer descriptions below describe the earlier checkpoint;
 use this continuation and `tasks/rust/source-wip.md` for current source scope.
+
+## Muon, AMP and GRU source continuation
+
+The follow-up implementation request extends the resident banks to native
+Muon for Mamba/Kimi/Tucker and non-BN GRU. Matrix momentum, Newton-Schulz,
+AdamW fallback and final parameters remain on device. DNOPT6 saves materialize
+current device momentum, including before host-weight synchronization. Fully
+resident networks can defer Muon; other families retain eager hybrid updates.
+Scalar finiteness guards still synchronize.
+
+Oxide dense forward/dgrad/wgrad now use half operands and tensor-core GEMMs
+under AMP. Forward/dX use half storage; parameter gradients, master weights
+and optimizer state remain f32. Mixer scans and other unsupported operations
+can remain f32 islands. This is real dense AMP training source, not all-layer
+native-half completion or measured tensor-core execution.
+
+Non-BN GRU now has exact CPU BPTT, native device training forward/backward,
+forward-owned caches, resident SGD/Adam/Muon, compact and half-storage inference.
+Its sigmoid candidate and time-major sequence semantics match existing source.
+GRU BN training remains rejected; rolling-stat BN inference is preserved.
+
+At the source-only checkpoint, the new fixtures were unrun. CPU finite differences cover every GRU input/parameter;
+Oxide sources cover dense AMP, Muon order/gates/resume, full GRU accumulation,
+deferred steps and optimizer resume. No Cargo/check/build/test/runtime/training
+or benchmark execution occurred. Source review and `git diff --check` are the
+only verification. See `tasks/rust/device_completion_plan.md` for the exact map
+and remaining queue. Keep local WIP commits untagged and preserve unrelated work.
+
+The user subsequently authorized check/test execution with two jobs, serially.
+Host `cargo xtask check` passed for lightnet-core/lightnet-cli. Focused tests
+passed: GRU 4/4, Muon 26/26 and the broad runtime filter 324/324. Fixes include
+lazy training-buffer allocation/invalidation, fake backend routing metadata,
+explicit fallback fixtures and Swin's multi-head CPU cache stride. Device
+validation is in progress; see the source ledger for final evidence.
+
+Latest GPU evidence: `gpu-check` passed; `oxide_connected_amp` passed 3/3,
+and `oxide_gru_training` passed 1/1 across all optimizer/AMP combinations.
+The initial resident mixer suite passed 12/15. Its failures exposed a CPU
+Mamba scan-adjoint bug (C read from model parameters instead of the cached
+token projection). A finite-difference regression caught the error before the
+fix; all 19 Mamba host tests and the three focused resident Muon GPU tests
+passed after the correction. The separate SGD/Adam gate rerun also passed 1/1.
+All three original failures now pass; this is focused rerun evidence, not a
+second full resident-suite run.
+Verification remains serialized,
+with two build jobs, one GPU test thread and MemoryHigh=3G.
 
 ## Current implementation
 

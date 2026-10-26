@@ -39,6 +39,7 @@ where
             device_conv_params,
             f16_conv_weights,
             device_train_buffers,
+            train_buffers_initialized: false,
             device_moe_train_buffers,
             device_eml_train_buffers,
             device_dcnv4_train_buffers,
@@ -478,8 +479,9 @@ where
             }
         }
         if version >= 6 {
-            let entries: Vec<usize> = self
-                .muon_state
+            let mut muon_states = self.muon_state.clone();
+            self.materialize_resident_muon_states(&mut muon_states)?;
+            let entries: Vec<usize> = muon_states
                 .iter()
                 .enumerate()
                 .filter_map(|(index, state)| {
@@ -494,7 +496,7 @@ where
                 file.write_all(&(index as u64).to_le_bytes())?;
                 write_muon_layer_state(
                     &mut file,
-                    self.muon_state[index]
+                    muon_states[index]
                         .as_ref()
                         .expect("filtered to non-empty Muon state"),
                 )?;

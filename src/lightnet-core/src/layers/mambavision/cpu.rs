@@ -1076,7 +1076,7 @@ pub fn mambavision_backward(
                     let a = -a_log.exp();
                     let raw = dt * a;
                     let abar = raw.clamp(SCAN_MIN, SCAN_MAX).exp();
-                    let dh = dy * p[c_start + state] + dh_next[state];
+                    let dh = dy * cache.x_proj[c_start + state] + dh_next[state];
                     let b_value = cache.x_proj[b_start + state];
                     dxproj[c_start + state] += dy * h;
                     let d_abar = dh * hprev;
@@ -1710,6 +1710,43 @@ mod tests {
                 "actual={actual} expected={expected}"
             );
         }
+    }
+
+    #[test]
+    fn selective_scan_adjoint_uses_token_projection_coefficients() {
+        let shape = TensorShape::new(2, 1, 2, 1);
+        let spec = spec(2, 2, 1, 1);
+        let mut params = MambaVisionParams::zeroed(2, 2, 1, 1, 1, 1).unwrap();
+        let o = MambaOffsets::new(2, 2, 1, 1, 1, 1).unwrap();
+        params.values[o.in_b.start] = 1.0;
+        params.values[o.conv_x_w.start] = 1.0;
+        params.values[o.x_proj_w.clone()].fill(1.0);
+        params.values[o.out_w.start] = 1.0;
+        params.values[o.ln1_gamma.clone()].fill(1.0);
+        params.values[o.ln2_gamma.clone()].fill(1.0);
+        let input = [0.0; 4];
+        let state = MambaVisionState { values: vec![0.4] };
+        let seed = [0.7, -0.2, 0.3, 0.1];
+        let forward = mambavision_forward(&input, shape, &spec, &params, Some(&state)).unwrap();
+        let analytic = mambavision_backward(&seed, &params, &forward, None).unwrap();
+        let eps = 1.0e-3;
+        for index in o.x_proj_w.clone().chain(o.dt_proj_b.clone()).chain(o.a_log.clone()) {
+            let mut plus = params.clone();
+            let mut minus = params.clone();
+            plus.values[index] += eps;
+            minus.values[index] -= eps;
+            let fp = mambavision_forward(&input, shape, &spec, &plus, Some(&state)).unwrap();
+            let fm = mambavision_forward(&input, shape, &spec, &minus, Some(&state)).unwrap();
+            let fd = (loss(&fp.output, &seed) - loss(&fm.output, &seed)) / (2.0 * eps);
+            assert!((fd - analytic.params[index]).abs() < 1.0e-4,
+                "scan parameter[{index}] fd={fd} analytic={}", analytic.params[index]);
+        }
+        let plus = MambaVisionState { values: vec![state.values[0] + eps] };
+        let minus = MambaVisionState { values: vec![state.values[0] - eps] };
+        let fp = mambavision_forward(&input, shape, &spec, &params, Some(&plus)).unwrap();
+        let fm = mambavision_forward(&input, shape, &spec, &params, Some(&minus)).unwrap();
+        let fd = (loss(&fp.output, &seed) - loss(&fm.output, &seed)) / (2.0 * eps);
+        assert!((fd - analytic.state_in.values[0]).abs() < 1.0e-4);
     }
 
     #[test]

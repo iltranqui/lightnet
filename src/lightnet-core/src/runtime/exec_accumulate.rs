@@ -633,6 +633,17 @@ impl ExecutableNetwork {
                     };
                     accumulate_vec(&mut train.weight_updates, &gradient.weights)?;
                 }
+                (LayerKind::Gru(_), LayerParams::Gru(gradient)) => {
+                    let Some(LayerTrainBuffers::Gru(train))=self.train_buffers.get_mut(layer.index) else {
+                        return Err(Error::InvalidConfig("missing GRU train buffers".into()));
+                    };
+                    for(t,p)in [&mut train.input_z,&mut train.state_z,&mut train.input_r,
+                        &mut train.state_r,&mut train.input_h,&mut train.state_h].into_iter()
+                        .zip(crate::layers::gru::cpu::projections(gradient)) {
+                        accumulate_negative_vec(&mut t.weight_updates,&p.weights)?;
+                        accumulate_negative_vec(&mut t.bias_updates,&p.biases)?;
+                    }
+                }
                 (LayerKind::Rnn(_), LayerParams::Rnn(gradient)) => {
                     let Some(LayerTrainBuffers::Rnn(train)) =
                         self.train_buffers.get_mut(layer.index)

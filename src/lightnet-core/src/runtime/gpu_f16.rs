@@ -9,7 +9,7 @@ where
 {
     /// f16 twin of [`GpuExecutableNetwork::forward_compact`]. Convolution and
     /// connected operands use binary16 device storage with f32 accumulation.
-    /// MambaVision, KimiKDA and TuckerAttention use half activation storage around explicit
+    /// MambaVision, KimiKDA, TuckerAttention and non-BN GRU use half activation storage around explicit
     /// device f32 arithmetic islands; their master weights remain f32.
     /// The yolo heads are widened to f32 on download.
     /// Supports convolutional, maxpool, (local) avgpool, standalone batchnorm,
@@ -62,6 +62,12 @@ where
                             layer_index: layer.index,
                             name: "KimiKDA variant (f16 storage, f32 arithmetic)".into(),
                         });
+                    }
+                }
+                LayerKind::Gru(spec) => {
+                    if spec.batch_normalize {
+                        return Err(Error::UnsupportedLayer {layer_index:layer.index,
+                            name:"GRU BN (half-storage inference)".into()});
                     }
                 }
                 LayerKind::TuckerAttention(spec) => {
@@ -818,6 +824,12 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("f16 upsample", err))?,
+                (LayerKind::Gru(spec), LayerParams::Gru(params)) => {
+                    let input=self.backend.widen_f16(current_input.expect("GRU input"))
+                        .map_err(|e|backend_error("widen GRU half storage",e))?;
+                    let output=self.forward_gru_gpu(layer,spec,params,&input,launch_config)?;
+                    self.backend.narrow_f32(&output).map_err(|e|backend_error("narrow GRU half storage",e))?
+                }
                 (LayerKind::MambaVision(spec), LayerParams::MambaVision(params)) => {
                     let input = self.backend.widen_f16(current_input.expect("MambaVision input"))
                         .map_err(|err| backend_error("widen MambaVision half storage", err))?;

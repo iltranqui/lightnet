@@ -48,11 +48,12 @@ fn dcnv4_host_adam_and_optimizer_state_round_trip() {
 
 #[test]
 fn kimi_kda_runtime_and_fake_backend_host_fallback_match() {
+    // Revleaky pins whole-network host fallback now that scalar native paths exist.
     let network = Network::from_config(
         ConfigFile::parse_str(
             "kimi-runtime.cfg",
             "[net]\nwidth=2\nheight=1\nchannels=2\nbatch=1\n\
-                 [kimi_kda]\nrank=1\nexperts=2\ntop_k=0\nhidden=2\nload_balance=0.03\n",
+                 [kimi_kda]\nrank=1\nexperts=2\ntop_k=0\nhidden=2\nload_balance=0.03\nactivation=revleaky\n",
         )
         .unwrap(),
     )
@@ -1087,10 +1088,14 @@ impl F32TensorOpsBackend for FakeBackend {
         {
             return Err("route_concat_f32 metadata length mismatch".to_owned());
         }
-        let batch = inputs
-            .first()
-            .and_then(|tensor| tensor.shape.first().copied())
-            .ok_or("route_concat_f32 requires at least one input")?;
+        // Routing metadata defines the flat layout; token tensors can have
+        // nominal [batch*tokens, channels] shapes. Match the device backend.
+        let first=inputs.first().ok_or("route_concat_f32 requires at least one input")?;
+        let total=*input_total_channels.first().ok_or("route_concat_f32 missing channels")?;
+        let stride=total.checked_mul(channel_stride).filter(|&s|s>0)
+            .ok_or("route_concat_f32 invalid source stride")?;
+        if first.data.len()%stride!=0{return Err("route_concat_f32 source length mismatch".into());}
+        let batch=first.data.len()/stride;
         let total_channels = input_channels.iter().sum::<usize>();
         let mut out = vec![0.0; output_shape.iter().product()];
         let mut channel_offset = 0usize;
@@ -1135,7 +1140,11 @@ impl F32TensorOpsBackend for FakeBackend {
         {
             return Err("route_backward_f32 metadata length mismatch".to_owned());
         }
-        let batch = output_grad.shape[0];
+        let output_channels=input_channels.iter().sum::<usize>();
+        let stride=output_channels.checked_mul(channel_stride).filter(|&s|s>0)
+            .ok_or("route_backward_f32 invalid output stride")?;
+        if output_grad.data.len()%stride!=0{return Err("route_backward_f32 output length mismatch".into());}
+        let batch=output_grad.data.len()/stride;
         let mut output_channel_offset = 0usize;
         let mut out = Vec::with_capacity(input_shapes.len());
 
@@ -1150,7 +1159,7 @@ impl F32TensorOpsBackend for FakeBackend {
             for b in 0..batch {
                 for c in 0..src_channels {
                     let src_base =
-                        (b * output_grad.shape[1] + output_channel_offset + c) * channel_stride;
+                        (b * output_channels + output_channel_offset + c) * channel_stride;
                     let dst_base =
                         (b * source_total_channels + source_channel_offset + c) * channel_stride;
                     input_grad[dst_base..dst_base + channel_stride]

@@ -1,7 +1,6 @@
 //! Native f32 Tucker attention: padded window gather, low-rank projections,
 //! dense or minimax sparse attention and the exact CPU-reference adjoint.
-//! Native SGD/Adam keep serialized factors and gradients resident; Muon
-//! retains the explicit host-staged optimizer path.
+//! Native SGD/Adam/Muon keep serialized factors and gradients resident.
 use crate::error::{Error, Result};
 use crate::layers::vit::gpu::device_activation;
 use crate::model::{Layer, TuckerAttentionSpec};

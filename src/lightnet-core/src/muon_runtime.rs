@@ -19,6 +19,113 @@ pub(crate) struct MuonLayerState {
     pub matrices: Vec<MuonMatrixState>,
 }
 
+/// Matrix views of a mixer's serialized parameter bank, in DNOPT6 order.
+/// These are source-storage views, independent of forward GEMM packing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SerializedMuonMatrix {
+    pub range: std::ops::Range<usize>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+pub(crate) fn serialized_mixer_muon_layout(
+    kind: &LayerKind, input: TensorShape, params: &LayerParams,
+) -> Result<Vec<SerializedMuonMatrix>> {
+    let mut matrices = Vec::new();
+    let mut push = |start: usize, rows: usize, cols: usize| -> Result<()> {
+        let len = checked_product(&[rows, cols], "resident matrix")?;
+        let end = start.checked_add(len)
+            .ok_or_else(|| Error::InvalidConfig("resident Muon range overflow".into()))?;
+        if rows == 0 || cols == 0 {
+            return Err(Error::InvalidConfig("resident Muon matrix must be nonempty".into()));
+        }
+        matrices.push(SerializedMuonMatrix { range:start..end, rows, cols });
+        Ok(())
+    };
+    let total = match (kind, params) {
+        (LayerKind::Gru(s),LayerParams::Gru(p)) => {
+            crate::layers::gru::cpu::validate(s,p,input,TensorShape::new(1,1,s.output,input.batch))?;
+            let mut cursor=0;
+            for p in crate::layers::gru::cpu::projections(p) {
+                cursor+=p.biases.len();
+                push(cursor,s.output,p.weights.len()/s.output)?;
+                cursor+=p.weights.len();
+            }
+            cursor
+        }
+        (LayerKind::MambaVision(s), LayerParams::MambaVision(p)) => {
+            let half = s.filters / 2;
+            let width = checked_product(&[s.state, 2], "Mamba state width")?
+                .checked_add(s.dt_rank).ok_or_else(|| Error::InvalidConfig("Mamba projection overflow".into()))?;
+            let hidden = checked_product(&[s.filters, s.ffn_ratio], "Mamba FFN")?;
+            for block in crate::mambavision::mambavision_param_blocks(p).map_err(Error::InvalidConfig)? {
+                let (rows, cols, depthwise) = match block.name {
+                    "mambavision_in_proj_weights" => (s.filters, input.channels, false),
+                    "mambavision_conv_x" | "mambavision_conv_z" => (half, s.conv_size, true),
+                    "mambavision_x_proj" => (width, half, false),
+                    "mambavision_dt_proj" => (half, s.dt_rank, false),
+                    "mambavision_out_proj" => (s.filters, s.filters, false),
+                    "mambavision_res_proj" => (s.filters, input.channels, false),
+                    "mambavision_ffn_w1" => (hidden, s.filters, false),
+                    "mambavision_ffn_w2" => (s.filters, hidden, false),
+                    _ => continue,
+                };
+                if block.range.len() != checked_product(&[rows, cols], "Mamba resident block")? {
+                    return Err(Error::InvalidConfig("resident Mamba Muon block length".into()));
+                }
+                if depthwise && half > 1 {
+                    for channel in 0..half { push(block.range.start + channel * cols, 1, cols)?; }
+                } else { push(block.range.start, rows, cols)?; }
+            }
+            p.values.len()
+        }
+        (LayerKind::KimiKda(s), LayerParams::KimiKda(p)) => {
+            p.to_blob().map_err(Error::InvalidConfig)?;
+            let (c, r, h, e) = (s.filters, s.rank, s.hidden, s.experts);
+            let mut cursor = p.biases.len();
+            for (rows, cols) in [(r,c),(r,c),(c,c),(c,c),(r,c),(r,c),(e,c)]
+                .into_iter().chain((0..=e).map(|_| (h,c))).chain((0..=e).map(|_| (c,h))) {
+                push(cursor, rows, cols)?;
+                cursor += rows * cols;
+            }
+            if cursor != p.parameter_count() {
+                return Err(Error::InvalidConfig("resident Kimi Muon layout length".into()));
+            }
+            cursor
+        }
+        (LayerKind::TuckerAttention(s), LayerParams::TuckerAttention(p)) => {
+            p.to_blob().map_err(Error::InvalidConfig)?;
+            let (c, heads) = (s.filters, s.heads);
+            if heads == 0 || c % heads != 0 {
+                return Err(Error::InvalidConfig("resident Tucker Muon head geometry".into()));
+            }
+            let dim = c / heads;
+            let mut cursor = p.biases.len();
+            for (rows, cols) in [(c,s.rank_q),(c,s.rank_k),(c,s.rank_v)] {
+                push(cursor, rows, cols)?; cursor += rows * cols;
+            }
+            for rank in [s.rank_q, s.rank_k, s.rank_v] {
+                for _ in 0..heads { push(cursor, rank, dim)?; cursor += rank * dim; }
+            }
+            for _ in 0..heads { push(cursor, dim, s.rank_o)?; cursor += dim * s.rank_o; }
+            push(cursor, s.rank_o, c)?; cursor += s.rank_o * c;
+            if cursor != p.parameter_count() {
+                return Err(Error::InvalidConfig("resident Tucker Muon layout length".into()));
+            }
+            cursor
+        }
+        _ => return Err(Error::InvalidConfig("resident Muon layer kind mismatch".into())),
+    };
+    let mut end = 0;
+    for m in &matrices {
+        if m.range.start < end || m.range.end > total {
+            return Err(Error::InvalidConfig("resident Muon matrices overlap or exceed the bank".into()));
+        }
+        end = m.range.end;
+    }
+    Ok(matrices)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StagedMuonMatrix {
     pub rows: usize,
@@ -1340,6 +1447,39 @@ mod tests {
     use crate::cfg::ConfigFile;
     use crate::model::Network;
     use crate::runtime::ExecutableNetwork;
+
+    #[test]
+    fn resident_mixer_muon_ranges_match_cpu_visitor_values_and_dnopt_order() {
+        for (channels,body) in [
+            (3,"[gru]\noutput=4\n"),
+            (3,"[mambavision]\nfilters=4\nstate=2\nconv_size=3\ndt_rank=2\nffn_ratio=2\n"),
+            (3,"[kimi_kda]\nfilters=3\nrank=2\nexperts=3\nhidden=4\n"),
+            (4,"[tucker_attention]\nfilters=4\nsize=2\nheads=2\nrank_q=2\nrank_k=3\nrank_v=2\nrank_o=3\n"),
+        ] {
+            let cfg=format!("[net]\nwidth=3\nheight=2\nchannels={channels}\n{body}");
+            let network=Network::from_config(ConfigFile::parse_str("resident-muon-layout.cfg",&cfg).unwrap()).unwrap();
+            let mut cpu=ExecutableNetwork::new(network);
+            let serial=match &mut cpu.params[0] {
+                LayerParams::Gru(p)=>{for(i,x)in crate::layers::gru::cpu::projections_mut(p).into_iter()
+                    .flat_map(|p|p.biases.iter_mut().chain(&mut p.weights)).enumerate(){*x=i as f32;}
+                    crate::layers::gru::cpu::serialized(p)},
+                LayerParams::MambaVision(p)=>{for(i,x)in p.values.iter_mut().enumerate(){*x=i as f32;}p.values.clone()},
+                LayerParams::KimiKda(p)=>{for(i,x)in p.biases.iter_mut().chain(&mut p.weights).enumerate(){*x=i as f32;}p.to_blob().unwrap()},
+                LayerParams::TuckerAttention(p)=>{for(i,x)in p.biases.iter_mut().chain(&mut p.weights).enumerate(){*x=i as f32;}p.to_blob().unwrap()},
+                _=>panic!("mixer params"),
+            };
+            let layer=&cpu.network.layers[0];
+            let views=serialized_mixer_muon_layout(&layer.kind,layer.input_shape,&cpu.params[0]).unwrap();
+            let mut visited=0;
+            visit_muon_matrices(&layer.kind,layer.input_shape,layer.output_shape,
+                &mut cpu.params[0],&mut cpu.train_buffers[0],&mut |weights,_,rows,cols,scale| {
+                    let v=&views[visited];
+                    assert_eq!((rows,cols),(v.rows,v.cols)); assert_eq!(scale,1.0);
+                    assert_eq!(weights,&serial[v.range.clone()]); visited+=1; Ok(())
+                }).unwrap();
+            assert_eq!(visited,views.len());
+        }
+    }
 
     fn matrix_shapes_for(cfg: &str) -> Vec<(usize, usize)> {
         let network =

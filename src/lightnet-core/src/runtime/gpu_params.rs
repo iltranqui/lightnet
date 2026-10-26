@@ -495,6 +495,7 @@ where
     }
 
     pub(super) fn clear_device_train_buffers(&mut self) {
+        self.train_buffers_initialized = false;
         for entry in self.device_train_buffers.get_mut().iter_mut() {
             *entry = None;
         }

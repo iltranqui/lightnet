@@ -112,6 +112,7 @@ where
         let mut layer_outputs = Vec::with_capacity(self.network.layers.len());
         let mut layer_activation_inputs = Vec::with_capacity(self.network.layers.len());
         let mut recurrent_caches = Vec::with_capacity(self.network.layers.len());
+        let mut gpu_gru_caches = vec![None;self.network.layers.len()];
         let mut gpu_rnn_caches = Vec::with_capacity(self.network.layers.len());
         let mut gpu_crnn_caches = Vec::with_capacity(self.network.layers.len());
         let mut gpu_lstm_caches = Vec::with_capacity(self.network.layers.len());
@@ -1074,6 +1075,10 @@ where
                         layer.index
                     )));
                 }
+                (LayerKind::Gru(spec), LayerParams::Gru(params)) if training && !spec.batch_normalize => {
+                    let(output,cache)=self.forward_gru_training_gpu(layer,spec,params,current_input,launch_config)?;
+                    gpu_gru_caches[layer.index]=Some(cache);output
+                }
                 (LayerKind::Gru(spec), LayerParams::Gru(params)) if !training => {
                     self.forward_gru_gpu(layer, spec, params, current_input, launch_config)?
                 }
@@ -1213,6 +1218,7 @@ where
             gpu_rnn_caches,
             gpu_crnn_caches,
             gpu_lstm_caches,
+            gpu_gru_caches,
             gpu_moe_caches,
             gpu_eml_caches,
             gpu_dcnv4_caches,

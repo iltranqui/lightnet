@@ -7,12 +7,15 @@
 - [Components](#components)
 - [Implementation sequence](#implementation-sequence)
 - [Review](#review)
+- [Muon, AMP and GRU continuation](#muon-amp-and-gru-continuation)
 
 ## Priority and constraints
 
 Operator priority: full backward, native GPU updates, FP16 and every-layer
 completion precede the separate CPU detector-versus-/usr/bin/darknet milestone.
-Source only: no Cargo check/build/test/run, executable probes or training.
+Original scope was source only. The user now authorizes Cargo checks/tests,
+at most two jobs/test threads and one invocation at a time, under MemoryHigh=3G.
+Training and unrelated executable probes remain outside scope.
 Make local WIP commits after source-complete slices, with no verified release
 tags. Preserve unrelated Latin corpus/example/Cargo.lock work. Work directly
 without subagents under tasks/rust/AGENTS.md.
@@ -110,3 +113,88 @@ reviewed algebraically; no numeric proof is available. Half-storage inference
 uses f32 arithmetic islands and preserves the training cache. A resident update
 marks host mirrors stale immediately after each layer publication, including
 when a subsequent layer fails.
+
+## Muon, AMP and GRU continuation
+
+The operator requested implementing the remaining Muon/FP16/layer work.
+The user subsequently authorized serial check/test execution with two jobs.
+This source continuation supersedes
+the earlier Muon-hybrid-only scope above.
+
+```text
+src/
+|-- lightnet-core/src/
+|   |-- layers/
+|   |   |-- gru/
+|   |   |   |-- mod.rs
+|   |   |   |-- cpu.rs
+|   |   |   `-- gpu.rs
+|   |   |-- mambavision/gpu.rs
+|   |   `-- tucker_attention/gpu.rs
+|   |-- muon_runtime.rs
+|   `-- runtime/
+|       |-- exec_backward.rs
+|       |-- exec_accumulate.rs
+|       |-- gpu_backward.rs
+|       |-- gpu_backward_support.rs
+|       |-- gpu_forward.rs
+|       |-- gpu_forward_compact.rs
+|       |-- gpu_f16.rs
+|       |-- gpu_types.rs
+|       |-- gpu_state.rs
+|       |-- gpu_update.rs
+|       |-- gpu_resident_params.rs
+|       `-- tests/yolo_3d_runtime_tests.rs
+`-- lightnet-cuda-oxide/
+    |-- src/
+    |   |-- lib.rs
+    |   |-- mixed.rs
+    |   `-- half.rs
+    `-- tests/
+        |-- oxide_resident_params.rs
+        |-- oxide_connected_amp.rs
+        |-- oxide_gru_training.rs
+        `-- oxide_runtime_chain.rs
+```
+
+- Muon mapping defines serialized matrix views in the existing CPU visitor and
+  DNOPT6 order. Its unrun host fixture compares both values and shapes. Views
+  must use source storage, not the packed forward-GEMM layout.
+- Resident banks own persistent native matrix momentum and AdamW fallback
+  state. Updates mask matrix Adam gradients but preserve resumed moments.
+  Every layer is published only after staging its complete device result.
+  Finite-value diagnostics still transfer scalar flags. Mixed hybrid families
+  require eager synchronization; all-resident networks can defer Muon updates.
+- gpu_state materializes resident Muon momentum for DNOPT6 saves and explicit
+  host synchronization. Loaded state is validated and uploaded lazily. GRU
+  uses six child bias/weight moment slots, matching existing host optimizer IO.
+- mixed.rs implements dense half-operand tensor-core forward/dgrad/wgrad;
+  lib.rs selects it only under AMP. Forward/dX use half storage; gradients of
+  parameters and optimizer/master state stay f32. half.rs widening handles AMP
+  tensors before the explicit half-inference narrowing boundary.
+- GRU host/device code adds exact non-BN BPTT for the source's sigmoid candidate,
+  with a forward-owned device tape. Runtime dispatch, gradient accumulation,
+  native parameter residency and all three optimizers are wired. Compact and
+  half-storage inference read resident masters without replacing training state.
+  BN training remains rejected; legacy rolling-stat BN inference is preserved.
+- Fixtures cover CPU finite differences, repeated BPTT, native/deferred updates,
+  AMP, DNOPT resume, gates/reset and cast overflow. The historical GRU rejection
+  test now asserts only the BN restriction. The unrelated YOLO-3D fixture only
+  receives the new empty cache field required by its struct constructor.
+
+Implementation sequence and source status:
+
+- [x] Define serialized Muon views and unrun CPU visitor-order fixture.
+- [x] Write device-resident Muon momentum, AdamW fallback and DNOPT6 materialization.
+- [x] Write native dense AMP training forward/dgrad/wgrad and unrun primitive fixtures.
+- [x] Write non-BN GRU exact host/native BPTT, resident SGD/Adam/Muon and compact/half inference.
+- [x] Write unrun integration, gradient, gate/reset and resume fixtures.
+- [ ] Finish source/diff review and local WIP checkpoint, without a release tag.
+- [x] Host compilation and focused GRU (4)/Muon (26) tests passed with two jobs.
+- [ ] Resolve broad runtime failures and run the GPU-enabled check/Oxide suites serially.
+
+Remaining full-completion work includes other families' residency/Muon,
+RecursiveBlock controller/lattice/BN/body variants, other documented ViT and
+Clifford variants, GRU BN training, dense-loss gaps, DSConv variants and YOLO-3D.
+Dense AMP supplies real half arithmetic for projections; it does not establish
+native half coverage of all scan/attention/normalization operations or all layers.

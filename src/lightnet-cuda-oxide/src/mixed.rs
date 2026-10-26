@@ -8,18 +8,19 @@
 //! * f32 master weights, f32 optimizer state, f32 weight / bias / BN-scale
 //!   gradients and f32 BN statistics: the runtime keeps owning those through the
 //!   unchanged f32 trait ops (`sgd_update_f32`, `adam_update_f32`, ...).
-//! * f16 working copies of the conv weights, refreshed automatically after every
+//! * f16 working copies of conv and dense weights, refreshed after every
 //!   update (the update creates a new weight tensor; the copy is cached per
 //!   buffer identity, see [`OxideBackend::weights_half`]).
 //! * activations and activation gradients are stored in f16
 //!   (`OxideTensorF32::is_half`), conv forward / dgrad / wgrad run on the f16
-//!   tensor-core GEMM with f32 accumulation, im2col is f16, col2im accumulates in
+//!   tensor-core GEMM with f32 accumulation. Dense forward/dgrad/wgrad also use
+//!   half operands: dX is half storage and dW/dB remain f32. Im2col is f16, col2im accumulates in
 //!   f32 and rounds once, batch-norm statistics and reductions are f32.
 //! * ops without an f16 implementation widen their inputs to f32 on entry
 //!   ([`OxideBackend::f32v`]) and return f32 tensors, so correctness never
 //!   depends on coverage.
 //!
-//! Which op takes the f16 path: conv forward / dgrad / wgrad whenever AMP is on;
+//! Which op takes the f16 path: conv and dense forward / dgrad / wgrad whenever AMP is on;
 //! every other f16-capable op follows the storage type of its activation input
 //! (a half tensor in, a half tensor out), so f32 tensors that merely pass
 //! through (weight-gradient accumulation, host losses) are never rounded.
@@ -33,7 +34,7 @@ use std::borrow::Cow;
 use std::sync::{Arc, Weak};
 
 use cuda_core::DeviceBuffer;
-use lightnet_cuda::{BatchNormTrainForward, ElementwiseLaunchConfig, F32ActivationKind};
+use lightnet_cuda::{BatchNormTrainForward, ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 
 use crate::conv::{Geom, chunk_limit, col_cap_bytes, expect_len, expect_shape};
 use crate::fp8::Fp8Format;
@@ -267,6 +268,52 @@ impl OxideBackend {
             half: half.clone(),
         });
         Ok(half)
+    }
+
+    // ---- dense projections -----------------------------------------------
+
+    /// Dense AMP forward: binary16/bfloat16 operands, f32 GEMM accumulation
+    /// and bias, then one rounding at the activation-storage boundary.
+    pub(crate) fn connected_forward_amp(&self, x:&OxideTensorF32, weights:&OxideTensorF32,
+        biases:&OxideTensorF32, batch:usize, inputs:usize, outputs:usize,
+        config:ElementwiseLaunchConfig) -> Result<OxideTensorF32,OxideError> {
+        let op="connected_f32 (amp)";
+        self.connected_layout(op,x.len(),weights.len(),batch,inputs,outputs)?;
+        expect_len(op,"biases",biases.len(),outputs)?;
+        let xh=self.as_half(x)?;
+        let wh=self.as_half(weights)?;
+        let mut raw=self.alloc_uninit(batch*outputs)?;
+        self.hgemm(&xh.buf,&wh.buf,HOut::F32(&mut raw),&GemmArgs {
+            m:batch,n:outputs,k:inputs,lda:inputs,ldb:inputs,ldc:outputs,
+            trans_b:true,..GemmArgs::default()
+        })?;
+        let raw=OxideTensorF32::new(raw,&[batch,outputs]);
+        let biased=self.bias_add_f32(&raw,biases,outputs,1,config)?;
+        self.to_half_storage(&biased)
+    }
+
+    /// Dense AMP adjoint. dX uses half storage; dW/dB remain f32 so repeated
+    /// accumulation and resident optimizer state never round through half.
+    pub(crate) fn connected_backward_amp(&self,x:&OxideTensorF32,weights:&OxideTensorF32,
+        delta:&OxideTensorF32,batch:usize,inputs:usize,outputs:usize,
+    ) -> Result<(OxideTensorF32,OxideTensorF32,OxideTensorF32),OxideError> {
+        let op="connected_backward_f32 (amp)";
+        self.connected_layout(op,x.len(),weights.len(),batch,inputs,outputs)?;
+        expect_len(op,"delta",delta.len(),batch*outputs)?;
+        let (xh,wh,dyh)=(self.as_half(x)?,self.as_half(weights)?,self.as_half(delta)?);
+        let mut dx=self.alloc_uninit(batch*inputs)?;
+        self.hgemm(&dyh.buf,&wh.buf,HOut::F32(&mut dx),&GemmArgs {
+            m:batch,n:inputs,k:outputs,lda:outputs,ldb:inputs,ldc:inputs,
+            ..GemmArgs::default()
+        })?;
+        let mut dw=self.alloc_uninit(outputs*inputs)?;
+        self.hgemm(&dyh.buf,&xh.buf,HOut::F32(&mut dw),&GemmArgs {
+            m:outputs,n:inputs,k:batch,lda:outputs,ldb:inputs,ldc:inputs,
+            trans_a:true,..GemmArgs::default()
+        })?;
+        let db=self.bias_backward_amp(&self.wrap_half(dyh),outputs,1)?;
+        let dx=self.to_half_storage(&OxideTensorF32::new(dx,&[batch,inputs]))?;
+        Ok((dx,OxideTensorF32::new(dw,&[outputs,inputs]),db))
     }
 
     // ---- convolution -----------------------------------------------------

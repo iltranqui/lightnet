@@ -3198,13 +3198,13 @@ fn gru_native_inference_matches_cpu_with_rolling_batch_norm() {
 }
 
 #[test]
-fn gru_gpu_training_path_is_rejected_as_unsupported_not_misconfigured() {
-    let net = network("[net]\nwidth=2\nheight=1\nchannels=1\nbatch=1\n[gru]\noutput=2\nsteps=2\n");
+fn gru_gpu_bn_training_path_is_rejected_as_unsupported_not_misconfigured() {
+    let net = network("[net]\nwidth=2\nheight=1\nchannels=1\nbatch=1\n[gru]\noutput=2\nbatch_normalize=1\n");
     let input = patterned(net.net.input_shape());
     let gpu = GpuExecutableNetwork::new(net, OxideBackend::new().expect("Oxide"));
     let error = match gpu.forward_training_with_state(&input) {
         Err(error) => error,
-        Ok(_) => panic!("GRU GPU training remains unsupported without native backward support"),
+        Ok(_) => panic!("GRU BN training remains unsupported without a BN adjoint"),
     };
     assert!(
         format!("{error:?}").contains("UnsupportedLayer"),

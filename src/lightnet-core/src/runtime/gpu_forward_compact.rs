@@ -152,6 +152,8 @@ where
             };
 
             let output_gpu = match (&layer.kind, params) {
+                (LayerKind::Gru(spec), LayerParams::Gru(params)) => self.forward_gru_gpu(
+                    layer,spec,params,current_input.expect("GRU requires current input"),launch_config)?,
                 (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(weights)) => self.forward_recursive_block_gpu(
                     layer, spec, weights, current_input.expect("recursive requires current input"), launch_config, false)?.0,
                 (LayerKind::Vit(spec), LayerParams::Vit(weights)) => vit_gpu::forward(

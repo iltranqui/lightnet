@@ -2267,6 +2267,11 @@ impl ExecutableNetwork {
                         &mut layer_output_gradients,
                     )?;
                 }
+                (LayerKind::Gru(spec), LayerParams::Gru(params)) => {
+                    let (dx,dp)=crate::layers::gru::cpu::backward(spec,params,current_input,&grad)?;
+                    param_gradients[layer.index]=LayerParams::Gru(dp);
+                    accumulate_previous_gradient(layer.index,&dx,&mut input_gradient,&mut layer_output_gradients)?;
+                }
                 (LayerKind::Rnn(spec), LayerParams::Rnn(params)) => {
                     let Some(RecurrentForwardCache::Rnn(cache)) = forward
                         .recurrent_caches

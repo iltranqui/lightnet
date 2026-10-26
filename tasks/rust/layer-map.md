@@ -33,7 +33,7 @@ Per layer directory under `src/lightnet-core/src/layers/`: which files hold the 
 | `eml_convolutional` | - | yes | - | - |
 | `foveation_film` | yes | yes | `foveation_film.rs` | `oxide_foveation_film` |
 | `graph_conv` | yes | yes | `graph_conv.rs` | `oxide_graph_conv` |
-| `gru` | - | yes | - | - |
+| `gru` | yes (non-BN adjoint) | yes | shared dense/vector/sequence | `oxide_gru_training` (unrun WIP) |
 | `hyperbolic_foveation` | yes | yes | - | `oxide_hyperbolic_foveation` |
 | `jev_ce` | yes | - | - | - |
 | `kimi_kda` | yes | yes | `kimi_kda.rs` | `oxide_kimi_kda` (unrun WIP) |

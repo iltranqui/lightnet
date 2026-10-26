@@ -1,7 +1,7 @@
 //! Native MambaVision composition and exact input/parameter adjoints.
 //! Parameters and update directions retain the CPU serialized block order.
-//! Native SGD/Adam retain parameters, gradients and moments on device. Muon
-//! keeps its explicit hybrid path. Boundary flags are read at backward entry.
+//! Native SGD/Adam/Muon retain parameters, gradients and moments on device.
+//! Boundary flags are read at backward entry.
 use std::ops::Range;
 use super::cpu::{MambaOffsets, MambaVisionGeometry};
 use crate::layers::vit::gpu::device_activation;

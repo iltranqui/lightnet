@@ -276,6 +276,7 @@ where
         }
         *self.device_eml_train_buffers.get_mut() = eml_train_buffers;
         self.reset_resident_parameter_gradients()?;
+        self.train_buffers_initialized = true;
         Ok(())
     }
 
@@ -292,7 +293,7 @@ where
     /// One optimizer step over device convolutions, EML SGD, and MoE SGD/Adam,
     /// including BN scales. EML Adam, HyperbolicFoveation, and FoveationFilm
     /// parameters are updated through their host fallback buffers.
-    /// Supported native MambaVision, KimiKDA and TuckerAttention SGD/Adam
+    /// Supported native MambaVision, KimiKDA, TuckerAttention and non-BN GRU SGD/Adam
     /// parameters, accumulators and moments use resident device banks.
     /// The optimizer follows `[net]`: SGD with
     /// momentum by default, Adam with `adam=1` (`B1`/`B2`/`eps`, coupled L2
@@ -318,8 +319,10 @@ where
     /// expert params remain stale until [`Self::sync_host_weights_from_device`]
     /// runs (call it before reading or saving `params`). Falls back to eager
     /// sync when CPU backward reads host weights. Supported native MambaVision,
-    /// KimiKDA and TuckerAttention SGD/Adam banks also remain device-authoritative
+    /// KimiKDA, TuckerAttention and non-BN GRU SGD/Adam banks also remain device-authoritative
     /// until synchronization; forward reads their updated device weights.
+    /// Muon can defer when every trainable family uses these resident banks;
+    /// mixed networks retaining hybrid Muon families require eager updates.
     pub fn update_weights_gpu_deferred(
         &mut self,
         lr: f32,
@@ -384,7 +387,8 @@ where
         Ok(())
     }
 
-    pub(super) fn update_weights_gpu_muon(&mut self, lr: f32, decay: f32, batch: usize) -> Result<()> {
+    pub(super) fn update_weights_gpu_muon(&mut self, lr: f32, decay: f32, batch: usize,
+        sync_host_weights: bool) -> Result<()> {
         let net = self.network.net.clone();
         if !net.muon || net.adam || !net.decoupled_decay {
             return Err(Error::InvalidConfig(
@@ -430,6 +434,7 @@ where
                         | (LayerKind::Moe(_), LayerParams::Moe(_))
                         | (LayerKind::Local(_), LayerParams::Local(_))
                         | (LayerKind::Rnn(_), LayerParams::Rnn(_))
+                        | (LayerKind::Gru(_), LayerParams::Gru(_))
                         | (LayerKind::Lstm(_), LayerParams::Lstm(_))
                         | (LayerKind::Crnn(_), LayerParams::Crnn(_))
                         | (LayerKind::Vit(_), LayerParams::Vit(_))
@@ -455,6 +460,14 @@ where
                 layer_index: index,
                 name: "GPU Muon supports standard convolution, EML, MoE, DCNv4, deform_conv, and single-template DSConv matrices without BN via host-staged gradients, GraphConv matrices including BN through the existing CPU fallback, plus host-gradient local/RNN/LSTM/CRNN/Kimi/MambaVision/Tucker/Swin/ViT/deconvolutional/connected matrices and standalone batch-norm parameters; other parameter families remain explicitly unsupported".to_owned(),
             });
+        }
+        let resident_layers = self.resident_parameter_banks.borrow().iter()
+            .map(Option::is_some).collect::<Vec<_>>();
+        if !sync_host_weights && self.params.iter().enumerate().any(|(i,p)| {
+            !matches!(p,LayerParams::None | LayerParams::DepthAnything(_))
+                && !resident_layers.get(i).copied().unwrap_or(false)
+        }) {
+            return Err(Error::InvalidConfig("deferred GPU Muon requires every trainable parameter family to use a resident bank; hybrid families require eager synchronization".into()));
         }
         let step = self
             .adam_step
@@ -506,10 +519,12 @@ where
         for index in dcnv4_muon_layers {
             self.flush_device_dcnv4_gradients_to_host(Some(index))?;
         }
+        self.update_resident_muon_parameters(&adam,loss_scale,ElementwiseLaunchConfig::default())?;
         let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
         for index in 0..layer_count {
             let layer = self.network.layers[index].clone();
             if !layer.train.updates_at(iteration_num, burn_in)
+                || resident_layers.get(index).copied().unwrap_or(false)
                 || matches!(self.params[index], LayerParams::None)
                 || matches!(layer.kind, LayerKind::DepthAnything(_))
             {
@@ -991,8 +1006,12 @@ where
                 train.pending = None;
             }
         }
+        drop(buffers);
         self.adam_step = step;
-        self.host_weights_stale = false;
+        if sync_host_weights {
+            self.synchronize_resident_parameter_state()?;
+            self.host_weights_stale = false;
+        }
         Ok(())
     }
 
@@ -1009,12 +1028,7 @@ where
             self.retire_resident_parameter_banks()?;
         }
         if self.network.net.muon {
-            if !sync_host_weights {
-                return Err(Error::InvalidConfig(
-                    "GPU Muon does not support deferred host synchronization".to_owned(),
-                ));
-            }
-            return self.update_weights_gpu_muon(lr, decay, batch);
+            return self.update_weights_gpu_muon(lr, decay, batch, sync_host_weights);
         }
         let config = ElementwiseLaunchConfig::default();
         self.defer_host_sync = !sync_host_weights;
@@ -2346,6 +2360,14 @@ where
                             0.0,
                             batch,
                         );
+                    }
+                }
+                (LayerParams::Gru(params), LayerTrainBuffers::Gru(train)) => {
+                    let layer_lr=lr*layer.train.learning_rate_scale;
+                    for (p,t) in crate::layers::gru::cpu::projections_mut(params).into_iter().zip([
+                        &mut train.input_z,&mut train.state_z,&mut train.input_r,&mut train.state_r,
+                        &mut train.input_h,&mut train.state_h]) {
+                        update_connected_params(p,t,layer_lr,momentum,decay,batch);
                     }
                 }
                 (LayerParams::Rnn(params), LayerTrainBuffers::Rnn(train)) => {

@@ -333,12 +333,13 @@ fn vit_sgd_update_applies_decay_and_reduced_mhc_rate() {
 
 #[test]
 fn tucker_attention_cpu_and_fake_backend_forward_backward_and_sgd_match() {
+    // Revleaky deliberately selects the documented unmapped-activation fallback.
     let network = Network::from_config(
         ConfigFile::parse_str(
             "tucker-runtime.cfg",
             "[net]\nwidth=2\nheight=2\nchannels=2\nbatch=1\n\
                  [tucker_attention]\nsize=2\nheads=1\nrank=1\nrank_k=2\nrank_o=2\n\
-                 activation=tanh\nmsa=1\nmsa_block=1\nmsa_topk=1\n",
+                 activation=revleaky\nmsa=1\nmsa_block=1\nmsa_topk=1\n",
         )
         .unwrap(),
     )
@@ -401,11 +402,12 @@ fn tucker_attention_cpu_and_fake_backend_forward_backward_and_sgd_match() {
 
 #[test]
 fn mambavision_runtime_and_fake_backend_host_fallback_match() {
+    // Keep this host-cache/state test on an explicitly unsupported device activation.
     let network = Network::from_config(
         ConfigFile::parse_str(
             "mambavision-runtime.cfg",
             "[net]\nwidth=2\nheight=1\nchannels=2\nbatch=1\n\
-                 [mambavision]\nstate=1\nconv_size=1\ndt_rank=1\nffn_ratio=1\nactivation=tanh\n",
+                 [mambavision]\nstate=1\nconv_size=1\ndt_rank=1\nffn_ratio=1\nactivation=revleaky\n",
         )
         .unwrap(),
     )

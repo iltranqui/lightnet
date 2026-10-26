@@ -110,6 +110,7 @@ where
     pub(crate) gpu_rnn_caches: Vec<Option<GpuRnnBackwardCache<T>>>,
     pub(crate) gpu_crnn_caches: Vec<Option<GpuCrnnBackwardCache<T>>>,
     pub(crate) gpu_lstm_caches: Vec<Option<GpuLstmBackwardCache<T>>>,
+    pub(crate) gpu_gru_caches: Vec<Option<crate::layers::gru::gpu::DeviceCache<T>>>,
     pub(crate) gpu_moe_caches: Vec<Option<GpuMoeBackwardCache<T>>>,
     pub(crate) gpu_eml_caches: Vec<Option<GpuEmlBackwardCache<T>>>,
     pub(crate) gpu_dcnv4_caches: Vec<Option<dcnv4_gpu::ForwardCache<T>>>,
@@ -216,6 +217,7 @@ where
     /// because `B::TensorF16` only exists for `B: F16TensorOpsBackend`.
     pub(super) f16_conv_weights: RefCell<Vec<Option<std::rc::Rc<dyn std::any::Any>>>>,
     pub(super) device_train_buffers: RefCell<Vec<Option<GpuConvolutionTrainBuffers<B::Tensor>>>>,
+    pub(super) train_buffers_initialized: bool,
     pub(super) device_moe_train_buffers: RefCell<Vec<Option<GpuMoeTrainBuffers<B::Tensor>>>>,
     pub(super) device_eml_train_buffers: RefCell<Vec<Option<GpuEmlTrainBuffers<B::Tensor>>>>,
     pub(crate) device_dcnv4_train_buffers: RefCell<Vec<Option<GpuDcnv4TrainBuffers<B::Tensor>>>>,

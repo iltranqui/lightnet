@@ -18,6 +18,7 @@ where
                     }
                 }
                 LayerKind::Lstm(_) => {}
+                LayerKind::Gru(spec) => { if spec.batch_normalize { return true; } }
                 LayerKind::RecursiveBlock(spec) => {
                     if !crate::layers::recursive_block::gpu::supported(spec) { return true; }
                 }
@@ -137,7 +138,7 @@ where
             let conv = self.device_train_buffers.borrow();
             let moe = self.device_moe_train_buffers.borrow();
             let eml = self.device_eml_train_buffers.borrow();
-            conv.len() != self.network.layers.len()
+            !self.train_buffers_initialized || conv.len() != self.network.layers.len()
                 || moe.len() != self.network.layers.len()
                 || eml.len() != self.network.layers.len()
                 || self.cpu_fallback_train_buffers.borrow().len() != self.network.layers.len()

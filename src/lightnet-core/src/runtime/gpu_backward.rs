@@ -67,13 +67,13 @@ where
             let moe = self.device_moe_train_buffers.borrow();
             let eml = self.device_eml_train_buffers.borrow();
             let dcnv4 = self.device_dcnv4_train_buffers.borrow();
-            conv.len() != self.network.layers.len()
+            !self.train_buffers_initialized || conv.len() != self.network.layers.len()
                 || moe.len() != self.network.layers.len()
                 || eml.len() != self.network.layers.len()
                 || dcnv4.len() != self.network.layers.len()
-                // A transformer-only network legitimately has no convolution
-                // buffers. Initialization is a length contract, not a test
-                // for whether any layer owns convolution parameters.
+                // Constructor vectors have the right length but empty slots.
+                // The explicit flag also handles transformer-only networks
+                // that legitimately never own convolution buffers.
                 || self.cpu_fallback_train_buffers.borrow().len() != self.network.layers.len()
         };
         if train_buffers_uninitialized {
@@ -397,6 +397,9 @@ where
                         config,
                         &mut layer_output_gradients,
                     )?;
+                }
+                (LayerKind::Gru(spec), Some(LayerParams::Gru(params))) => {
+                    self.backward_gru_gpu(layer,spec,params,forward,grad,config,&mut layer_output_gradients)?;
                 }
                 (LayerKind::Rnn(spec), Some(LayerParams::Rnn(params))) => {
                     self.backward_rnn_gpu(

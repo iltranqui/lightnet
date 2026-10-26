@@ -321,3 +321,145 @@ fn half_storage_mixer_inference_keeps_training_cache_and_resident_updates() {
         close("half-storage reads updated resident master", &current.data, &expected.data);
     }
 }
+
+fn mixer_fixture(kind: usize, optimizer: &str) -> (ExecutableNetwork, GpuExecutableNetwork<OxideBackend>, Tensor) {
+    match kind {
+        0 => fixture(optimizer, ""),
+        1 => kimi_fixture(optimizer),
+        _ => {
+            let cfg = format!("[net]\nbatch=2\nwidth=3\nheight=2\nchannels=4\nloss_scale=8\ndecay=0.003\n{optimizer}\n[tucker_attention]\nfilters=4\nsize=2\nheads=2\nrank_q=2\nrank_k=3\nrank_v=2\nrank_o=3\nactivation=gelu\n");
+            let net = Network::from_config(ConfigFile::parse_str("resident-tucker.cfg", &cfg).unwrap()).unwrap();
+            let mut cpu = ExecutableNetwork::new(net.clone());
+            let LayerParams::TuckerAttention(p) = &mut cpu.params[0] else { panic!("Tucker params") };
+            for (i,x) in p.biases.iter_mut().chain(&mut p.weights).enumerate() { *x=(i as f32*0.13+0.2).sin()*0.2; }
+            let mut gpu = GpuExecutableNetwork::new(net, OxideBackend::new().unwrap());
+            gpu.params=cpu.params.clone(); gpu.init_train_buffers_gpu().unwrap();
+            let shape=cpu.network.net.input_shape();
+            let input=Tensor::from_data(shape,(0..shape.batch*shape.element_count()).map(|i|(i as f32*0.17).cos()*0.2).collect()).unwrap();
+            (cpu,gpu,input)
+        }
+    }
+}
+fn mixer_values(p: &LayerParams) -> Vec<f32> {
+    match p {
+        LayerParams::MambaVision(p) => p.values.clone(),
+        LayerParams::KimiKda(p) => p.to_blob().unwrap(),
+        LayerParams::TuckerAttention(p) => p.to_blob().unwrap(),
+        _ => panic!("mixer params"),
+    }
+}
+fn mixer_updates(t: &LayerTrainBuffers) -> Vec<f32> {
+    match t {
+        LayerTrainBuffers::MambaVision(t) => t.updates.clone(),
+        LayerTrainBuffers::KimiKda(t) => [t.bias_updates.as_slice(),t.weight_updates.as_slice()].concat(),
+        LayerTrainBuffers::TuckerAttention(t) => [t.bias_updates.as_slice(),t.weight_updates.as_slice()].concat(),
+        _ => panic!("mixer train"),
+    }
+}
+
+#[test]
+fn resident_muon_three_steps_deferred_momentum_and_dnopt6_resume() {
+    for kind in 0..3 {
+        let (mut cpu,mut gpu,input)=mixer_fixture(kind,"muon=1\nadam=0\ndecoupled_decay=1\neps=0.001\n");
+        let original=gpu.params.clone();
+        let decay=cpu.network.net.decay;
+        for _ in 0..3 {
+            backward(&mut cpu,&mut gpu,&input);
+            assert!(mixer_updates(&gpu.host_fallback_train_buffers()[0]).iter().all(|&x|x==0.0),
+                "Muon backward must keep parameter gradients on device");
+            cpu.update_weights_muon(0.002,2).unwrap();
+            gpu.update_weights_gpu_deferred(0.002,0.7,decay,2).unwrap();
+            assert_eq!(gpu.params,original);
+            let want=cpu.forward(&input).unwrap().final_output().unwrap().clone();
+            let got=gpu.forward_compact(&input).unwrap().final_output.unwrap();
+            close("resident Muon updated forward",&got.data,&want.data);
+        }
+        let path=std::env::temp_dir().join(format!("resident-muon-{kind}-{}.opt",std::process::id()));
+        gpu.save_optimizer_state(&path).unwrap(); // Device state is still authoritative.
+        gpu.sync_host_weights_from_device().unwrap();
+        close("resident Muon parameters",&mixer_values(&gpu.params[0]),&mixer_values(&cpu.params[0]));
+        let mut resumed=GpuExecutableNetwork::new(gpu.network.clone(),OxideBackend::new().unwrap());
+        resumed.params=gpu.params.clone(); resumed.init_train_buffers_gpu().unwrap();
+        resumed.load_optimizer_state(&path).unwrap();
+        assert_eq!(resumed.adam_step(),3);
+        backward(&mut cpu,&mut resumed,&input);
+        cpu.update_weights_muon(0.002,2).unwrap();
+        resumed.update_weights_gpu(0.002,0.7,decay,2).unwrap();
+        close("resident Muon resumed",&mixer_values(&resumed.params[0]),&mixer_values(&cpu.params[0]));
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[test]
+fn resident_muon_gates_preserve_pending_gradients_and_reset_preserves_momentum() {
+    for kind in 0..3 {
+        let(mut cpu,mut gpu,input)=mixer_fixture(kind,"muon=1\ndecoupled_decay=1\n");
+        cpu.network.layers[0].train.dont_update=1; gpu.network.layers[0].train.dont_update=1;
+        let original=gpu.params.clone(); let decay=cpu.network.net.decay;
+        backward(&mut cpu,&mut gpu,&input);
+        cpu.update_weights_muon(0.002,2).unwrap();
+        gpu.update_weights_gpu_deferred(0.002,0.7,decay,2).unwrap();
+        gpu.synchronize_resident_parameter_gradients().unwrap();
+        assert_eq!(gpu.params,original);
+        close("Muon gated directions",&mixer_updates(&gpu.host_fallback_train_buffers()[0]),&mixer_updates(&cpu.train_buffers[0]));
+        cpu.set_train_iteration(1);gpu.set_train_iteration(1);
+        cpu.update_weights_muon(0.002,2).unwrap();gpu.update_weights_gpu(0.002,0.7,decay,2).unwrap();
+        close("Muon gate release",&mixer_values(&gpu.params[0]),&mixer_values(&cpu.params[0]));
+        cpu.zero_train_buffers();gpu.zero_train_buffers_gpu().unwrap();
+        // A zero-gradient step still advances the retained Nesterov momentum.
+        cpu.update_weights_muon(0.002,2).unwrap();gpu.update_weights_gpu(0.002,0.7,decay,2).unwrap();
+        close("Muon reset retains momentum",&mixer_values(&gpu.params[0]),&mixer_values(&cpu.params[0]));
+    }
+}
+
+#[test]
+fn resident_muon_preserves_adam_moments_when_switching_from_adamw() {
+    for kind in 0..3 {
+        let(mut cpu,mut gpu,input)=mixer_fixture(kind,"adam=1\ndecoupled_decay=1\neps=0.001\n");
+        let decay=cpu.network.net.decay;
+        backward(&mut cpu,&mut gpu,&input);
+        cpu.update_weights_adam(0.002,2).unwrap();
+        gpu.update_weights_gpu_deferred(0.002,0.7,decay,2).unwrap();
+        // Matrix Adam moments are nonzero. Muon zeroes their new Adam
+        // gradients, but must still preserve/advance the loaded moments.
+        cpu.network.net.adam=false;cpu.network.net.muon=true;
+        gpu.network.net.adam=false;gpu.network.net.muon=true;
+        backward(&mut cpu,&mut gpu,&input);
+        cpu.update_weights_muon(0.002,2).unwrap();
+        gpu.update_weights_gpu(0.002,0.7,decay,2).unwrap();
+        close("Muon retains existing matrix Adam moments",&mixer_values(&gpu.params[0]),&mixer_values(&cpu.params[0]));
+    }
+}
+
+#[test]
+fn mixer_amp_training_runs_half_projections_with_resident_master_updates() {
+    for kind in 0..3 {
+        for optimizer in ["adam=0\n","adam=1\neps=0.001\n","muon=1\ndecoupled_decay=1\neps=0.001\n"] {
+            let(mut cpu,baseline,input)=mixer_fixture(kind,optimizer);
+            let mut gpu=GpuExecutableNetwork::new(baseline.network.clone(),OxideBackend::new().unwrap().with_amp(true));
+            gpu.params=baseline.params.clone();gpu.init_train_buffers_gpu().unwrap();
+            let decay=cpu.network.net.decay;
+            for _ in 0..2 {
+                let host=cpu.forward_training(&input).unwrap();let device=gpu.forward_training_device(&input).unwrap();
+                let shape=gpu.network.layers[0].output_shape;
+                let seeds=[Some(Tensor::from_data(shape,vec![0.1;shape.batch*shape.element_count()]).unwrap())];
+                let scaled=[Some(Tensor::from_data(shape,vec![0.8;shape.batch*shape.element_count()]).unwrap())];
+                let expected=cpu.backward_accumulate_seeded(&input,&host,&scaled).unwrap();
+                let got=gpu.backward_accumulate_seeded_gpu_with_input_gradient(&device,&seeds).unwrap().unwrap();
+                for (a,b) in got.data.iter().zip(&expected.input_gradient.data) {
+                    assert!(a.is_finite()&&b.is_finite()&&(a-b).abs()<=0.01*(1.0+b.abs()));
+                }
+                if cpu.network.net.muon { cpu.update_weights_muon(0.002,2).unwrap(); }
+                else if cpu.network.net.adam { cpu.update_weights_adam(0.002,2).unwrap(); }
+                else { cpu.update_weights(0.002/8.0,0.7,decay*8.0,2); }
+                gpu.update_weights_gpu_deferred(0.002,0.7,decay,2).unwrap();
+                // Exercise inference between AMP steps without replacing training state.
+                gpu.forward_compact_f16(&input).unwrap();
+            }
+            gpu.sync_host_weights_from_device().unwrap();
+            for(a,b)in mixer_values(&gpu.params[0]).iter().zip(mixer_values(&cpu.params[0])){
+                assert!(a.is_finite()&&b.is_finite()&&(a-b).abs()<=0.01*(1.0+b.abs()));
+            }
+        }
+    }
+}

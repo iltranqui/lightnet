@@ -14482,6 +14482,9 @@ impl F32TensorOpsBackend for OxideBackend {
         outputs: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
+        if self.amp {
+            return self.connected_forward_amp(x,weights,biases,batch,inputs,outputs,config);
+        }
         let x_f = self.f32v(x)?;
         let x = &*x_f;
         let weights_f = self.f32v(weights)?;
@@ -14540,6 +14543,9 @@ impl F32TensorOpsBackend for OxideBackend {
         outputs: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        if self.amp {
+            return self.connected_backward_amp(x,weights,delta,batch,inputs,outputs);
+        }
         let x_f = self.f32v(x)?;
         let x = &*x_f;
         let weights_f = self.f32v(weights)?;
