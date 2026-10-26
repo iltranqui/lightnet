@@ -4,7 +4,7 @@
 use super::cpu::{DptHeadGeometry, DptHeadWeightLayout, dpt_head_weight_layout};
 use crate::error::{Error, Result};
 use crate::model::{DptHeadSpec, Layer};
-use crate::runtime::{GpuExecutableNetwork, LayerTrainBuffers, backend_error, tensor_backend_shape};
+use crate::runtime::{GpuExecutableNetwork, LayerTrainBuffers, ResidentMomentSlot, ResidentParameterRange, backend_error, tensor_backend_shape};
 use lightnet_cuda::{BilinearGatherGeometry, ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 
 #[derive(Clone, Debug)]
@@ -25,6 +25,7 @@ pub(crate) struct DeviceCache<T> {
     geometry: DptHeadGeometry,
     layout: DptHeadWeightLayout,
     weights: Vec<Option<T>>,
+    resident_generation: Option<u64>,
     nodes: Vec<Node<T>>,
 }
 
@@ -121,15 +122,33 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
         if params.values.len() != layout.total {
             return Err(Error::InvalidConfig("DPT GPU parameter length mismatch".into()));
         }
-        let mut weights = Vec::with_capacity(66);
-        for range in &layout.slots {
-            weights.push(if range.len == 0 { None } else {
-                Some(self.backend.upload_f32(&[range.len], &params.values[range.start..range.start+range.len])
-                    .map_err(|e| backend_error("upload DPT weights", e))?)
-            });
-        }
+        let active = |slot: usize| crate::dpt_head::DPT_MUON_WEIGHT_SLOTS.contains(&slot)
+            || crate::dpt_head::DPT_BIAS_SLOTS.contains(&slot);
+        let matrix = |slot: usize| crate::dpt_head::DPT_MUON_WEIGHT_SLOTS.contains(&slot);
+        let host_layout = layout.slots.iter().enumerate().map(|(slot, range)| ResidentParameterRange {
+            range: range.start..range.start + range.len,
+            decay: active(slot) && matrix(slot),
+            coupled_decay: active(slot),
+            moment_slot: if !active(slot) { None }
+                else if matrix(slot) {
+                    (!self.network.net.muon).then_some(ResidentMomentSlot::ChildWeights(slot))
+                } else { Some(ResidentMomentSlot::ChildBiases(slot)) },
+            active: active(slot),
+        }).collect::<Vec<_>>();
+        let ranges = layout.slots.iter().map(|r| r.start..r.start+r.len).collect::<Vec<_>>();
+        let use_resident = self.resident_parameter_path_enabled();
+        let (device_weights, resident_generation) = if use_resident {
+            let (weights, generation) = self.resident_parameter_slices(
+                layer.index, &params.values, host_layout, &ranges, config)?;
+            (weights, Some(generation))
+        } else {
+            (ranges.iter().map(|r| if r.is_empty() { self.backend.zeros_f32(&[1]) }
+                else { self.backend.upload_f32(&[r.len()], &params.values[r.clone()]) }
+                .map_err(|e| backend_error("upload DPT weights", e))).collect::<Result<Vec<_>>>()?, None)
+        };
+        let weights = device_weights.into_iter().map(|w| Some(w)).collect();
         let mut builder = Builder { be: &self.backend, config, cache: DeviceCache {
-            geometry, layout, weights, nodes: vec![Node { value: input.clone(),
+            geometry, layout, weights, resident_generation, nodes: vec![Node { value: input.clone(),
                 shape: tensor_backend_shape(layer.input_shape), op: Op::Input }] } };
         let g = geometry;
         let mut neck = [0usize; 4];
@@ -186,12 +205,14 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
         let err = |e| backend_error("GPU DPT backward", e);
         let mut gradients = vec![None; cache.nodes.len()];
         *gradients.last_mut().ok_or_else(|| Error::InvalidConfig("empty DPT device tape".into()))? = Some(grad);
-        let mut dparams = vec![0.0; cache.layout.total];
+        let mut dparams: Vec<Option<B::Tensor>> = vec![None; cache.layout.slots.len()];
         let mut parameter_grad = |slot: usize, tensor: &B::Tensor| -> Result<()> {
-            let values = be.download_f32(tensor).map_err(err)?;
             let range = cache.layout.get(slot);
-            if values.len() != range.len { return Err(Error::InvalidConfig("DPT gradient slot length mismatch".into())); }
-            for (dst, src) in dparams[range.start..range.start+range.len].iter_mut().zip(values) { *dst += src; }
+            if range.len == 0 { return Ok(()); }
+            dparams[slot] = Some(match dparams[slot].take() {
+                Some(previous) => be.saxpy_f32(1.0, tensor, &previous, config).map_err(err)?,
+                None => tensor.clone(),
+            });
             Ok(())
         };
         for index in (1..cache.nodes.len()).rev() {
@@ -249,16 +270,35 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
         }
         drop(parameter_grad);
         let dx = gradients[0].take().ok_or_else(|| Error::InvalidConfig("DPT missing input adjoint".into()))?;
-        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
-        let Some(LayerTrainBuffers::DptHead(train)) = buffers.get_mut(layer.index) else {
-            return Err(Error::InvalidConfig("missing DPT train buffers".into()));
-        };
-        if train.weight_updates.len() != dparams.len() {
-            return Err(Error::InvalidConfig("DPT train buffer length mismatch".into()));
+        let mut packed_gradients = Vec::new();
+        for (slot, range) in cache.layout.slots.iter().enumerate() {
+            if range.len == 0 { continue; }
+            let gradient = match dparams[slot].take() {
+                Some(gradient) => gradient,
+                None => be.zeros_f32(&[range.len]).map_err(err)?,
+            };
+            packed_gradients.push((range.start..range.start+range.len, gradient));
         }
-        train.has_gradient |= dparams.iter().any(|&x| x != 0.0);
-        for (dst, gradient) in train.weight_updates.iter_mut().zip(dparams) { *dst -= gradient; }
-        drop(buffers);
+        let gradients = packed_gradients;
+        if let Some(generation) = cache.resident_generation {
+            if let Some(LayerTrainBuffers::DptHead(train)) = self
+                .cpu_fallback_train_buffers.borrow_mut().get_mut(layer.index)
+            {
+                train.has_gradient = true;
+            }
+            self.accumulate_resident_parameter_gradients(layer.index, generation, gradients, config)?;
+        } else {
+            let packed = be.route_concat_f32(&gradients.iter().map(|(_,g)|g).collect::<Vec<_>>(),
+                &vec![0;gradients.len()], &gradients.iter().map(|(r,_)|r.len()).collect::<Vec<_>>(),
+                &gradients.iter().map(|(r,_)|r.len()).collect::<Vec<_>>(), &[1,cache.layout.total,1,1], 1, config).map_err(err)?;
+            let values = be.download_f32(&packed).map_err(err)?;
+            let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+            let Some(LayerTrainBuffers::DptHead(train)) = buffers.get_mut(layer.index) else {
+                return Err(Error::InvalidConfig("missing DPT train buffers".into()));
+            };
+            train.has_gradient |= values.iter().any(|&x| x != 0.0);
+            for (dst, gradient) in train.weight_updates.iter_mut().zip(values) { *dst -= gradient; }
+        }
         self.accumulate_previous_gpu_gradient(layer.index, dx, layer_output_gradients)
     }
 }

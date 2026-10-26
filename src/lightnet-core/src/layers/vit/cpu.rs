@@ -1274,6 +1274,30 @@ pub struct VitWeights {
 }
 
 impl VitWeights {
+    pub(crate) fn serialized_parts(&self) -> [&[f32]; 16] {
+        [&self.patch_embed, &self.patch_bias, &self.qkv_bias, &self.ln1_gamma,
+            &self.ln1_beta, &self.qkv_weight, &self.wo, &self.wo_bias,
+            &self.ln2_gamma, &self.ln2_beta, &self.ffn_w1, &self.ffn_b1,
+            &self.ffn_w2, &self.ffn_b2, &self.pos_embed, &self.mhc]
+    }
+
+    pub(crate) fn set_serialized(&mut self, values: &[f32]) -> Result<(), String> {
+        if self.serialized_parts().iter().map(|p| p.len()).sum::<usize>() != values.len() {
+            return Err("ViT resident serialized length mismatch".into());
+        }
+        let mut cursor = 0;
+        for part in [&mut self.patch_embed, &mut self.patch_bias, &mut self.qkv_bias,
+            &mut self.ln1_gamma, &mut self.ln1_beta, &mut self.qkv_weight,
+            &mut self.wo, &mut self.wo_bias, &mut self.ln2_gamma, &mut self.ln2_beta,
+            &mut self.ffn_w1, &mut self.ffn_b1, &mut self.ffn_w2, &mut self.ffn_b2,
+            &mut self.pos_embed, &mut self.mhc] {
+            let end = cursor + part.len();
+            part.copy_from_slice(&values[cursor..end]);
+            cursor = end;
+        }
+        Ok(())
+    }
+
     /// Construct shape-correct defaults. Projection tensors are zero-filled;
     /// mHC starts from the C++ identity-like logits, and sinusoidal positions
     /// are generated rather than serialized state when selected.

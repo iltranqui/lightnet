@@ -111,7 +111,7 @@ where
             let layout = super::mambavision_param_blocks(params).map_err(Error::InvalidConfig)?
                 .into_iter().enumerate().map(|(i,b)|ResidentParameterRange {
                     range:b.range, decay:b.decay, coupled_decay:b.decay,
-                    moment_slot:ResidentMomentSlot::ChildWeights(i),
+                    moment_slot:Some(ResidentMomentSlot::ChildWeights(i)), active:true,
                 }).collect();
             let (p,generation) = self.resident_parameter_slices(layer.index,&params.values,
                 layout,&ranges(&o),config)?;

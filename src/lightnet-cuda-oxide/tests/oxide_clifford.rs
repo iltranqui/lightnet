@@ -155,7 +155,12 @@ fn train_check(options: &str, w: usize, h: usize, c: usize, adam: bool, fallback
         &update_values(&cpu.train_buffers[0]), 8e-4);
     close("BN running statistics", &parameter_values(&gpu.params[0]), &parameter_values(&cpu.params[0]), 8e-4);
     let before = parameter_values(&cpu.params[0]);
-    cpu.update_weights(0.01, 0.9, 0.0005, 2);
+    // The CPU API selects the optimizer explicitly; the GPU API reads [net].
+    if adam {
+        cpu.update_weights_adam(0.01, 2).unwrap();
+    } else {
+        cpu.update_weights(0.01, 0.9, 0.0005, 2);
+    }
     gpu.update_weights_gpu(0.01, 0.9, 0.0005, 2).unwrap();
     assert_ne!(before, parameter_values(&cpu.params[0]));
     close("updated parameters", &parameter_values(&gpu.params[0]), &parameter_values(&cpu.params[0]), 8e-4);

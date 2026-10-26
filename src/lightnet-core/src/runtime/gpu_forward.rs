@@ -642,25 +642,13 @@ where
                     let geometry = vit_geometry(layer, spec);
                     if vit_device_training {
                         // Training: the native backward reads this device cache.
-                        let (output, cache) = vit_gpu::forward_training(
-                            &self.backend,
-                            &geometry,
-                            weights,
-                            current_input,
-                            layer.output_shape,
-                            launch_config,
-                        )?;
-                        vit_device_cache = Some(cache);
+                        let (output, cache) = self.forward_vit_native_gpu(
+                            layer, &geometry, weights, current_input, launch_config, true)?;
+                        vit_device_cache = cache;
                         output
                     } else {
-                        vit_gpu::forward(
-                            &self.backend,
-                            &geometry,
-                            weights,
-                            current_input,
-                            layer.output_shape,
-                            launch_config,
-                        )?
+                        self.forward_vit_native_gpu(layer,&geometry,weights,current_input,
+                            launch_config,false)?.0
                     }
                 }
                 (LayerKind::Vit(spec), LayerParams::Vit(weights)) => {

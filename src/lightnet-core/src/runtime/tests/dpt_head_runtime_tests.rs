@@ -736,3 +736,83 @@ fn dpt_head_native_f32_dispatch_and_unsupported_half_boundary() {
     assert!(error.to_string().contains("Stage-1 CPU support"));
 
 }
+
+#[test]
+fn dpt_head_resident_optimizers_preserve_inactive_slots_and_moments() {
+    let inactive = [28usize, 29, 36, 37];
+    for (optimizer, use_adam, use_muon) in [
+        ("", false, false), ("adam=1\n", true, false),
+        ("muon=1\ndecoupled_decay=1\n", false, true),
+    ] {
+        let network = Network::from_config(ConfigFile::parse_str(
+            "dpt-resident-slots.cfg", &dpt_config("dpt_head", 2, optimizer, ""),
+        ).unwrap()).unwrap();
+        let input = dpt_input(&network);
+        let geometry = match &network.layers[0].kind {
+            LayerKind::DptHead(spec) => spec.geometry(network.layers[0].input_shape),
+            _ => unreachable!(),
+        };
+        let layout = crate::dpt_head::dpt_head_weight_layout(geometry).unwrap();
+        let mut gpu = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+        gpu.init_train_buffers_gpu().unwrap();
+        let inactive_values = {
+            let LayerParams::DptHead(params) = &mut gpu.params[0] else { panic!("DPT params") };
+            for (index, value) in params.values.iter_mut().enumerate() {
+                *value = 0.25 + (index % 13) as f32 * 0.01;
+            }
+            inactive.iter().map(|&slot| {
+                let range = layout.get(slot);
+                (range.start..range.start+range.len).map(|i| params.values[i]).collect::<Vec<_>>()
+            }).collect::<Vec<_>>()
+        };
+        let mut seeded = vec![0.0; layout.total];
+        for (n, &slot) in inactive.iter().enumerate() {
+            let range = layout.get(slot);
+            for value in &mut seeded[range.start..range.start+range.len] { *value = 0.03 + n as f32 * 0.01; }
+        }
+        let LayerTrainBuffers::DptHead(train) = &mut gpu.cpu_fallback_train_buffers.get_mut()[0] else {
+            panic!("DPT train buffers")
+        };
+        train.weight_updates.copy_from_slice(&seeded);
+        let forward = gpu.forward_training_device(&input).unwrap();
+        gpu.update_weights_gpu(0.01, 0.9, 0.02, 2).unwrap();
+        let LayerParams::DptHead(params) = &gpu.params[0] else { panic!("DPT params") };
+        let host_buffers = gpu.host_fallback_train_buffers();
+        let LayerTrainBuffers::DptHead(train) = &host_buffers[0] else {
+            panic!("DPT train buffers")
+        };
+        for (n, &slot) in inactive.iter().enumerate() {
+            let range = layout.get(slot);
+            assert_eq!(&params.values[range.start..range.start+range.len], inactive_values[n]);
+            assert_eq!(&train.weight_updates[range.start..range.start+range.len],
+                &seeded[range.start..range.start+range.len]);
+        }
+        if use_adam || use_muon {
+            let host_state = gpu.host_adam_state.borrow();
+            let state = host_state[0].as_ref().expect("DPT Adam state");
+            for &slot in &inactive {
+                let child = &state.children[slot];
+                assert!(child.weights.is_none() && child.biases.is_none(),
+                    "inactive DPT slot {slot} must not acquire Adam moments");
+            }
+            assert_eq!(state.children[0].weights.is_some(), use_adam,
+                "DPT matrix Adam moments must follow the selected optimizer policy");
+            assert!(state.children[1].biases.is_some());
+            let expected = state.clone();
+            drop(host_state);
+            if use_adam || use_muon {
+                let path = temp_weights_path("resident-adam-muon");
+                gpu.save_optimizer_state(&path).unwrap();
+                let mut restored = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+                restored.params = gpu.params.clone();
+                restored.init_train_buffers_gpu().unwrap();
+                restored.load_optimizer_state(&path).unwrap();
+                let restored_state = restored.host_adam_state.borrow();
+                assert_eq!(restored_state[0].as_ref(), Some(&expected));
+                drop(restored_state);
+                fs::remove_file(path).unwrap();
+            }
+        }
+        drop(forward);
+    }
+}

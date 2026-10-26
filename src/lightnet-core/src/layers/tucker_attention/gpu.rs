@@ -110,9 +110,9 @@ where
         let (bias, resident_generation) = if self.resident_parameter_path_enabled() {
             let layout = vec![
                 ResidentParameterRange { range:0..c, decay:false, coupled_decay:true,
-                    moment_slot:ResidentMomentSlot::Biases },
+                    moment_slot:Some(ResidentMomentSlot::Biases), active:true },
                 ResidentParameterRange { range:c..host.len(), decay:true, coupled_decay:true,
-                    moment_slot:ResidentMomentSlot::Weights },
+                    moment_slot:Some(ResidentMomentSlot::Weights), active:true },
             ];
             let mut slices = vec![0..c];
             let mut start = c;

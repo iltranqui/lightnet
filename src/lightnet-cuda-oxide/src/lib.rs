@@ -11645,6 +11645,71 @@ impl F32TensorOpsBackend for OxideBackend {
         OxideBackend::vit_add_pos_embed_f32(self, tokens, pos, config)
     }
 
+    fn vit_resident_mhc_forward_f32(&self, skip: &Self::Tensor, branch: &Self::Tensor,
+        params: &Self::Tensor, site: usize, clip: f32, config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let skip = self.f32v(skip)?; let branch = self.f32v(branch)?; let params = self.f32v(params)?;
+        if skip.len() == 0 || skip.len() != branch.len() || params.len() != 12 || site >= 2
+            || !clip.is_finite() || clip <= 0.0 {
+            return Err(shape_err("resident ViT mHC", "invalid lengths, site or clip".into()));
+        }
+        let mut out = self.alloc_uninit(skip.len())?;
+        // SAFETY: validated operands and one writer per output element.
+        unsafe { self.vit.vit_resident_mhc(&self.stream, launch::elementwise(skip.len(),config),
+            &skip.buf, &branch.buf, &skip.buf, &params.buf, &mut out, site, 0, clip) }.map_err(launch_err)?;
+        Ok(OxideTensorF32::new(out, skip.shape()))
+    }
+
+    fn vit_resident_mhc_backward_f32(&self, skip: &Self::Tensor, branch: &Self::Tensor,
+        grad: &Self::Tensor, params: &Self::Tensor, site: usize, clip: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let skip = self.f32v(skip)?; let branch = self.f32v(branch)?;
+        let grad = self.f32v(grad)?; let params = self.f32v(params)?;
+        let n = skip.len();
+        if n == 0 || n != branch.len() || n != grad.len() || params.len() != 12 || site >= 2
+            || !clip.is_finite() || clip <= 0.0 {
+            return Err(shape_err("resident ViT mHC backward", "invalid lengths, site or clip".into()));
+        }
+        let mut ds = self.alloc_uninit(n)?; let mut db = self.alloc_uninit(n)?;
+        let mut terms = self.alloc_uninit(3*n)?;
+        // SAFETY: each launch fully writes a disjoint output of its stated length.
+        unsafe {
+            self.vit.vit_resident_mhc(&self.stream, launch::elementwise(n,config), &skip.buf,
+                &branch.buf, &grad.buf, &params.buf, &mut ds, site, 1, clip).map_err(launch_err)?;
+            self.vit.vit_resident_mhc(&self.stream, launch::elementwise(n,config), &skip.buf,
+                &branch.buf, &grad.buf, &params.buf, &mut db, site, 2, clip).map_err(launch_err)?;
+            self.vit.vit_resident_mhc(&self.stream, launch::elementwise(3*n,config), &skip.buf,
+                &branch.buf, &grad.buf, &params.buf, &mut terms, site, 3, clip).map_err(launch_err)?;
+        }
+        let sums = self.bias_backward_f32(&OxideTensorF32::new(terms,&[3,n]),3,n,config)?;
+        let mut dp = self.alloc_uninit(6)?;
+        // SAFETY: six logit outputs read the validated twelve parameters and three sums.
+        unsafe { self.vit.vit_resident_mhc_gradient(&self.stream,launch::elementwise(6,config),
+            &params.buf,&sums.buf,&mut dp,site) }.map_err(launch_err)?;
+        Ok((OxideTensorF32::new(ds,grad.shape()),OxideTensorF32::new(db,grad.shape()),
+            OxideTensorF32::new(dp,&[6])))
+    }
+
+    fn vit_prepare_updates_f32(&self, updates: &Self::Tensor, excluded_start: usize,
+        excluded_end: usize, limit: f32, config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let updates = self.f32v(updates)?;
+        if excluded_start > excluded_end || excluded_end > updates.len() || !limit.is_finite() || limit <= 0.0 {
+            return Err(shape_err("ViT update clipping", "invalid excluded range or limit".into()));
+        }
+        let mut scale = self.alloc_uninit(1)?;
+        let mut out = self.alloc_uninit(updates.len())?;
+        // SAFETY: one scalar writer followed by one writer per update, on the same stream.
+        unsafe {
+            self.vit.vit_update_norm(&self.stream,launch::elementwise(1,config),&updates.buf,
+                &mut scale,excluded_start,excluded_end,limit).map_err(launch_err)?;
+            self.vit.vit_update_scale(&self.stream,launch::elementwise(updates.len(),config),
+                &updates.buf,&scale,&mut out,excluded_start,excluded_end).map_err(launch_err)?;
+        }
+        Ok(OxideTensorF32::new(out,&[updates.len()]))
+    }
+
     fn vit_clamp_feature_f32(
         &self,
         input: &Self::Tensor,

@@ -6,6 +6,7 @@
 - [Written source](#written-source)
 - [Resident Muon, dense AMP and GRU training](#resident-muon-dense-amp-and-gru-training)
 - [Evidence and remaining work](#evidence-and-remaining-work)
+- [ViT residency and half-storage follow-up](#vit-residency-and-half-storage-follow-up)
 
 ## Execution boundary
 
@@ -153,6 +154,16 @@ remain outside this checkpoint.
 
 ## Evidence and remaining work
 
+Explicit resume, 2026-10-26, at `0e93bcb`: host check passed for core/CLI
+(1m 07s), `PKGS=lightnet-core` host `runtime::` passed **324 tests, 0 failures**
+(51.17s test time), and `gpu-check` passed (19.91s). No compile fixes were
+needed. All commands ran serially under MemoryHigh=3G with two build jobs,
+two host test threads and Rayon capped at two. Existing unused-import warnings
+remain. The runtime filter selected zero cfg-corpus tests. Resident lifecycle
+GPU tests are in progress; neither device lifecycle nor full-suite success is
+established yet. This paragraph supersedes historical uncompiled/stop wording
+below for those three verification gates only.
+
 Checkpoint `2ee6840` records the Muon/AMP/GRU implementation and fixes covered
 below. A later lifecycle continuation moves Mamba/Kimi/Tucker
 training tapes into GpuForwardState and makes resident generations monotonic
@@ -162,9 +173,78 @@ The same source change now covers DeformConv, ViT, Swin, WMHF, Clifford, DPT,
 DepthAnything and RecursiveBlock; WMHF/Clifford rolling-stat accumulation
 also reads the supplied forward state. `oxide_forward_tapes` adds isolated
 versus interleaved GPU input-adjoint/BN-stat checks across those eight families.
-These later edits are **uncompiled/unrun** while the prior checkpoint's full
-core invocation continues in cfg-corpus integration. Do not apply the older
-passing results to this continuation.
+These later edits are checkpointed at `0e93bcb` and remain **uncompiled/unrun**.
+The prior checkpoint's full core invocation was interrupted during cfg-corpus
+integration at the user's stop request. The test scope was stopped and no
+task-owned Cargo/corpus process remained. Do not apply older passing results
+to this continuation or resume work without an explicit user request.
+
+The two focused resident lifecycle GPU regressions also passed at `0e93bcb`:
+overlapping forwards **1/1** (84.86s), stale reload generation **1/1** (72.91s),
+each across Mamba/Kimi/Tucker. Built/executed through the Oxide wrapper, one
+test thread and command at a time under MemoryHigh=3G. Full resident suite and
+the other eight families' forward-tape suite were pending at that point.
+The subsequent `oxide_forward_tapes` invocation passed **1/1** (333.34s),
+covering DeformConv, ViT, Swin, WMHF, Clifford, DPT, DepthAnything and bounded
+RecursiveBlock lifecycle equivalence. It compares isolated/interleaved GPU
+input adjoints and WMHF/Clifford BN statistics, not independent numeric parity.
+Full CLI tests subsequently passed **36/36** (0.44s). Full numeric
+layer/corpus gates are pending. Full `oxide_resident_params` subsequently
+passed **17/17** (1278.44s) at `0e93bcb`: a fresh full-suite aggregate rather
+than the earlier partial reruns. `oxide_mambavision` passed **2/2** (98.50s),
+including runtime accumulation/two updates and nonzero scan/final-state
+adjoints. `oxide_kimi_kda` passed **3/3** (100.85s), including runtime
+outputs/gradients/two updates, scan/projection adjoints and top-k ties.
+`oxide_tucker_attention` passed **3/3** (175.91s), including compact padded
+dense/sparse windows, half casts and resident factor-gradient/deferred
+optimizers. `oxide_vit` passed **5/5** (258.35s), covering backward/elementwise
+kernels, patch layout, native forward and training backward/update against
+Rust references. `oxide_swin` passed **5/5** (224.26s), including native
+forward/training backward/update, mHC and window-layout adjoints and the
+documented fallback. `oxide_wmhf` passed **8/8** (247.76s), including native
+inference/training backward/update and primitive references. Initial
+`oxide_clifford` initially finished **4 passed, 1 failed** (220.09s), in
+`clifford_native_adam_update_matches_cpu`: updated parameter 0 was
+`1.1428108 != 1.1332897`. Its forward/input/parameter gradient checks passed.
+Root cause found in one pass: the fixture called CPU SGD unconditionally
+while GPU selected configured Adam. The fixture now calls CPU Adam for Adam
+cases; no tolerance/production change. Full corrected rerun passed **5/5**
+(216.17s). Named-path staging failed with `.git/index.lock: Read-only file
+system`, so the validated fixture fix remains uncommitted; no commit/tag was
+created. `oxide_dpt_head` passed **1/1** (59.33s), across the existing
+host-staged SGD/Adam/Muon path before the DPT residency slice below.
+`oxide_depth_anything` passed **2/2** (63.13s): clamp/NaN boundary and frozen
+encoder repeated-tap/patch-layout/input-adjoint references.
+Initial `oxide_recursive_block` failed **0/1** (22.47s), with shared
+parameter accumulation element 0 `-0.008424982 vs 0.008424982` after input
+adjoints passed. One source pass found an extra native negation: nested CPU
+convolution/connected accumulators add the returned gradient. Corrected the
+two native loops to add in `layers/recursive_block/gpu.rs`. CPU conventions
+and tolerances are unchanged. Restarted serial verification: host check passed
+(4.44s), runtime:: passed (324/324), gpu-check passed (4.41s), and full
+`oxide_recursive_block` rerun passed **1/1** (59.48s). `git diff --check`
+passed. Next source slice is DPT SGD/Adam residency; Muon remains separate
+because DPT host fallback skips matrix Adam moments while generic resident
+Muon advances them.
+
+DPT continuation: resident SGD/Adam now slices its 66-slot serialized arena,
+packs slot gradients on device, and applies per-slot child moment mappings.
+Empty slots 12/13 and optimizer-inactive slots 28/29/36/37 are masked from
+updates and moment materialization; inactive weights and preloaded update
+accumulators are blended through unchanged. DPT Muon uses its source visitor's
+32 matrix views, masks matrix Adam moments, and retains Adam moments for active
+biases. Host check passed, `runtime::` passed 325/325, gpu-check passed,
+`dpt_head_resident_optimizers_preserve_inactive_slots_and_moments` passed 1/1,
+and `oxide_dpt_head` passed 1/1 (65.57s) across resident SGD/Adam/Muon. The
+regression saves and reloads DPT Adam and Muon child moments through DNOPT and
+compares restored child slots. The full shared `oxide_resident_params` suite
+passed 17/17 (1117.58s) after the generic resident Muon policy change. The
+first full runtime rerun exposed a shape mismatch (323/324);
+preserving native gradient shapes until flat arena packing fixed it. Remaining
+gaps: switching a serialized Adam DPT state into Muon and broader layer/family
+evidence. This is a partial optimizer-residency slice, not DPT completion. No
+tolerance changes or C++ parity claims.
+Other numeric layer/corpus gates remain pending.
 
 Current authorized verification uses at most two jobs/test threads and a 3G
 soft RAM cap, one Cargo invocation at a time:
@@ -207,10 +287,11 @@ soft RAM cap, one Cargo invocation at a time:
   twelve passing cases have not been rerun after this correction. No
   tolerances were changed.
 - Full core host invocation: **1,016 unit tests passed**. Its cfg-corpus
-  integration test is still running serially; the handbook records prior
-  corpus memory/timeout issues, so this is not yet a green full host suite.
+  integration test was interrupted at the user's stop request, without an
+  aggregate result. This is neither a pass nor a numeric failure; the full
+  host suite remains unproven. Full CLI host tests remain pending.
 
-The Oxide numeric suites are in progress. Host backend
+Further Oxide numeric suites are pending until an explicit resume. Host backend
 reference tests do not prove GPU execution or device parity. References are
 hand-derived Rust/C++ source, no compiled-C++ golden. Whitespace validation
 uses git diff --check.
@@ -232,3 +313,27 @@ half dispatch and native arithmetic coverage remain open.
 Next work follows the AGENTS.md device queue and the now-authorized host/Oxide
 verification gates, serially with two jobs. Keep WIP commits local and do not
 tag them as verified releases before all required coverage passes.
+
+## ViT residency and half-storage follow-up
+
+On the resumed `0e93bcb` tree, ViT now has native supported SGD/Adam/AdamW
+parameter residency, device gradient accumulation and its 16-array serialized
+order. Its mHC reductions/updates and frozen sinusoidal position handling stay
+on device. The support gate still excludes MSA and VC attention; those
+backward/residency variants remain open, as do ViT Muon and full layer
+completion.
+
+Validation: host check passed; gpu-check passed; `PKGS=lightnet-core`
+`runtime::` passed **325/325** (zero cfg-corpus cases selected);
+`oxide_vit` passed **7/7** (364.28s), including dense/flash backward CPU
+comparisons, resident optimizer/deferred-update/checkpoint checks, and f16
+compact inference compared at half-storage boundaries before and after updates.
+`oxide_forward_tapes` freshly passed **1/1** (297.20s) before the f16 dispatch
+edit, establishing lifecycle equivalence only. The named-path DPT commit retry
+again failed because `.git/index.lock` creation reports `Read-only file
+system`; no lock was removed and no commit/tag was created. Diff whitespace,
+full CLI/layer reruns after these edits and cfg-corpus remain unverified.
+
+The next family for native residency is Swin. Keep its optional residual
+projection and Rust-defined variable blob order explicit; do not combine this
+with ViT's unsupported attention variants in one change.

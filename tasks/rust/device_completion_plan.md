@@ -9,6 +9,8 @@
 - [Review](#review)
 - [Muon, AMP and GRU continuation](#muon-amp-and-gru-continuation)
 - [Lifecycle continuation and next residency contract](#lifecycle-continuation-and-next-residency-contract)
+- [ViT residency continuation](#vit-residency-continuation)
+- [Swin residency continuation](#swin-residency-continuation)
 
 ## Priority and constraints
 
@@ -204,8 +206,9 @@ native half coverage of all scan/attention/normalization operations or all layer
 
 Checkpoint `2ee6840` contains the Muon/AMP/GRU slice, with focused verification
 recorded in source-wip.md. The full core invocation passed 1,016 unit tests
-and is still running cfg-corpus integration. Latest source edits after that
-checkpoint are uncompiled: Mamba/Kimi/Tucker device tapes move to the returned
+and was interrupted during cfg-corpus integration at the user's stop request.
+No task-owned Cargo/corpus process remains; resume only when asked. Latest
+source edits are checkpointed at `0e93bcb` and uncompiled: Mamba/Kimi/Tucker device tapes move to the returned
 GpuForwardState, and resident bank epochs no longer reset on retirement/reload.
 Overlapping-forward and stale-reload device regressions are queued for the
 next serial test slot. Do not attribute the checkpoint's green evidence to
@@ -215,8 +218,9 @@ DepthAnything and RecursiveBlock, including WMHF/Clifford rolling-stat consumers
 New `oxide_forward_tapes` isolates the lifecycle property from numeric CPU
 parity by comparing interleaved and isolated GPU input adjoints/BN statistics.
 
-Next residency candidate is DPT, but its source contract needs more than
-adding a parameter enum arm. Source audit (not an implementation):
+The DPT source contract needs more than a parameter enum arm. The audit below
+guided the partial SGD/Adam residency slice that follows; its remaining
+requirements are still open:
 
 - `layers/dpt_head/cpu.rs` declares 66 serialized slots: 32 active matrix
   slots and 28 active bias slots; 12/13 are empty, and 28/29/36/37 contain
@@ -232,7 +236,76 @@ adding a parameter enum arm. Source audit (not an implementation):
 - DPT's Muon host fallback skips matrix Adam updates/moments, unlike the
   common mixer fallback that advances resumed matrix moments with zero new
   gradient. Preserve this distinction; test switching/resume explicitly.
-- Forward currently uploads every slot, backward downloads each conv
-  parameter gradient, and updates remain hybrid. A resident implementation
-  must remove those transfers while preserving transpose-conv storage,
-  source matrix shapes/order, update gates and explicit checkpoint boundaries.
+- Before the partial residency slice, forward uploaded every slot, backward
+  downloaded each conv parameter gradient, and updates were hybrid. The slice
+  removes the SGD/Adam parameter transfers while preserving transpose-conv
+storage, source order and update gates. Explicit child-state checkpoint
+round-trips are now covered; switching an Adam checkpoint to Muon remains open.
+
+### DPT SGD/Adam residency slice, 2026-10-26
+
+Implemented and partially validated: resident DPT forward slices the full
+serialized arena, backward packs slot gradients without host downloads, and
+native SGD/Adam updates use per-child moment mappings. Empty slots 12/13 and
+inactive slots 28/29/36/37 are masked from updates and moment materialization;
+inactive weights and seeded accumulators are preserved by the update mask.
+DPT Muon uses its 32 CPU visitor matrix views, skips matrix Adam moments, and
+updates active bias moments on device.
+
+Evidence: host check passed, `runtime::` passed 325/325, gpu-check passed,
+focused DPT runtime tests passed 1/1, and `oxide_dpt_head` passed 1/1 (65.57s)
+with resident SGD/Adam/Muon. Full `oxide_resident_params` passed 17/17
+(1117.58s) after the shared Muon change. The first runtime rerun exposed a
+tensor-shape mismatch (323/324); the focused test and full runtime rerun passed
+after preserving convolution gradient shapes until flat packing. The Oxide
+test checks gradients through an explicit diagnostic and updated weights. A
+host regression round-trips Adam and Muon child moments through DNOPT, including
+the absence of inactive and Muon matrix moments. Adam-to-Muon checkpoint
+switching and full layer completion remain open.
+
+## ViT residency continuation
+
+Next family: ViT, following the transformer order in AGENTS.md. First slice:
+native supported SGD/Adam residency, then its FP16 dispatch coverage; Muon and
+MSA/VC variants retain their existing paths until separately implemented.
+
+```text
+src/lightnet-core/src/
+  layers/vit/{cpu.rs,gpu.rs}
+  runtime/{gpu_resident_params.rs,gpu_forward.rs,gpu_forward_compact.rs}
+src/lightnet-cuda/src/lib.rs
+src/lightnet-cuda-oxide/
+  src/{lib.rs,kernels/vit.rs}
+  tests/oxide_vit.rs
+```
+
+ViT CPU owns the 16-array serialization order and optimizer reference. Layer
+GPU glue owns forward slices, generation-pinned tapes and device gradient
+packing. Runtime owns resident state and per-array optimizer publication.
+Backend operations own mHC logits/adjoints and sanitize/L2 clipping, including
+frozen sinusoidal positions, mHC's 0.1 rate and [-8,8] parameter clamp. Oxide
+tests compare CPU/device gradients, eager/deferred updates and checkpoints.
+
+- [x] Implement the 16-array bank and device mHC/gradient clipping operations.
+- [x] Wire native full/compact forward and device gradient accumulation.
+- [x] Run check, gpu-check, runtime:: and full oxide_vit serially with caps.
+- [x] Add ViT half-storage compact dispatch around f32 arithmetic and test before/after deferred resident updates.
+- [x] Record evidence and retry the named-path WIP checkpoint; `.git/index.lock` creation is blocked by read-only `.git`.
+- [ ] Extend native backward/residency to ViT MSA and VC attention variants; current support gate rejects both.
+
+Validation on the resumed tree: host check passed; gpu-check passed; core
+`runtime::` passed **325/325** (corpus filter selected zero); `oxide_vit`
+passed **7/7** (364.28s), including dense and flash backward comparisons,
+resident SGD/Adam/AdamW and half-storage inference before and after deferred
+updates. `oxide_forward_tapes` passed **1/1** (297.20s) before the half-storage
+edit; it remains lifecycle-equivalence evidence. No C++ golden or all-variant
+completion claim is made. The next transformer family in the queue is Swin.
+
+## Swin residency continuation
+
+Swin is the next transformer-family residency slice after ViT. Preserve its
+variable serialized block order, optional residual projection, relative
+position bias and 12-value mHC block. First scope native SGD/Adam residency
+for variants already accepted by `layers::swin::gpu::supported`; keep Muon
+and unsupported activation fallbacks separate. Add resident diagnostics,
+deferred updates and checkpoint coverage before reporting a green slice.

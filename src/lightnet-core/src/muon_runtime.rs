@@ -114,6 +114,36 @@ pub(crate) fn serialized_mixer_muon_layout(
             }
             cursor
         }
+        (LayerKind::DptHead(s), LayerParams::DptHead(p)) => {
+            let geometry = s.geometry(input);
+            let layout = crate::dpt_head::dpt_head_weight_layout(geometry)?;
+            for &index in &crate::dpt_head::DPT_MUON_WEIGHT_SLOTS {
+                let tap = match index {
+                    0 | 2 | 4 | 6 => index / 2,
+                    8 | 10 | 14 => (index - 8) / 2,
+                    16..=19 => index - 16,
+                    _ => 0,
+                };
+                let (rows, cols) = match index {
+                    0 | 2 | 4 | 6 => (geometry.neck[tap], geometry.embed_dim),
+                    8 | 10 | 14 => (geometry.neck[tap], geometry.neck[tap] * [4usize, 2, 0, 3][tap].pow(2)),
+                    16..=19 => (geometry.fusion, geometry.neck[tap] * 9),
+                    20 | 22 | 24 | 26 => (geometry.fusion, geometry.fusion),
+                    30 | 32 | 34 | 38 | 40 | 42 | 44 | 46 | 48 | 50 | 52 | 54 | 56 | 58 =>
+                        (geometry.fusion, geometry.fusion * 9),
+                    60 => (geometry.fusion / 2, geometry.fusion * 9),
+                    62 => (geometry.head_hidden, geometry.fusion / 2 * 9),
+                    64 => (1, geometry.head_hidden),
+                    _ => return Err(Error::InvalidConfig(format!("DPT Muon matrix slot {index} has no declared view"))),
+                };
+                let range = layout.get(index);
+                if range.len != checked_product(&[rows, cols], "DPT resident matrix")? {
+                    return Err(Error::InvalidConfig(format!("DPT Muon matrix slot {index} storage mismatch")));
+                }
+                push(range.start, rows, cols)?;
+            }
+            p.values.len()
+        }
         _ => return Err(Error::InvalidConfig("resident Muon layer kind mismatch".into())),
     };
     let mut end = 0;

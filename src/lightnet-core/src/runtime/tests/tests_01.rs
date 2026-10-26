@@ -284,6 +284,7 @@ fn vit_runtime_forward_backward_matches_input_and_parameter_finite_differences()
     let LayerParams::Vit(cpu_grad) = &cpu_backward.param_gradients[0] else {
         panic!("Vit gradients")
     };
+    gpu.synchronize_resident_parameter_gradients().unwrap();
     let buffers = gpu.host_fallback_train_buffers();
     let LayerTrainBuffers::Vit(train) = &buffers[0] else {
         panic!("Vit native-staged updates")

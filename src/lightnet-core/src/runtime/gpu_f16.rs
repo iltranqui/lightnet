@@ -9,14 +9,14 @@ where
 {
     /// f16 twin of [`GpuExecutableNetwork::forward_compact`]. Convolution and
     /// connected operands use binary16 device storage with f32 accumulation.
-    /// MambaVision, KimiKDA, TuckerAttention and non-BN GRU use half activation storage around explicit
+    /// ViT, MambaVision, KimiKDA, TuckerAttention and non-BN GRU use half activation storage around explicit
     /// device f32 arithmetic islands; their master weights remain f32.
     /// The yolo heads are widened to f32 on download.
     /// Supports convolutional, maxpool, (local) avgpool, standalone batchnorm,
     /// route, LAYA marker gather, SAM, shortcut (mismatched sources are cropped /
     /// zero-padded like Darknet), upsample (also `reverse`), Logistic sigmoid and
     /// OMD loss inference pass-through, group-major JevCe softmax, and yolo-style
-    /// pass-through layers, supported MambaVision, KimiKDA and TuckerAttention mixers;
+    /// pass-through layers, supported ViT, MambaVision, KimiKDA and TuckerAttention mixers;
     /// any other layer returns `UnsupportedLayer` (use `forward_compact`).
     pub fn forward_compact_f16(&self, input: &Tensor) -> Result<GpuForwardSummary> {
         reject_gpu_hyperbolic_foveation(&self.network, "f16 inference")?;
@@ -61,6 +61,15 @@ where
                         return Err(Error::UnsupportedLayer {
                             layer_index: layer.index,
                             name: "KimiKDA variant (f16 storage, f32 arithmetic)".into(),
+                        });
+                    }
+                }
+                LayerKind::Vit(spec) => {
+                    let geometry = crate::runtime::vit_geometry(layer, spec);
+                    if !crate::layers::vit::gpu::supported(&geometry) {
+                        return Err(Error::UnsupportedLayer {
+                            layer_index: layer.index,
+                            name: "ViT variant (f16 storage, f32 arithmetic)".into(),
                         });
                     }
                 }
@@ -854,6 +863,21 @@ where
                         &input, launch_config, false)?;
                     self.backend.narrow_f32(&output)
                         .map_err(|err| backend_error("narrow TuckerAttention half storage", err))?
+                }
+                (LayerKind::Vit(spec), LayerParams::Vit(params)) => {
+                    let input = self.backend.widen_f16(current_input.expect("ViT input"))
+                        .map_err(|err| backend_error("widen ViT half storage", err))?;
+                    // Inference must not replace the last training cache.
+                    let (output, _) = self.forward_vit_native_gpu(
+                        layer,
+                        &crate::runtime::vit_geometry(layer, spec),
+                        params,
+                        &input,
+                        launch_config,
+                        false,
+                    )?;
+                    self.backend.narrow_f32(&output)
+                        .map_err(|err| backend_error("narrow ViT half storage", err))?
                 }
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::ObbYolo(_), LayerParams::None)

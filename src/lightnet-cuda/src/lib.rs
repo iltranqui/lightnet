@@ -2955,6 +2955,62 @@ pub trait F32TensorOpsBackend {
         self.upload_f32(shape, &out)
     }
 
+    /// Resident mHC logits stay on device. Backends must override this default
+    /// to avoid downloading the parameter bank's twelve-scalar suffix.
+    fn vit_resident_mhc_forward_f32(&self, skip: &Self::Tensor, branch: &Self::Tensor,
+        params: &Self::Tensor, site: usize, clip: f32, config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let p = self.download_f32(params)?;
+        assert!(p.len() == 12 && site < 2);
+        let o = site * 6;
+        let mix = 1.0 / (1.0 + (-0.5 * (p[o] + p[o+3] - p[o+1] - p[o+2])).exp());
+        let a = 2.0 / (1.0 + (-p[o+4]).exp());
+        let b = 2.0 / (1.0 + (-p[o+5]).exp());
+        self.vit_mhc_residual_f32(skip, branch, a*mix+b*(1.0-mix),
+            a*(1.0-mix)+b*mix, clip, config)
+    }
+
+    /// Returns input adjoints and the six mathematical logit derivatives.
+    fn vit_resident_mhc_backward_f32(&self, skip: &Self::Tensor, branch: &Self::Tensor,
+        grad: &Self::Tensor, params: &Self::Tensor, site: usize, clip: f32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let p = self.download_f32(params)?;
+        assert!(p.len() == 12 && site < 2);
+        let o = site * 6;
+        let mix = 1.0 / (1.0 + (-0.5 * (p[o] + p[o+3] - p[o+1] - p[o+2])).exp());
+        let a = 2.0 / (1.0 + (-p[o+4]).exp());
+        let b = 2.0 / (1.0 + (-p[o+5]).exp());
+        let (ds, db, sums) = self.vit_mhc_residual_backward_f32(skip, branch, grad,
+            a*mix+b*(1.0-mix), a*(1.0-mix)+b*mix, mix, a, b, clip, config)?;
+        let sums = self.download_f32(&sums)?;
+        let dz = 0.5 * sums[2] * mix * (1.0-mix);
+        Ok((ds, db, self.upload_f32(&[6], &[dz, -dz, -dz, dz,
+            sums[0]*a*(1.0-0.5*a), sums[1]*b*(1.0-0.5*b)])?))
+    }
+
+    /// ViT sanitizes trainable accumulators and clips their global L2 norm.
+    /// Frozen positions are excluded from sanitization/norm, but their pending
+    /// accumulator still receives the CPU helper's common scale.
+    fn vit_prepare_updates_f32(&self, updates: &Self::Tensor, excluded_start: usize,
+        excluded_end: usize, limit: f32, config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = config;
+        let mut values = self.download_f32(updates)?;
+        assert!(excluded_start <= excluded_end && excluded_end <= values.len());
+        let mut norm_sq = 0.0f64;
+        for (i, v) in values.iter_mut().enumerate() {
+            if i >= excluded_start && i < excluded_end { continue; }
+            if !v.is_finite() { *v = 0.0; }
+            norm_sq += f64::from(*v) * f64::from(*v);
+        }
+        let norm = norm_sq.sqrt() as f32;
+        let scale = if norm > limit && norm.is_finite() { limit/norm }
+            else if !norm.is_finite() { 0.0 } else { 1.0 };
+        for v in &mut values { *v *= scale; }
+        self.upload_f32(&[values.len()], &values)
+    }
+
     /// ViT feature guard: clamp finite values to `[-clip, clip]`, map the rest to 0.
     fn vit_clamp_feature_f32(
         &self,

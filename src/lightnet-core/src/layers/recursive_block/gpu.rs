@@ -167,8 +167,9 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
                 LayerTrainBuffers::Connected(t)=>(&mut t.weight_updates,&mut t.bias_updates),
                 _=>unreachable!("validated recursive train buffer"),
             };
-            for (dst,src) in w.iter_mut().zip(dw){*dst-=src;}
-            for (dst,src) in b.iter_mut().zip(db){*dst-=src;}
+            // Match the nested convolution/connected CPU train-buffer convention.
+            for (dst,src) in w.iter_mut().zip(dw){*dst+=src;}
+            for (dst,src) in b.iter_mut().zip(db){*dst+=src;}
         }
         drop(buffers);
         self.accumulate_previous_gpu_gradient(layer.index,input_grad,layer_output_gradients)

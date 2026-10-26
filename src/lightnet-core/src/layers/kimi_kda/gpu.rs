@@ -89,9 +89,9 @@ where
             let shift = o.total_biases;
             let layout = vec![
                 ResidentParameterRange { range:0..shift, decay:false, coupled_decay:true,
-                    moment_slot:ResidentMomentSlot::Biases },
+                    moment_slot:Some(ResidentMomentSlot::Biases), active:true },
                 ResidentParameterRange { range:shift..total, decay:true, coupled_decay:true,
-                    moment_slot:ResidentMomentSlot::Weights },
+                    moment_slot:Some(ResidentMomentSlot::Weights), active:true },
             ];
             let mut slices = Vec::with_capacity(2 * descriptions.len() + 4);
             for (w, b, _, _) in &descriptions {

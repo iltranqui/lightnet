@@ -367,6 +367,7 @@ fn train_check(extra: &str, width: usize, height: usize) {
         &cpu_backward.input_gradient.data,
         5e-4,
     );
+    gpu.synchronize_resident_parameter_gradients().unwrap();
     let gpu_updates = vit_updates(&gpu.host_fallback_train_buffers()[0]);
     close(
         &format!("{extra} staged gradients"),
@@ -392,4 +393,91 @@ fn vit_native_training_backward_and_update_match_cpu() {
     train_check("patch_size=2\npatch_stride=1\nactivation=leaky\npos_embed=sinusoidal", 4, 4);
     train_check("patch_size=3\npatch_stride=2\npatch_pad=1\nflash_attention=1\nactivation=swish", 5, 5);
     train_check("patch_size=1\nflash_attention=1\nactivation=relu", 3, 4);
+}
+
+#[test]
+fn vit_resident_clipping_preserves_frozen_accumulators_and_sanitizes_active_values() {
+    let be=OxideBackend::new().unwrap();
+    let input=be.upload_f32(&[7],&[f32::NAN,f32::INFINITY,f32::NEG_INFINITY,100.0,3.0,4.0,f32::NAN]).unwrap();
+    let actual=be.download_f32(&be.vit_prepare_updates_f32(&input,6,7,5.0,cfg()).unwrap()).unwrap();
+    let scale=5.0/(10025.0f64.sqrt() as f32);
+    close("resident norm clip",&actual[..6],&[0.0,0.0,0.0,100.0*scale,3.0*scale,4.0*scale],1e-6);
+    assert!(actual[6].is_nan());
+}
+
+#[test]
+fn vit_resident_deferred_sgd_adam_and_adamw_match_cpu_and_resume() {
+    for (adam,decoupled,sinusoidal) in [(false,false,false),(true,false,true),(true,true,false)] {
+        let mut cpu=network(if sinusoidal {"patch_size=1\nflash_attention=1\npos_embed=sinusoidal"}
+            else {"patch_size=1\nflash_attention=1"},3,2);
+        cpu.network.net.adam=adam; cpu.network.net.decoupled_decay=decoupled;
+        cpu.network.net.decay=0.03;
+        let shape=cpu.network.net.input_shape(); let mut rng=Rng(781);
+        let input=Tensor::from_data(shape,rng.vec(shape.batch*shape.element_count())).unwrap();
+        let mut gpu=GpuExecutableNetwork::new(cpu.network.clone(),OxideBackend::new().unwrap());
+        gpu.params=cpu.params.clone(); gpu.init_train_buffers_gpu().unwrap();
+        cpu.zero_train_buffers(); gpu.zero_train_buffers_gpu().unwrap();
+        for step in 0..3 {
+            let host_snapshot=vit_blob(&gpu.params[0]);
+            let host=cpu.forward_training(&input).unwrap();
+            let device=gpu.forward_training_device(&input).unwrap();
+            let expected=host.final_output().unwrap();
+            close("resident forward",&gpu.backend.download_f32(&device.gpu_layer_outputs[0]).unwrap(),&expected.data,2e-4);
+            let compact=gpu.forward_compact(&input).unwrap().final_output.unwrap();
+            close("resident compact",&compact.data,&expected.data,2e-4);
+            // The half path rounds activations at its storage boundaries, then
+            // uses the same native f32 ViT kernels and resident master bank.
+            let half_input = gpu.backend.upload_f16(&[shape.batch, shape.channels, shape.height, shape.width], &input.data).unwrap();
+            let rounded_input = Tensor::from_data(shape, gpu.backend.download_f16(&half_input).unwrap()).unwrap();
+            let f32_rounded_reference = gpu.forward_compact(&rounded_input).unwrap().final_output.unwrap();
+            let rounded_output = gpu.backend.download_f16(
+                &gpu.backend.upload_f16(&[
+                    f32_rounded_reference.shape.batch,
+                    f32_rounded_reference.shape.channels,
+                    f32_rounded_reference.shape.height,
+                    f32_rounded_reference.shape.width,
+                ], &f32_rounded_reference.data).unwrap()
+            ).unwrap();
+            let half_summary = gpu.forward_compact_f16(&input).unwrap();
+            let half_output = half_summary.final_output.unwrap();
+            close("resident f16 compact storage", &half_output.data, &rounded_output, 0.0);
+            let seeds=[Some(Tensor::from_data(expected.shape,rng.vec(expected.len()).into_iter().map(|v|v*200.0).collect()).unwrap())];
+            for _ in 0..2 {
+                let reference=cpu.backward_accumulate_seeded(&input,&host,&seeds).unwrap();
+                let actual=gpu.backward_accumulate_seeded_gpu_with_input_gradient(&device,&seeds).unwrap().unwrap();
+                close("resident input adjoint",&actual.data,&reference.input_gradient.data,5e-4);
+            }
+            gpu.synchronize_resident_parameter_gradients().unwrap();
+            close("resident accumulated gradients",&vit_updates(&gpu.host_fallback_train_buffers()[0]),
+                &vit_updates(&cpu.train_buffers[0]),5e-4);
+            if adam {cpu.update_weights_adam(0.003,2).unwrap();}
+            else {cpu.update_weights(0.003,0.9,0.03,2);}
+            gpu.update_weights_gpu_deferred(0.003,0.9,0.03,2).unwrap();
+            assert_eq!(vit_blob(&gpu.params[0]),host_snapshot,"deferred host mirror changed");
+            assert!(gpu.backward_accumulate_seeded_gpu(&device,&seeds).is_err(),"stale ViT tape accepted");
+            let actual=gpu.forward_compact(&input).unwrap().final_output.unwrap();
+            close("updated resident inference",&actual.data,&cpu.forward(&input).unwrap().final_output().unwrap().data,5e-4);
+            let half_after_update = gpu.forward_compact_f16(&input).unwrap().final_output.unwrap();
+            let current_f32 = gpu.forward_compact(&rounded_input).unwrap().final_output.unwrap();
+            let current_half = gpu.backend.download_f16(
+                &gpu.backend.upload_f16(&[
+                    current_f32.shape.batch,
+                    current_f32.shape.channels,
+                    current_f32.shape.height,
+                    current_f32.shape.width,
+                ], &current_f32.data).unwrap()
+            ).unwrap();
+            close("updated resident f16 compact storage", &half_after_update.data, &current_half, 0.0);
+            if adam && step==1 {
+                let path=std::env::temp_dir().join(format!("lightnet-vit-resident-{}-{decoupled}.dnopt",std::process::id()));
+                gpu.save_optimizer_state(&path).unwrap();
+                let mut restored=GpuExecutableNetwork::new(cpu.network.clone(),OxideBackend::new().unwrap());
+                restored.params=cpu.params.clone(); restored.init_train_buffers_gpu().unwrap();
+                restored.load_optimizer_state(&path).unwrap(); std::fs::remove_file(path).unwrap();
+                gpu=restored;
+            }
+        }
+        gpu.synchronize_resident_parameter_state().unwrap();
+        close("resident final parameters",&vit_blob(&gpu.params[0]),&vit_blob(&cpu.params[0]),5e-4);
+    }
 }

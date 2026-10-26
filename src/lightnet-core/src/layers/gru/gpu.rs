@@ -27,7 +27,7 @@ where
             for (len,decay,slot) in [(p.biases.len(),false,ResidentMomentSlot::ChildBiases(i)),
                 (p.weights.len(),true,ResidentMomentSlot::ChildWeights(i))] {
                 let range=cursor..cursor+len;cursor+=len;ranges.push(range.clone());
-                layout.push(ResidentParameterRange{range,decay,coupled_decay:true,moment_slot:slot});
+                layout.push(ResidentParameterRange{range,decay,coupled_decay:true,moment_slot:Some(slot),active:true});
             }
         }
         let host=serialized(params);

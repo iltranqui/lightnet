@@ -156,9 +156,9 @@ where
                     layer,spec,params,current_input.expect("GRU requires current input"),launch_config)?,
                 (LayerKind::RecursiveBlock(spec), LayerParams::RecursiveBlock(weights)) => self.forward_recursive_block_gpu(
                     layer, spec, weights, current_input.expect("recursive requires current input"), launch_config, false)?.0,
-                (LayerKind::Vit(spec), LayerParams::Vit(weights)) => vit_gpu::forward(
-                    &self.backend, &vit_geometry(layer, spec), weights,
-                    current_input.expect("ViT requires current input"), layer.output_shape, launch_config)?,
+                (LayerKind::Vit(spec), LayerParams::Vit(weights)) => self.forward_vit_native_gpu(
+                    layer, &vit_geometry(layer, spec), weights,
+                    current_input.expect("ViT requires current input"), launch_config, false)?.0,
                 (LayerKind::Swin(spec), LayerParams::Swin(weights)) => crate::layers::swin::gpu::forward(
                     &self.backend, &crate::layers::swin::gpu::geometry(layer, spec), weights,
                     current_input.expect("Swin requires current input"), layer.output_shape, launch_config)?,

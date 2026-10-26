@@ -1,9 +1,10 @@
 //! Native f32 composition for `[vit]` (no MSA, no VC attention): inference
 //! forward, a training forward that keeps its intermediates on the device, and
-//! the native backward that consumes them. Parameter gradients are staged into
-//! the host train buffers, where the existing SGD/Adam/Muon arms update them.
+//! the native backward that consumes them. Native SGD/Adam retain parameters,
+//! gradients and moments in resident banks. Muon retains the hybrid path.
 use crate::runtime::{
-    GpuExecutableNetwork, LayerTrainBuffers, backend_error, tensor_backend_shape,
+    GpuExecutableNetwork, LayerTrainBuffers, ResidentMomentSlot, ResidentParameterRange,
+    backend_error, tensor_backend_shape,
 };
 use crate::error::{Error, Result};
 use crate::model::{Activation, Layer, TensorShape};
@@ -56,6 +57,9 @@ pub(crate) fn supported(g: &VitGeometry) -> bool {
 /// recomputes probabilities instead of storing a `tokens x tokens` matrix.
 #[derive(Clone, Debug)]
 pub(crate) struct DeviceCache<T> {
+    resident_mhc: Option<T>,
+    resident_generation: Option<u64>,
+    resident_ranges: Vec<std::ops::Range<usize>>,
     geometry: VitGeometry,
     out_h: usize,
     out_w: usize,
@@ -83,41 +87,6 @@ pub(crate) struct DeviceCache<T> {
     ln2_gamma: T,
 }
 
-/// Native inference forward; no intermediates are kept.
-pub(crate) fn forward<B: F32TensorOpsBackend>(
-    backend: &B,
-    g: &VitGeometry,
-    weights: &VitWeights,
-    input: &B::Tensor,
-    output_shape: TensorShape,
-    config: ElementwiseLaunchConfig,
-) -> Result<B::Tensor>
-where
-    B::Error: std::fmt::Display,
-{
-    Ok(run(backend, g, weights, input, output_shape, config, false)?.0)
-}
-
-/// Native training forward: the same composition as [`forward`], returning the
-/// device cache that [`GpuExecutableNetwork::backward_vit_gpu`] consumes.
-pub(crate) fn forward_training<B: F32TensorOpsBackend>(
-    backend: &B,
-    g: &VitGeometry,
-    weights: &VitWeights,
-    input: &B::Tensor,
-    output_shape: TensorShape,
-    config: ElementwiseLaunchConfig,
-) -> Result<(B::Tensor, DeviceCache<B::Tensor>)>
-where
-    B::Error: std::fmt::Display,
-{
-    let (output, cache) = run(backend, g, weights, input, output_shape, config, true)?;
-    let cache = cache.ok_or_else(|| {
-        Error::InvalidConfig("[vit] native training forward produced no cache".into())
-    })?;
-    Ok((output, cache))
-}
-
 fn run<B: F32TensorOpsBackend>(
     backend: &B,
     g: &VitGeometry,
@@ -126,6 +95,7 @@ fn run<B: F32TensorOpsBackend>(
     output_shape: TensorShape,
     config: ElementwiseLaunchConfig,
     keep: bool,
+    resident: Option<&[B::Tensor]>,
 ) -> Result<(B::Tensor, Option<DeviceCache<B::Tensor>>)>
 where
     B::Error: std::fmt::Display,
@@ -135,7 +105,8 @@ where
     if !g.ln_eps.is_finite() || g.ln_eps <= 0.0 {
         return Err(Error::InvalidConfig("[vit] ln_eps must be positive and finite".into()));
     }
-    let up = |what: &str, shape: &[usize], data: &[f32]| {
+    let up = |slot: usize, what: &str, shape: &[usize], data: &[f32]| {
+        if let Some(parameters) = resident { return Ok(parameters[slot].clone()); }
         backend
             .upload_f32(shape, data)
             .map_err(|e| backend_error(&format!("upload vit {what}"), e))
@@ -199,21 +170,21 @@ where
     let (skip1, branch1, ..) =
         crate::vit::mhc_coefficients(&weights.mhc, 1).map_err(Error::InvalidConfig)?;
 
-    let patch_embed = up("patch_embed", &[hidden, patch_dim], &weights.patch_embed)?;
-    let patch_bias = up("patch_bias", &[hidden], &weights.patch_bias)?;
-    let pos = up("positions", &[tokens_per_sample, hidden], &weights.pos_embed)?;
-    let ln1_gamma = up("ln1 gamma", &[hidden], &weights.ln1_gamma)?;
-    let ln1_beta = up("ln1 beta", &[hidden], &weights.ln1_beta)?;
-    let qkv_weight = up("qkv weights", &[3 * hidden, hidden], &weights.qkv_weight)?;
-    let qkv_bias = up("qkv bias", &[3 * hidden], &weights.qkv_bias)?;
-    let wo = up("wo weights", &[hidden, hidden], &weights.wo)?;
-    let wo_bias = up("wo bias", &[hidden], &weights.wo_bias)?;
-    let ln2_gamma = up("ln2 gamma", &[hidden], &weights.ln2_gamma)?;
-    let ln2_beta = up("ln2 beta", &[hidden], &weights.ln2_beta)?;
-    let ffn_w1 = up("ffn1 weights", &[mlp, hidden], &weights.ffn_w1)?;
-    let ffn_b1 = up("ffn1 bias", &[mlp], &weights.ffn_b1)?;
-    let ffn_w2 = up("ffn2 weights", &[hidden, mlp], &weights.ffn_w2)?;
-    let ffn_b2 = up("ffn2 bias", &[hidden], &weights.ffn_b2)?;
+    let patch_embed = up(0,"patch_embed", &[hidden, patch_dim], &weights.patch_embed)?;
+    let patch_bias = up(1,"patch_bias", &[hidden], &weights.patch_bias)?;
+    let pos = up(14,"positions", &[tokens_per_sample, hidden], &weights.pos_embed)?;
+    let ln1_gamma = up(3,"ln1 gamma", &[hidden], &weights.ln1_gamma)?;
+    let ln1_beta = up(4,"ln1 beta", &[hidden], &weights.ln1_beta)?;
+    let qkv_weight = up(5,"qkv weights", &[3 * hidden, hidden], &weights.qkv_weight)?;
+    let qkv_bias = up(2,"qkv bias", &[3 * hidden], &weights.qkv_bias)?;
+    let wo = up(6,"wo weights", &[hidden, hidden], &weights.wo)?;
+    let wo_bias = up(7,"wo bias", &[hidden], &weights.wo_bias)?;
+    let ln2_gamma = up(8,"ln2 gamma", &[hidden], &weights.ln2_gamma)?;
+    let ln2_beta = up(9,"ln2 beta", &[hidden], &weights.ln2_beta)?;
+    let ffn_w1 = up(10,"ffn1 weights", &[mlp, hidden], &weights.ffn_w1)?;
+    let ffn_b1 = up(11,"ffn1 bias", &[mlp], &weights.ffn_b1)?;
+    let ffn_w2 = up(12,"ffn2 weights", &[hidden, mlp], &weights.ffn_w2)?;
+    let ffn_b2 = up(13,"ffn2 bias", &[hidden], &weights.ffn_b2)?;
 
     // Torch `Linear` (`[out, in]` weights) is the connected-layer GEMM with a
     // device bias epilogue.
@@ -261,9 +232,12 @@ where
         )
         .map_err(|e| backend_error("GPU vit attention", e))?;
     let projection = lin("wo", &context, &wo, &wo_bias, hidden, hidden)?;
-    let res1 = backend
+    let res1 = if let Some(p) = resident {
+        backend.vit_resident_mhc_forward_f32(&tokens,&projection,&p[15],0,FEATURE_CLIP,config)
+            .map_err(|e| backend_error("resident ViT attention residual",e))?
+    } else { backend
         .vit_mhc_residual_f32(&tokens, &projection, skip0, branch0, FEATURE_CLIP, config)
-        .map_err(|e| backend_error("GPU vit attention residual", e))?;
+        .map_err(|e| backend_error("GPU vit attention residual", e))? };
     let ln2 = norm("ln2", &res1, &ln2_gamma, &ln2_beta)?;
     let ffn1_raw = lin("ffn1", &ln2, &ffn_w1, &ffn_b1, hidden, mlp)?;
     let ffn1_clamped = backend
@@ -276,13 +250,19 @@ where
         .vit_clamp_feature_f32(&ffn1_act, FEATURE_CLIP, config)
         .map_err(|e| backend_error("GPU vit ffn post-clamp", e))?;
     let ffn2 = lin("ffn2", &ffn1_activated, &ffn_w2, &ffn_b2, mlp, hidden)?;
-    let mixed = backend
+    let mixed = if let Some(p) = resident {
+        backend.vit_resident_mhc_forward_f32(&res1,&ffn2,&p[15],1,FEATURE_CLIP,config)
+            .map_err(|e| backend_error("resident ViT ffn residual",e))?
+    } else { backend
         .vit_mhc_residual_f32(&res1, &ffn2, skip1, branch1, FEATURE_CLIP, config)
-        .map_err(|e| backend_error("GPU vit ffn residual", e))?;
+        .map_err(|e| backend_error("GPU vit ffn residual", e))? };
     let out = backend
         .vit_tokens_to_nchw_f32(&mixed, g.batch, out_h, out_w, hidden, config)
         .map_err(|e| backend_error("GPU vit output", e))?;
     let cache = keep.then(|| DeviceCache {
+        resident_mhc: resident.map(|p|p[15].clone()),
+        resident_generation: None,
+        resident_ranges: Vec::new(),
         geometry: g.clone(),
         out_h,
         out_w,
@@ -339,6 +319,37 @@ where
     B: F32TensorOpsBackend,
     B::Error: std::fmt::Display,
 {
+    pub(crate) fn forward_vit_native_gpu(&self, layer: &Layer, g: &VitGeometry,
+        weights: &VitWeights, input: &B::Tensor, config: ElementwiseLaunchConfig,
+        training: bool,
+    ) -> Result<(B::Tensor, Option<DeviceCache<B::Tensor>>)> {
+        let mut cursor = 0;
+        let mut ranges = Vec::new();
+        let mut layout = Vec::new();
+        for (slot, part) in weights.serialized_parts().iter().enumerate() {
+            let range = cursor..cursor+part.len(); cursor = range.end;
+            let active = slot != 14 || g.learned_pos_embed;
+            ranges.push(range.clone());
+            layout.push(ResidentParameterRange { range,
+                decay: matches!(slot,0|5|6|10|12|14) && active,
+                coupled_decay: slot != 15 && active,
+                moment_slot: active.then_some(ResidentMomentSlot::ChildWeights(slot)), active });
+        }
+        // ViT Muon's two-stage clipping and fallback policy remain hybrid.
+        let resident = self.resident_parameter_path_enabled() && !self.network.net.muon;
+        let (parameters,generation) = if resident {
+            let (p,generation)=self.resident_parameter_slices(layer.index,&weights.to_blob(),layout,&ranges,config)?;
+            (Some(p),Some(generation))
+        } else { (None,None) };
+        let (output,mut cache)=run(&self.backend,g,weights,input,layer.output_shape,config,
+            training,parameters.as_deref())?;
+        if let Some(cache)=cache.as_mut() {
+            cache.resident_generation=generation;
+            cache.resident_ranges=ranges;
+        }
+        Ok((output,cache))
+    }
+
     /// Host ViT forward with a device flash-attention hook; fills the host cache
     /// that the host backward reads (MSA, VC, unmapped activations, and training
     /// networks that need the CPU backward fallback for another layer).
@@ -453,6 +464,15 @@ where
             crate::vit::mhc_coefficients(&weights.mhc, 0).map_err(Error::InvalidConfig)?;
         let (skip1, branch1, p1, post_skip1, post_branch1) =
             crate::vit::mhc_coefficients(&weights.mhc, 1).map_err(Error::InvalidConfig)?;
+        let mhc_backward = |site, skip: &B::Tensor, branch: &B::Tensor, grad: &B::Tensor| {
+            if let Some(params) = &cache.resident_mhc {
+                be.vit_resident_mhc_backward_f32(skip,branch,grad,params,site,FEATURE_CLIP,config)
+            } else {
+                let (ss,bs,p,a,b)=if site==0 {(skip0,branch0,p0,post_skip0,post_branch0)}
+                    else {(skip1,branch1,p1,post_skip1,post_branch1)};
+                be.vit_mhc_residual_backward_f32(skip,branch,grad,ss,bs,p,a,b,FEATURE_CLIP,config)
+            }
+        };
 
         // LayerNorm adjoint: input gradient from the existing kernel; gamma
         // and beta reduce `dy * xhat` and `dy` over rows (xhat is the
@@ -479,19 +499,7 @@ where
         let d_mixed = be
             .vit_nchw_to_tokens_f32(&grad, g.batch, cache.out_h, cache.out_w, hidden, config)
             .map_err(err("output layout"))?;
-        let (d_res1_skip, d_ffn2, mhc1_sums) = be
-            .vit_mhc_residual_backward_f32(
-                &cache.res1,
-                &cache.ffn2,
-                &d_mixed,
-                skip1,
-                branch1,
-                p1,
-                post_skip1,
-                post_branch1,
-                FEATURE_CLIP,
-                config,
-            )
+        let (d_res1_skip, d_ffn2, mhc1_sums) = mhc_backward(1,&cache.res1,&cache.ffn2,&d_mixed)
             .map_err(err("ffn residual"))?;
         let (d_ffn1_activated, d_ffn_w2, d_ffn_b2) = be
             .connected_backward_f32(&cache.ffn1_activated, &cache.ffn_w2, &d_ffn2, rows, mlp, hidden, config)
@@ -518,19 +526,7 @@ where
                 .map_err(err(what))
         };
         let d_res1 = add("ln2 residual", &d_res1_norm, &d_res1_skip)?;
-        let (d_tokens_skip, d_projection, mhc0_sums) = be
-            .vit_mhc_residual_backward_f32(
-                &cache.tokens,
-                &cache.projection,
-                &d_res1,
-                skip0,
-                branch0,
-                p0,
-                post_skip0,
-                post_branch0,
-                FEATURE_CLIP,
-                config,
-            )
+        let (d_tokens_skip, d_projection, mhc0_sums) = mhc_backward(0,&cache.tokens,&cache.projection,&d_res1)
             .map_err(err("attention residual"))?;
         let (d_context, d_wo, d_wo_bias) = be
             .connected_backward_f32(&cache.context, &cache.wo, &d_projection, rows, hidden, hidden, config)
@@ -581,7 +577,20 @@ where
             None
         };
 
-        // Parameter staging: one download per tensor at the optimizer boundary.
+        if let Some(generation) = cache.resident_generation {
+            let d_mhc=be.route_concat_f32(&[&mhc0_sums,&mhc1_sums],&[0,0],&[6,6],&[6,6],
+                &[12],1,config).map_err(err("mHC gradient packing"))?;
+            let d_pos=match d_pos {Some(p)=>p,None=>be.zeros_f32(&[weights.pos_embed.len()])
+                .map_err(err("frozen position gradients"))?};
+            let gradients=vec![d_patch_embed,d_patch_bias,d_qkv_bias,d_ln1_gamma,d_ln1_beta,
+                d_qkv_weight,d_wo,d_wo_bias,d_ln2_gamma,d_ln2_beta,d_ffn_w1,d_ffn_b1,
+                d_ffn_w2,d_ffn_b2,d_pos,d_mhc];
+            self.accumulate_resident_parameter_gradients(layer.index,generation,
+                cache.resident_ranges.iter().cloned().zip(gradients).collect(),config)?;
+            return self.accumulate_previous_gpu_gradient(layer.index,d_input,layer_output_gradients);
+        }
+
+        // Hybrid fallback stages parameter tensors at the optimizer boundary.
         let host = |what: &str, t: &B::Tensor| {
             be.download_f32(t)
                 .map_err(|e| backend_error(&format!("download vit {what} gradient"), e))

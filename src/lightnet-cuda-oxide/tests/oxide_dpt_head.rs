@@ -56,6 +56,9 @@ fn dpt_native_four_tap_forward_backward_accumulation_and_updates_match_cpu() {
                 let actual = gpu.backward_accumulate_seeded_gpu_with_input_gradient(&device, &seeds).unwrap().unwrap();
                 close("input gradient", &actual.data, &expected.input_gradient.data, 1e-3);
             }
+            // Resident backward keeps parameter updates on device. The
+            // explicit diagnostic refreshes this host mirror for comparison.
+            gpu.synchronize_resident_parameter_gradients().unwrap();
             close("parameter accumulation", updates(&gpu.host_fallback_train_buffers()[0]), updates(&cpu.train_buffers[0]), 1e-3);
             if cpu.network.net.muon {cpu.update_weights_muon(0.003,2).unwrap();}
             else if cpu.network.net.adam {cpu.update_weights_adam(0.003,2).unwrap();}
