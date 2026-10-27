@@ -15,6 +15,7 @@ mod crop_backend;
 mod local_backend;
 mod pool_backend;
 mod graph_conv_backend;
+mod tucker_attention_backend;
 mod graph_conv;
 mod swin;
 mod mambavision;
@@ -10639,7 +10640,7 @@ impl F32TensorOpsBackend for OxideBackend {
         geometry: lightnet_cuda::host_ops::tucker_attention::AttentionGeometry,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
-        self.tucker_attention_native(q, k, v, geometry, config)
+        self.tucker_attention_backend_f32(q, k, v, geometry, config)
     }
 
     fn tucker_attention_backward_f32(
@@ -10648,7 +10649,16 @@ impl F32TensorOpsBackend for OxideBackend {
         geometry: lightnet_cuda::host_ops::tucker_attention::AttentionGeometry,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
-        self.tucker_attention_backward_native(q, k, v, probabilities, active, grad, geometry, config)
+        self.tucker_attention_backend_backward_f32(
+            q,
+            k,
+            v,
+            probabilities,
+            active,
+            grad,
+            geometry,
+            config,
+        )
     }
 
     fn clifford_interaction_f32(
