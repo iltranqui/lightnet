@@ -4389,6 +4389,39 @@ fn clifford_fourier_backward_f32(&self, input: &Self::Tensor, grad: &Self::Tenso
         )
     }
 
+    fn swin_resident_mhc_forward_f32(&self, skip: &Self::Tensor, branch: &Self::Tensor,
+        params: &Self::Tensor, site: usize, config: ElementwiseLaunchConfig) -> Result<Self::Tensor,Self::Error> {
+        let skip=self.f32v(skip)?; let branch=self.f32v(branch)?; let params=self.f32v(params)?;
+        if skip.len()==0 || skip.len()!=branch.len() || params.len()!=12 || site>=2 {
+            return Err(shape_err("resident Swin mHC", "invalid lengths or site".into()));
+        }
+        let mut out=self.alloc_uninit(skip.len())?;
+        // SAFETY: operands and output lengths are validated above.
+        unsafe { self.swin.swin_resident_mhc(&self.stream,launch::elementwise(skip.len(),config),
+            &skip.buf,&branch.buf,&skip.buf,&params.buf,&mut out,site,0) }.map_err(launch_err)?;
+        Ok(OxideTensorF32::new(out,skip.shape()))
+    }
+    fn swin_resident_mhc_backward_f32(&self, skip: &Self::Tensor, branch: &Self::Tensor,
+        grad: &Self::Tensor, params: &Self::Tensor, site: usize, config: ElementwiseLaunchConfig)
+        -> Result<(Self::Tensor,Self::Tensor,Self::Tensor),Self::Error> {
+        let skip=self.f32v(skip)?; let branch=self.f32v(branch)?; let grad=self.f32v(grad)?; let params=self.f32v(params)?;
+        let n=skip.len(); if n==0 || n!=branch.len() || n!=grad.len() || params.len()!=12 || site>=2 {
+            return Err(shape_err("resident Swin mHC backward", "invalid lengths or site".into()));
+        }
+        let mut ds=self.alloc_uninit(n)?; let mut db=self.alloc_uninit(n)?; let mut terms=self.alloc_uninit(3*n)?;
+        // SAFETY: each launch writes its validated output exactly once.
+        unsafe {
+            self.swin.swin_resident_mhc(&self.stream,launch::elementwise(n,config),&skip.buf,&branch.buf,&grad.buf,&params.buf,&mut ds,site,1).map_err(launch_err)?;
+            self.swin.swin_resident_mhc(&self.stream,launch::elementwise(n,config),&skip.buf,&branch.buf,&grad.buf,&params.buf,&mut db,site,2).map_err(launch_err)?;
+            self.swin.swin_resident_mhc(&self.stream,launch::elementwise(3*n,config),&skip.buf,&branch.buf,&grad.buf,&params.buf,&mut terms,site,3).map_err(launch_err)?;
+        }
+        let sums=self.bias_backward_f32(&OxideTensorF32::new(terms,&[3,n]),3,n,config)?;
+        let mut dp=self.alloc_uninit(6)?;
+        // SAFETY: six output elements consume twelve parameters and three sums.
+        unsafe { self.swin.swin_resident_mhc_gradient(&self.stream,launch::elementwise(6,config),&params.buf,&sums.buf,&mut dp,site) }.map_err(launch_err)?;
+        Ok((OxideTensorF32::new(ds,grad.shape()),OxideTensorF32::new(db,grad.shape()),OxideTensorF32::new(dp,&[6])))
+    }
+
     fn swin_mhc_residual_f32(
         &self,
         skip: &Self::Tensor,

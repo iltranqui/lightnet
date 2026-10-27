@@ -85,6 +85,7 @@ fn host_values_match(params: &LayerParams, snapshot: &[f32]) -> Result<bool> {
         LayerParams::Gru(p) => Ok(same_bits(&crate::layers::gru::cpu::serialized(p),snapshot)),
         LayerParams::DptHead(p) => Ok(same_bits(&p.values,snapshot)),
         LayerParams::Vit(p) => Ok(same_bits(&p.to_blob(),snapshot)),
+        LayerParams::Swin(p) => Ok(same_bits(&p.to_blob().map_err(Error::InvalidConfig)?,snapshot)),
         _ => Err(Error::InvalidConfig("resident parameter host kind mismatch".into())),
     }
 }
@@ -98,6 +99,7 @@ fn host_updates(buffer: &LayerTrainBuffers) -> Result<Vec<f32>> {
             .into_iter().flat_map(|t|t.bias_updates.iter().chain(&t.weight_updates).copied()).collect()),
         LayerTrainBuffers::DptHead(t) => Ok(t.weight_updates.clone()),
         LayerTrainBuffers::Vit(t) => Ok(t.updates.to_blob()),
+        LayerTrainBuffers::Swin(t) => t.updates.to_blob().map_err(Error::InvalidConfig),
         _ => Err(Error::InvalidConfig("resident accumulator host kind mismatch".into())),
     }
 }
@@ -128,6 +130,7 @@ fn set_host_updates(buffer: &mut LayerTrainBuffers, values: &[f32]) -> Result<()
         }
         LayerTrainBuffers::DptHead(t) if t.weight_updates.len() == values.len() => t.weight_updates.copy_from_slice(values),
         LayerTrainBuffers::Vit(t) => t.updates.set_serialized(values).map_err(Error::InvalidConfig)?,
+        LayerTrainBuffers::Swin(t) => t.updates.set_serialized(values).map_err(Error::InvalidConfig)?,
         _ => return Err(Error::InvalidConfig("resident host accumulator mirror mismatch".into())),
     }
     Ok(())
@@ -149,6 +152,7 @@ fn set_host_values(params: &mut LayerParams, values: &[f32]) -> Result<()> {
         }
         LayerParams::DptHead(p) if p.values.len() == values.len() => p.values.copy_from_slice(values),
         LayerParams::Vit(p) => p.set_serialized(values).map_err(Error::InvalidConfig)?,
+        LayerParams::Swin(p) => p.set_serialized(values).map_err(Error::InvalidConfig)?,
         _ => return Err(Error::InvalidConfig("resident parameter host length/kind mismatch".into())),
     }
     Ok(())
@@ -172,12 +176,14 @@ fn validate_layout(layout: &[ResidentParameterRange], total: usize) -> Result<()
 /// rate and a parameter clamp. Keep those rules outside the uniform-bank step.
 fn stage_vit_resident_optimizer<B: F32TensorOpsBackend>(be: &B,
     old: &ResidentParameterState<B::Tensor>, step: &GpuOptimizerStep,
-    layer_rate: f32, config: ElementwiseLaunchConfig,
+    layer_rate: f32, config: ElementwiseLaunchConfig, swin: bool,
 ) -> Result<ResidentParameterState<B::Tensor>> where B::Error: std::fmt::Display {
     let err=|e|backend_error("resident ViT optimizer",e);
     let total=old.snapshot.len();
-    let positions=old.layout.get(14).ok_or_else(||Error::InvalidConfig("ViT resident position group missing".into()))?;
-    let excluded=if positions.active {0..0} else {positions.range.clone()};
+    let excluded=if swin {0..0} else {
+        let positions=old.layout.get(14).ok_or_else(||Error::InvalidConfig("ViT resident position group missing".into()))?;
+        if positions.active {0..0} else {positions.range.clone()}
+    };
     let prepared=be.vit_prepare_updates_f32(&old.updates,excluded.start,excluded.end,5.0,config).map_err(err)?;
     let slice=|t:&B::Tensor,r:Range<usize>|be.route_concat_f32(&[t],&[r.start],&[r.len()],&[total],
         &[r.len()],1,config).map_err(err);
@@ -191,7 +197,8 @@ fn stage_vit_resident_optimizer<B: F32TensorOpsBackend>(be: &B,
             None=>(be.zeros_f32(&[block.range.len()]).map_err(err)?,be.zeros_f32(&[block.range.len()]).map_err(err)?),
         };
         if !block.active { weights.push(w); updates.push(u); first.push(m); second.push(v); continue; }
-        let rate=layer_rate*if index==15 {0.1} else {1.0};
+        let mhc=if swin {index+1==old.layout.len()} else {index==15};
+        let rate=layer_rate*if mhc && !swin {0.1} else {1.0};
         let (w,u,m,v)=match step {
             GpuOptimizerStep::Sgd{lr,momentum,decay,batch}=>{
                 let (w,u)=be.sgd_update_f32(&w,&u,*lr*rate,*momentum,
@@ -205,7 +212,7 @@ fn stage_vit_resident_optimizer<B: F32TensorOpsBackend>(be: &B,
                 (w,be.zeros_f32(&[block.range.len()]).map_err(err)?,m,v)
             }
         };
-        weights.push(if index==15 {be.vit_clamp_feature_f32(&w,8.0,config).map_err(err)?} else {w});
+        weights.push(if mhc {be.vit_clamp_feature_f32(&w,8.0,config).map_err(err)?} else {w});
         updates.push(u); first.push(m); second.push(v);
     }
     let lengths=old.layout.iter().map(|b|b.range.len()).collect::<Vec<_>>();
@@ -353,6 +360,23 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
                 .ok_or_else(|| Error::InvalidConfig("resident host accumulator index".into()))?;
             set_host_updates(buffer, &values)?;
         }
+        Ok(())
+    }
+
+    /// Hand a clean Swin bank's accumulated gradients to the host optimizer.
+    pub(crate) fn retire_swin_bank_for_muon(&self, index: usize) -> Result<()> {
+        let mut banks = self.resident_parameter_banks.borrow_mut();
+        let Some(Some(state)) = banks.get(index) else { return Ok(()); };
+        if state.dirty {
+            return Err(Error::InvalidConfig("synchronize resident Swin state before switching to Muon".into()));
+        }
+        let values = self.backend.download_f32(&state.updates)
+            .map_err(|e| backend_error("download Swin gradients before Muon", e))?;
+        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
+        let buffer = buffers.get_mut(index)
+            .ok_or_else(|| Error::InvalidConfig("resident host accumulator index".into()))?;
+        set_host_updates(buffer, &values)?;
+        banks[index] = None;
         Ok(())
     }
 
@@ -567,8 +591,8 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
             let host = self.params.get(index)
                 .ok_or_else(|| Error::InvalidConfig("resident optimizer parameter index".into()))?;
             if !host_values_match(host,&old.snapshot)?{return Err(Error::InvalidConfig("host parameters changed after native forward; rerun forward or synchronize before updating".into()));}
-            if matches!(layer.kind,LayerKind::Vit(_)) {
-                let mut next=stage_vit_resident_optimizer(be,old,step,layer.train.learning_rate_scale,config)?;
+            if matches!(layer.kind,LayerKind::Vit(_) | LayerKind::Swin(_)) {
+                let mut next=stage_vit_resident_optimizer(be,old,step,layer.train.learning_rate_scale,config,matches!(layer.kind,LayerKind::Swin(_)))?;
                 next.dirty=true; next.generation=next_resident_generation(&self.resident_parameter_epoch)?;
                 *slot=Some(next); self.host_weights_stale=true;
                 continue;

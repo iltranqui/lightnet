@@ -119,6 +119,22 @@ fn swin_weight_sizes(
 }
 
 impl SwinWeights {
+    /// Parameter arrays in the Rust checkpoint order, including the optional projection.
+    pub(crate) fn serialized_parts(&self) -> Vec<&[f32]> {
+        let mut parts = vec![self.qkv_weight.as_slice(), &self.qkv_bias, &self.wo,
+            &self.wo_bias, &self.ln1_gamma, &self.ln1_beta, &self.ln2_gamma,
+            &self.ln2_beta, &self.ffn_w1, &self.ffn_b1, &self.ffn_w2, &self.ffn_b2];
+        if let Some(projection) = &self.res_proj { parts.push(projection); }
+        parts.push(&self.relative_position_bias);
+        parts.push(&self.mhc);
+        parts
+    }
+
+    pub(crate) fn set_serialized(&mut self, values: &[f32]) -> Result<(), String> {
+        *self = Self::from_blob(values, self.input_channels, self.output_channels,
+            self.heads, self.window, self.ffn_ratio)?;
+        Ok(())
+    }
     pub(crate) fn matches_geometry(
         &self,
         input_channels: usize,

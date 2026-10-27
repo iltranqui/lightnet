@@ -567,6 +567,7 @@ fn swin_gpu_native_check(activation: &str) {
     let LayerTrainBuffers::Swin(cpu_train) = &cpu.train_buffers[0] else {
         panic!("Swin CPU train buffers")
     };
+    gpu.synchronize_resident_parameter_gradients().unwrap();
     let buffers = gpu.host_fallback_train_buffers();
     let LayerTrainBuffers::Swin(gpu_train) = &buffers[0] else {
         panic!("Swin native-staged updates")

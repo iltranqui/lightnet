@@ -159,9 +159,9 @@ where
                 (LayerKind::Vit(spec), LayerParams::Vit(weights)) => self.forward_vit_native_gpu(
                     layer, &vit_geometry(layer, spec), weights,
                     current_input.expect("ViT requires current input"), launch_config, false)?.0,
-                (LayerKind::Swin(spec), LayerParams::Swin(weights)) => crate::layers::swin::gpu::forward(
-                    &self.backend, &crate::layers::swin::gpu::geometry(layer, spec), weights,
-                    current_input.expect("Swin requires current input"), layer.output_shape, launch_config)?,
+                (LayerKind::Swin(spec), LayerParams::Swin(weights)) => self.forward_swin_native_gpu(
+                    layer, &crate::layers::swin::gpu::geometry(layer, spec), weights,
+                    current_input.expect("Swin requires current input"), launch_config, false)?.0,
                 (LayerKind::TuckerAttention(spec), LayerParams::TuckerAttention(weights)) => self.forward_tucker_attention_gpu(
                     layer, spec, weights, current_input.expect("Tucker attention requires current input"), launch_config, false)?.0,
                 (LayerKind::MambaVision(spec), LayerParams::MambaVision(weights)) => self.forward_mambavision_gpu(

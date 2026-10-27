@@ -3357,6 +3357,28 @@ pub trait F32TensorOpsBackend {
             .collect();
         self.upload_f32(&[out.len()], &out)
     }
+    /// Device-resident Swin mHC logits and their mathematical derivatives.
+    fn swin_resident_mhc_forward_f32(&self, skip: &Self::Tensor, branch: &Self::Tensor,
+        params: &Self::Tensor, site: usize, config: ElementwiseLaunchConfig) -> Result<Self::Tensor, Self::Error> {
+        let p = self.download_f32(params)?; assert!(p.len() == 12 && site < 2);
+        let sigmoid = |x: f32| if !x.is_finite() { 0.5 } else if x >= 0.0 { 1.0/(1.0+(-x).exp()) } else { let e=x.exp(); e/(1.0+e) };
+        let o=site*6; let m=sigmoid(0.5*(p[o]+p[o+3]-p[o+1]-p[o+2]));
+        let a=2.0*sigmoid(p[o+4]); let b=2.0*sigmoid(p[o+5]);
+        self.swin_mhc_residual_f32(skip,branch,a*m+b*(1.0-m),a*(1.0-m)+b*m,config)
+    }
+    fn swin_resident_mhc_backward_f32(&self, skip: &Self::Tensor, branch: &Self::Tensor,
+        grad: &Self::Tensor, params: &Self::Tensor, site: usize, config: ElementwiseLaunchConfig)
+        -> Result<(Self::Tensor,Self::Tensor,Self::Tensor), Self::Error> {
+        let p=self.download_f32(params)?; assert!(p.len()==12 && site<2);
+        let sigmoid = |x: f32| if !x.is_finite() {0.5} else if x>=0.0 {1.0/(1.0+(-x).exp())} else {let e=x.exp();e/(1.0+e)};
+        let o=site*6; let z=0.5*(p[o]+p[o+3]-p[o+1]-p[o+2]); let m=sigmoid(z);
+        let a=2.0*sigmoid(p[o+4]); let b=2.0*sigmoid(p[o+5]);
+        let (ds,db,s)=self.swin_mhc_residual_backward_f32(skip,branch,grad,a*m+b*(1.0-m),a*(1.0-m)+b*m,m,a,b,config)?;
+        let s=self.download_f32(&s)?; let dz=if z.is_finite(){0.5*s[2]*m*(1.0-m)}else{0.0};
+        let da=if p[o+4].is_finite(){s[0]*a*(1.0-0.5*a)}else{0.0};
+        let dbias=if p[o+5].is_finite(){s[1]*b*(1.0-0.5*b)}else{0.0};
+        Ok((ds,db,self.upload_f32(&[6],&[dz,-dz,-dz,dz,da,dbias])?))
+    }
     /// Adjoint of [`Self::swin_mhc_residual_f32`]: `(d_skip, d_branch, sums)`
     /// with `sums = [grad_post_skip, grad_post_branch, grad_mix]`, the three
     /// reductions of `swin::mhc_residual_backward` (`mix` is the site's `p`,

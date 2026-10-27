@@ -2250,7 +2250,7 @@ dependencies = [
 
 [[package]]
 name = "lightnet-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "lightnet-core",
  "lightnet-cuda",
@@ -2262,7 +2262,7 @@ dependencies = [
 
 [[package]]
 name = "lightnet-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "imageproc",
@@ -2273,7 +2273,7 @@ dependencies = [
 
 [[package]]
 name = "lightnet-cuda"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "lightnet-cuda-oxide"
@@ -2287,7 +2287,7 @@ dependencies = [
 
 [[package]]
 name = "lightnet-examples"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "imageproc",
@@ -2297,7 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "lightnet-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "eframe",
@@ -2312,7 +2312,7 @@ dependencies = [
 
 [[package]]
 name = "lightnet-gui-engine"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2320,7 +2320,7 @@ dependencies = [
 
 [[package]]
 name = "lightnet-gui-project"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "image",
  "imageproc",
@@ -2331,7 +2331,7 @@ dependencies = [
 
 [[package]]
 name = "lightnet-lm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "lightnet-cuda",
  "sha2",

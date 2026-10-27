@@ -10,7 +10,7 @@ use super::block::SwinGeometry;
 use crate::error::{Error, Result};
 use crate::model::{Activation, Layer, SwinSpec, TensorShape};
 use crate::runtime::{
-    GpuExecutableNetwork, LayerTrainBuffers, backend_error, tensor_backend_shape,
+    GpuExecutableNetwork, LayerTrainBuffers, ResidentMomentSlot, ResidentParameterRange, backend_error, tensor_backend_shape,
 };
 use crate::swin::SWIN_MHC_DEFAULTS;
 use lightnet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
@@ -102,6 +102,9 @@ fn extents(g: &SwinGeometry) -> Result<Extents> {
 /// the open-interval derivative of the output constrain.
 #[derive(Clone, Debug)]
 pub(crate) struct DeviceCache<T> {
+    resident_generation: Option<u64>,
+    resident_ranges: Vec<std::ops::Range<usize>>,
+    resident_mhc: Option<T>,
     geometry: SwinGeometry,
     windowed: T,
     ln1: T,
@@ -138,7 +141,7 @@ pub(crate) fn forward<B: F32TensorOpsBackend>(
 where
     B::Error: std::fmt::Display,
 {
-    Ok(run(backend, g, weights, input, output_shape, config, false)?.0)
+    Ok(run(backend, g, weights, input, output_shape, config, false, None)?.0)
 }
 
 /// Native training forward: the same composition as [`forward`], returning the
@@ -154,7 +157,7 @@ pub(crate) fn forward_training<B: F32TensorOpsBackend>(
 where
     B::Error: std::fmt::Display,
 {
-    let (output, cache) = run(backend, g, weights, input, output_shape, config, true)?;
+    let (output, cache) = run(backend, g, weights, input, output_shape, config, true, None)?;
     let cache = cache.ok_or_else(|| {
         Error::InvalidConfig("[swin] native training forward produced no cache".into())
     })?;
@@ -169,6 +172,7 @@ fn run<B: F32TensorOpsBackend>(
     output_shape: TensorShape,
     config: ElementwiseLaunchConfig,
     keep: bool,
+    resident: Option<&[B::Tensor]>,
 ) -> Result<(B::Tensor, Option<DeviceCache<B::Tensor>>)>
 where
     B::Error: std::fmt::Display,
@@ -212,25 +216,29 @@ where
             .upload_f32(shape, data)
             .map_err(|err| backend_error(&format!("upload swin {what}"), err))
     };
+    let parameter = |slot: usize, what: &str, shape: &[usize], data: &[f32]| {
+        if let Some(p) = resident { Ok(p[slot].clone()) } else { up(what,shape,data) }
+    };
     let table_width = 2 * g.window - 1;
-    let qkv_weight = up("qkv weights", &[3 * c, c], &weights.qkv_weight)?;
-    let qkv_bias = up("qkv bias", &[3 * c], &weights.qkv_bias)?;
-    let wo = up("wo weights", &[f, c], &weights.wo)?;
-    let wo_bias = up("wo bias", &[f], &weights.wo_bias)?;
-    let ln1_gamma = up("ln1 gamma", &[c], &weights.ln1_gamma)?;
-    let ln1_beta = up("ln1 beta", &[c], &weights.ln1_beta)?;
-    let ln2_gamma = up("ln2 gamma", &[f], &weights.ln2_gamma)?;
-    let ln2_beta = up("ln2 beta", &[f], &weights.ln2_beta)?;
-    let ffn_w1 = up("ffn1 weights", &[e.hidden, f], &weights.ffn_w1)?;
-    let ffn_b1 = up("ffn1 bias", &[e.hidden], &weights.ffn_b1)?;
-    let ffn_w2 = up("ffn2 weights", &[f, e.hidden], &weights.ffn_w2)?;
-    let ffn_b2 = up("ffn2 bias", &[f], &weights.ffn_b2)?;
+    let qkv_weight = parameter(0,"qkv weights", &[3 * c, c], &weights.qkv_weight)?;
+    let qkv_bias = parameter(1,"qkv bias", &[3 * c], &weights.qkv_bias)?;
+    let wo = parameter(2,"wo weights", &[f, c], &weights.wo)?;
+    let wo_bias = parameter(3,"wo bias", &[f], &weights.wo_bias)?;
+    let ln1_gamma = parameter(4,"ln1 gamma", &[c], &weights.ln1_gamma)?;
+    let ln1_beta = parameter(5,"ln1 beta", &[c], &weights.ln1_beta)?;
+    let ln2_gamma = parameter(6,"ln2 gamma", &[f], &weights.ln2_gamma)?;
+    let ln2_beta = parameter(7,"ln2 beta", &[f], &weights.ln2_beta)?;
+    let ffn_w1 = parameter(8,"ffn1 weights", &[e.hidden, f], &weights.ffn_w1)?;
+    let ffn_b1 = parameter(9,"ffn1 bias", &[e.hidden], &weights.ffn_b1)?;
+    let ffn_w2 = parameter(10,"ffn2 weights", &[f, e.hidden], &weights.ffn_w2)?;
+    let ffn_b2 = parameter(11,"ffn2 bias", &[f], &weights.ffn_b2)?;
     let res_proj = weights
         .res_proj
         .as_ref()
-        .map(|w| up("residual projection", &[f, c], w))
+        .map(|w| parameter(12,"residual projection", &[f, c], w))
         .transpose()?;
-    let relative_bias = up(
+    let bias_slot=12+usize::from(weights.res_proj.is_some());
+    let relative_bias = parameter(bias_slot,
         "relative-position bias",
         &[g.heads, table_width * table_width],
         &weights.relative_position_bias,
@@ -314,14 +322,14 @@ where
         }
         None => windowed.clone(),
     };
-    let res1 = mix("attention residual", &first_skip, &projection, skip0, branch0)?;
+    let res1 = if let Some(p)=resident { backend.swin_resident_mhc_forward_f32(&first_skip,&projection,&p[bias_slot+1],0,config).map_err(|e|backend_error("GPU swin resident mHC",e))? } else {mix("attention residual", &first_skip, &projection, skip0, branch0)?};
     let ln2 = norm("ln2", &res1, &ln2_gamma, &ln2_beta, f)?;
     let ffn1_raw = lin("ffn1", &ln2, &ffn_w1, &ffn_b1, f, e.hidden)?;
     let ffn1_act = backend
         .activation_f32(&ffn1_raw, activation, config)
         .map_err(|err| backend_error("GPU swin activation", err))?;
     let ffn2 = lin("ffn2", &ffn1_act, &ffn_w2, &ffn_b2, e.hidden, f)?;
-    let mixed = mix("ffn residual", &res1, &ffn2, skip1, branch1)?;
+    let mixed = if let Some(p)=resident { backend.swin_resident_mhc_forward_f32(&res1,&ffn2,&p[bias_slot+1],1,config).map_err(|e|backend_error("GPU swin resident mHC",e))? } else {mix("ffn residual", &res1, &ffn2, skip1, branch1)?};
     // Unpartition, reverse shift, crop and the source output constrain.
     let output = backend
         .swin_window_unpartition_f32(
@@ -339,6 +347,9 @@ where
         )
         .map_err(|err| backend_error("GPU swin output", err))?;
     let cache = keep.then(|| DeviceCache {
+        resident_generation: None,
+        resident_ranges: Vec::new(),
+        resident_mhc: resident.map(|p|p[bias_slot+1].clone()),
         geometry: g.clone(),
         windowed,
         ln1,
@@ -401,6 +412,29 @@ where
     B: F32TensorOpsBackend,
     B::Error: std::fmt::Display,
 {
+    pub(crate) fn forward_swin_native_gpu(&self, layer: &Layer, g: &SwinGeometry,
+        weights: &super::SwinWeights, input: &B::Tensor, config: ElementwiseLaunchConfig,
+        training: bool) -> Result<(B::Tensor,Option<DeviceCache<B::Tensor>>)> {
+        if self.network.net.muon {
+            self.retire_swin_bank_for_muon(layer.index)?;
+        }
+        let mut cursor=0; let mut ranges=Vec::new(); let mut layout=Vec::new();
+        let projection=weights.res_proj.is_some();
+        for (slot,part) in weights.serialized_parts().iter().enumerate() {
+            let range=cursor..cursor+part.len(); cursor=range.end; ranges.push(range.clone());
+            let decay=matches!(slot,0|2|8|10) || (projection && slot==12);
+            layout.push(ResidentParameterRange { range, decay, coupled_decay: true,
+                moment_slot:Some(ResidentMomentSlot::ChildWeights(slot)),active:true });
+        }
+        let blob=weights.to_blob().map_err(Error::InvalidConfig)?;
+        let (parameters,generation)=if self.resident_parameter_path_enabled() && !self.network.net.muon {
+            let (p,g)=self.resident_parameter_slices(layer.index,&blob,layout,&ranges,config)?;
+            (Some(p),Some(g))
+        } else {(None,None)};
+        let (output,mut cache)=run(&self.backend,g,weights,input,layer.output_shape,config,training,parameters.as_deref())?;
+        if let Some(cache)=cache.as_mut() { cache.resident_generation=generation; cache.resident_ranges=ranges; }
+        Ok((output,cache))
+    }
     /// Download the input, run the host Swin forward, upload the output. Used
     /// for variants outside [`supported`] and for training networks that take
     /// the CPU backward fallback for another layer.
@@ -529,7 +563,9 @@ where
                 config,
             )
             .map_err(err("output layout"))?;
-        let (d_res1_skip, d_ffn2, mhc1_sums) = be
+        let (d_res1_skip, d_ffn2, mhc1_sums) = if let Some(params)=&cache.resident_mhc {
+            be.swin_resident_mhc_backward_f32(&cache.res1,&cache.ffn2,&d_mixed,params,1,config).map_err(err("ffn resident residual"))?
+        } else { be
             .swin_mhc_residual_backward_f32(
                 &cache.res1,
                 &cache.ffn2,
@@ -541,7 +577,7 @@ where
                 post_branch1,
                 config,
             )
-            .map_err(err("ffn residual"))?;
+            .map_err(err("ffn residual"))? };
         let (d_ffn1_act, d_ffn_w2, d_ffn_b2) = be
             .connected_backward_f32(&cache.ffn1_act, &cache.ffn_w2, &d_ffn2, rows, e.hidden, f, config)
             .map_err(err("ffn2"))?;
@@ -554,7 +590,9 @@ where
         let (d_res1_norm, d_ln2_gamma, d_ln2_beta) =
             layer_norm("ln2", &d_ln2, &cache.res1, &cache.ln2_gamma, f)?;
         let d_res1 = add("ln2 residual", &d_res1_norm, &d_res1_skip, f)?;
-        let (d_first_skip, d_projection, mhc0_sums) = be
+        let (d_first_skip, d_projection, mhc0_sums) = if let Some(params)=&cache.resident_mhc {
+            be.swin_resident_mhc_backward_f32(&cache.first_skip,&cache.projection,&d_res1,params,0,config).map_err(err("attention resident residual"))?
+        } else { be
             .swin_mhc_residual_backward_f32(
                 &cache.first_skip,
                 &cache.projection,
@@ -566,7 +604,7 @@ where
                 post_branch0,
                 config,
             )
-            .map_err(err("attention residual"))?;
+            .map_err(err("attention residual"))? };
         let (d_windowed_skip, d_res_proj) = match &cache.res_proj {
             Some(res_proj) => {
                 let (dx, dw, _) = be
@@ -615,6 +653,16 @@ where
             )
             .map_err(err("input layout"))?;
 
+        if let Some(generation)=cache.resident_generation {
+            let mhc=be.route_concat_f32(&[&mhc0_sums,&mhc1_sums],&[0,0],&[6,6],&[6,6],&[12],1,config).map_err(err("mHC gradient packing"))?;
+            let mut gradients=vec![d_qkv_weight,d_qkv_bias,d_wo,d_wo_bias,d_ln1_gamma,d_ln1_beta,
+                d_ln2_gamma,d_ln2_beta,d_ffn_w1,d_ffn_b1,d_ffn_w2,d_ffn_b2];
+            if let Some(projection)=d_res_proj { gradients.push(projection); }
+            gradients.push(d_relative_bias); gradients.push(mhc);
+            self.accumulate_resident_parameter_gradients(layer.index,generation,
+                cache.resident_ranges.iter().cloned().zip(gradients).collect(),config)?;
+            return self.accumulate_previous_gpu_gradient(layer.index,d_input,layer_output_gradients);
+        }
         // Parameter staging: one download per tensor at the optimizer boundary.
         let host = |what: &str, t: &B::Tensor| {
             be.download_f32(t)

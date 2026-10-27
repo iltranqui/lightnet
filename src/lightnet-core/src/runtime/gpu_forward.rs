@@ -670,25 +670,25 @@ where
                     let geometry = crate::layers::swin::gpu::geometry(layer, spec);
                     if swin_device_training {
                         // Training: the native backward reads this device cache.
-                        let (output, cache) = crate::layers::swin::gpu::forward_training(
-                            &self.backend,
+                        let (output, cache) = self.forward_swin_native_gpu(
+                            layer,
                             &geometry,
                             weights,
                             current_input,
-                            layer.output_shape,
                             launch_config,
+                            true,
                         )?;
-                        swin_device_cache = Some(cache);
+                        swin_device_cache = cache;
                         output
                     } else {
-                        crate::layers::swin::gpu::forward(
-                            &self.backend,
+                        self.forward_swin_native_gpu(
+                            layer,
                             &geometry,
                             weights,
                             current_input,
-                            layer.output_shape,
                             launch_config,
-                        )?
+                            false,
+                        )?.0
                     }
                 }
                 (LayerKind::Swin(spec), LayerParams::Swin(weights)) => {

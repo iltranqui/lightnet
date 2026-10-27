@@ -9,6 +9,46 @@ use cuda_device::{DisjointSlice, cuda_module, device, kernel, thread};
 pub mod kernels {
     use super::*;
 
+    #[device]
+    fn resident_sigmoid(x: f32) -> f32 {
+        if !x.is_finite() { 0.5 } else if x >= 0.0 {
+            1.0 / (1.0 + (-x).exp())
+        } else { let e = x.exp(); e / (1.0 + e) }
+    }
+
+    /// Modes: forward, input adjoints, and three planar reduction terms.
+    #[kernel]
+    pub fn swin_resident_mhc(skip: &[f32], branch: &[f32], grad: &[f32], params: &[f32],
+        mut output: DisjointSlice<f32>, site: usize, mode: usize) {
+        let idx = thread::index_1d(); let j = idx.get();
+        if j >= output.len() { return; }
+        let n = skip.len(); let i = j % n; let o = site * 6;
+        let p = resident_sigmoid(0.5 * (params[o] + params[o+3] - params[o+1] - params[o+2]));
+        let a = 2.0 * resident_sigmoid(params[o+4]);
+        let b = 2.0 * resident_sigmoid(params[o+5]);
+        let ss = a*p + b*(1.0-p); let bs = a*(1.0-p) + b*p;
+        let s = skip[i]; let v = branch[i]; let g = grad[i];
+        let value = if mode == 0 { ss*s + bs*v } else if mode == 1 { g*ss }
+            else if mode == 2 { g*bs } else if j/n == 0 { g*(p*s+(1.0-p)*v) }
+            else if j/n == 1 { g*((1.0-p)*s+p*v) } else { g*(a-b)*(s-v) };
+        if let Some(dst) = output.get_mut(idx) { *dst = value; }
+    }
+
+    #[kernel]
+    pub fn swin_resident_mhc_gradient(params: &[f32], sums: &[f32],
+        mut output: DisjointSlice<f32>, site: usize) {
+        let idx = thread::index_1d(); let i = idx.get(); if i >= output.len() { return; }
+        let o = site*6; let z = 0.5*(params[o]+params[o+3]-params[o+1]-params[o+2]);
+        let p = resident_sigmoid(z); let a = 2.0*resident_sigmoid(params[o+4]);
+        let b = 2.0*resident_sigmoid(params[o+5]);
+        let dz = if z.is_finite() { 0.5*sums[2]*p*(1.0-p) } else { 0.0 };
+        let value = if i == 0 || i == 3 { dz } else if i < 4 { -dz }
+            else if i == 4 && params[o+4].is_finite() { sums[0]*a*(1.0-0.5*a) }
+            else if i == 5 && params[o+5].is_finite() { sums[1]*b*(1.0-0.5*b) }
+            else { 0.0 };
+        if let Some(dst) = output.get_mut(idx) { *dst = value; }
+    }
+
     /// Source `constrain`: NaN maps to `-limit`, everything else clamps.
     #[device]
     fn swin_constrain(value: f32, limit: f32) -> f32 {
