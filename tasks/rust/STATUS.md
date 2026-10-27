@@ -1015,7 +1015,7 @@ believing a `cfg_corpus` failure.
 
 ## Known evidence gaps (not user questions)
 
-- `oxide_dcnv4_normalization` test `normalized_dcnv4_mixed_network_keeps_cpu_cache` fails with `InvalidConfig` reporting missing `[dcnv4]` forward cache for layer #0. The same failure occurred at commit `da19de2` before v0.2.202; it remains open to fix.
+- Resolved in `a62e123`: `oxide_dcnv4_normalization` test `normalized_dcnv4_mixed_network_keeps_cpu_cache` failed with `InvalidConfig` (missing `[dcnv4]` forward cache for layer #0) since before v0.2.202 (`da19de2`). The cause was a stale test: its second layer, `[deconvolutional]`, has had a native backward since an earlier version, so the network was not mixed and the native DCNv4 forward correctly keeps no host cache. The test now uses a batch-normalized `[deform_conv]` (forces host backward); all 3 tests in the suite pass. No runtime change.
 - `[dcnv3]`: forward/backward/update are stubs in **all five** branches that
   carry it (`deform`, `Jev_laya`, `fog`, `jepa`, `depth_3d`), and
   `docs/dcnv3_layer.md` says so. Only its `.weights` order can be ported

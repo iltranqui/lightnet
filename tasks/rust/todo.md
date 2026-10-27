@@ -758,7 +758,7 @@ Immediately next, in dependency order:
 
 ## Known evidence gaps (not user questions)
 
-- [ ] Fix `oxide_dcnv4_normalization` test `normalized_dcnv4_mixed_network_keeps_cpu_cache`: `InvalidConfig` reports missing `[dcnv4]` forward cache for layer #0. The same failure predates v0.2.202 at `da19de2`.
+- [x] Fix `oxide_dcnv4_normalization` test `normalized_dcnv4_mixed_network_keeps_cpu_cache` (`a62e123`): stale test premise, second layer now a batch-normalized `[deform_conv]`; suite 3 passed. No runtime change.
 - `[dcnv3]`: forward/backward/update are stubs in all five branches that carry it
   (`deform`, `Jev_laya`, `fog`, `jepa`, `depth_3d`); only the `.weights` order is
   portable against C++.
