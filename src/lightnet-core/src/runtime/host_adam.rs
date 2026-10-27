@@ -152,6 +152,7 @@ pub(super) fn host_adam_scalar_capacity(params: &LayerParams) -> usize {
             convolutional_parameter_count(&params.collapse)
                 + params.offset_weights.len()
                 + params.offset_biases.len()
+                + params.extra_offset_weights.iter().map(Vec::len).sum::<usize>()
         }
         LayerParams::Wmhf(params) => {
             convolutional_parameter_count(&params.pre)

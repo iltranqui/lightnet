@@ -1346,6 +1346,12 @@ pub(super) fn apply_host_adam_layer(
                 &mut offset_state.biases,
                 &offset_adam,
             )?;
+            if params.extra_offset_weights.len() != train.extra_offset_weight_updates.len() {
+                return Err(Error::InvalidConfig("dsconv extra offset update count mismatch".to_owned()));
+            }
+            for (index, (weights, updates)) in params.extra_offset_weights.iter_mut().zip(&mut train.extra_offset_weight_updates).enumerate() {
+                apply_host_adam(weights, updates, &mut host_adam_child(state, index + 1).weights, &offset_adam)?;
+            }
         }
         (LayerParams::Clifford(params), LayerTrainBuffers::Clifford(train)) => {
             let LayerKind::Clifford(spec) = kind else {

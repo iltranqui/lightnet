@@ -829,6 +829,9 @@ impl ExecutableNetwork {
                         decay,
                         batch,
                     );
+                    for (weights, updates) in params.extra_offset_weights.iter_mut().zip(&mut train.extra_offset_weight_updates) {
+                        sgd_update(weights, updates, layer_lr * 0.01, momentum, decay, batch);
+                    }
                     sgd_update(
                         &mut params.offset_biases,
                         &mut train.offset_bias_updates,
@@ -1106,6 +1109,9 @@ impl ExecutableNetwork {
     /// Apply the opt-in hybrid CPU optimizer: Muon for eligible matrix blocks,
     /// AdamW for all remaining trainable parameters.
     pub fn update_weights_muon(&mut self, lr: f32, batch: usize) -> Result<()> {
+        if self.network.layers.iter().any(|layer| matches!(&layer.kind, LayerKind::DsConv(spec) if spec.templates > 1)) {
+            return Err(Error::InvalidConfig("[dsconv] multi-template Muon updates are not yet supported".to_owned()));
+        }
         let net = self.network.net.clone();
         if !net.muon || net.adam || !net.decoupled_decay {
             return Err(Error::InvalidConfig(

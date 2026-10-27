@@ -886,14 +886,23 @@ impl ExecutableNetwork {
                                 Some(preactivation),
                             )?
                         };
-                    let math_gradient = crate::dsconv::dsconv_backward(
+                    let (math_gradient, extra_offset_weights) = match &cache.math {
+                    DsConvRuntimeMath::Single(cache) => (crate::dsconv::dsconv_backward(
                         current_input,
                         spec,
                         &params.collapse.weights,
                         &params.offset_weights,
-                        &cache.math,
+                        cache,
                         &delta.data,
-                    )?;
+                    )?, Vec::new()),
+                    DsConvRuntimeMath::Multi(cache) => {
+                        let result = crate::dsconv::dsconv_multi_view_backward(
+                            current_input, spec, &params.collapse.weights, &params.offset_weights,
+                            &params.extra_offset_weights, cache, &delta.data,
+                        )?;
+                        (result.shared, result.extra_offset_weights)
+                    }
+                    };
                     let gradient = DsConvParams {
                         collapse: ConvolutionalParams {
                             biases: math_gradient.biases,
@@ -902,7 +911,7 @@ impl ExecutableNetwork {
                         },
                         offset_weights: math_gradient.offset_weights,
                         offset_biases: math_gradient.offset_biases,
-                        extra_offset_weights: Vec::new(),
+                        extra_offset_weights,
                     };
                     let Some(LayerParams::DsConv(dst)) = param_gradients.get_mut(layer.index)
                     else {

@@ -468,6 +468,7 @@ pub struct DsConvTrainBuffers {
     pub collapse: ConvolutionalTrainBuffers,
     pub offset_weight_updates: Vec<f32>,
     pub offset_bias_updates: Vec<f32>,
+    pub extra_offset_weight_updates: Vec<Vec<f32>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -688,7 +689,13 @@ pub(crate) struct DeformConvRuntimeCache {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DsConvRuntimeCache {
-    pub math: crate::dsconv::DsConvForwardCache,
+    pub math: DsConvRuntimeMath,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum DsConvRuntimeMath {
+    Single(crate::dsconv::DsConvForwardCache),
+    Multi(crate::dsconv::DsConvMultiViewCache),
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -819,6 +819,7 @@ pub(super) fn default_dsconv_train_buffers(
         },
         offset_weight_updates: vec![0.0; offset_weights],
         offset_bias_updates: vec![0.0; 2 * spec.size],
+        extra_offset_weight_updates: vec![vec![0.0; offset_weights]; (spec.templates - 1) * 2],
     }
 }
 

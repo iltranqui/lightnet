@@ -45,16 +45,26 @@ pub(super) fn forward_dsconv_with_cache(
     params: &DsConvParams,
     input: &Tensor,
     output_shape: TensorShape,
+    active: &[bool],
 ) -> Result<(Tensor, Tensor, DsConvRuntimeCache)> {
-    let (raw_output, math) = crate::dsconv::dsconv_forward(
-        input,
-        output_shape,
-        spec,
-        &params.collapse.weights,
-        &params.collapse.biases,
-        &params.offset_weights,
-        &params.offset_biases,
-    )?;
+    let (raw_output, math) = if spec.templates > 1 {
+        let (output, cache) = crate::dsconv::dsconv_multi_view_forward(
+            input, output_shape, spec, &params.collapse.weights, &params.collapse.biases,
+            &params.offset_weights, &params.offset_biases, &params.extra_offset_weights, active,
+        )?;
+        (output, DsConvRuntimeMath::Multi(cache))
+    } else {
+        let (output, cache) = crate::dsconv::dsconv_forward(
+            input,
+            output_shape,
+            spec,
+            &params.collapse.weights,
+            &params.collapse.biases,
+            &params.offset_weights,
+            &params.offset_biases,
+        )?;
+        (output, DsConvRuntimeMath::Single(cache))
+    };
     let mut activation_input = Tensor::zeros(output_shape);
     let mut output = Tensor::zeros(output_shape);
     for (index, raw) in raw_output.data.iter().copied().enumerate() {

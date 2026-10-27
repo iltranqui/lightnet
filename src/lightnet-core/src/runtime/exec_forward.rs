@@ -403,8 +403,16 @@ impl ExecutableNetwork {
                     (output, Some(activation_input))
                 }
                 (LayerKind::DsConv(spec), LayerParams::DsConv(params)) => {
+                    let mut active = vec![true; spec.templates * 2];
+                    if spec.templates > 1 && training && spec.drop_prob > 0.0 {
+                        let seed = advance_rng(&mut rng_state);
+                        for (index, value) in active.iter_mut().enumerate() {
+                            *value = dropout_unit(seed, index as u64) >= spec.drop_prob;
+                        }
+                        if !active.iter().any(|&value| value) { active[0] = true; }
+                    }
                     let (output, activation_input, cache) =
-                        forward_dsconv_with_cache(spec, params, current_input, layer.output_shape)?;
+                        forward_dsconv_with_cache(spec, params, current_input, layer.output_shape, &active)?;
                     dsconv_cache = Some(cache);
                     (output, Some(activation_input))
                 }

@@ -780,6 +780,12 @@ impl ExecutableNetwork {
                     accumulate_convolutional_train_buffer(&mut train.collapse, &gradient.collapse)?;
                     accumulate_vec(&mut train.offset_weight_updates, &gradient.offset_weights)?;
                     accumulate_vec(&mut train.offset_bias_updates, &gradient.offset_biases)?;
+                    if train.extra_offset_weight_updates.len() != gradient.extra_offset_weights.len() {
+                        return Err(Error::InvalidConfig("dsconv extra offset gradient count mismatch".to_owned()));
+                    }
+                    for (updates, gradient) in train.extra_offset_weight_updates.iter_mut().zip(&gradient.extra_offset_weights) {
+                        accumulate_vec(updates, gradient)?;
+                    }
                 }
                 (LayerKind::Wmhf(_), LayerParams::Wmhf(gradient)) => {
                     let Some(LayerTrainBuffers::Wmhf(train)) =
