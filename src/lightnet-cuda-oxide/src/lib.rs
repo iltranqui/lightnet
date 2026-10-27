@@ -3,6 +3,7 @@
 //! `cargo oxide`; plain `cargo build` cannot compile the device code.
 
 pub mod conv;
+mod conv2d_backend;
 mod clifford;
 mod dcnv4_native;
 mod deconvolutional;
@@ -5042,29 +5043,7 @@ impl F32TensorOpsBackend for OxideBackend {
         groups: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        if self.amp {
-            return self.conv_forward_amp(
-                x,
-                weights,
-                output_shape,
-                input_channels,
-                input_height,
-                input_width,
-                filters,
-                kernel_size,
-                stride_x,
-                stride_y,
-                dilation,
-                padding,
-                groups,
-                config,
-            );
-        }
-        let x_f = self.f32v(x)?;
-        let x = &*x_f;
-        let weights_f = self.f32v(weights)?;
-        let weights = &*weights_f;
-        self.conv_forward(
+        self.conv2d_f32_backend(
             x,
             weights,
             output_shape,
@@ -5099,29 +5078,7 @@ impl F32TensorOpsBackend for OxideBackend {
         groups: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        if self.amp {
-            return self.conv_backward_input_amp(
-                output_grad,
-                weights,
-                input_shape,
-                input_channels,
-                input_height,
-                input_width,
-                filters,
-                kernel_size,
-                stride_x,
-                stride_y,
-                dilation,
-                padding,
-                groups,
-                config,
-            );
-        }
-        let output_grad_f = self.f32v(output_grad)?;
-        let output_grad = &*output_grad_f;
-        let weights_f = self.f32v(weights)?;
-        let weights = &*weights_f;
-        self.conv_backward_input(
+        self.conv2d_backward_input_f32_backend(
             output_grad,
             weights,
             input_shape,
@@ -5156,29 +5113,7 @@ impl F32TensorOpsBackend for OxideBackend {
         groups: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        if self.amp {
-            return self.conv_backward_weights_amp(
-                x,
-                output_grad,
-                weight_shape,
-                input_channels,
-                input_height,
-                input_width,
-                filters,
-                kernel_size,
-                stride_x,
-                stride_y,
-                dilation,
-                padding,
-                groups,
-                config,
-            );
-        }
-        let x_f = self.f32v(x)?;
-        let x = &*x_f;
-        let output_grad_f = self.f32v(output_grad)?;
-        let output_grad = &*output_grad_f;
-        self.conv_backward_weights(
+        self.conv2d_backward_weights_f32_backend(
             x,
             output_grad,
             weight_shape,
