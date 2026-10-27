@@ -148,7 +148,7 @@ fn normalized_dcnv4_mixed_network_keeps_cpu_cache() {
     let mut be=backend();
     for norm in NORMS {
         // Parse a genuine mixed graph; no activation/shape metadata patching.
-        let cfg=format!("[net]\nwidth=3\nheight=2\nchannels=4\nbatch=2\ntry_fix_nan=0\n[dcnv4]\nsize=1\npadding=0\ngroups=2\nd_stride=2\nsoftmax=0\nbatch_normalize=1\nactivation={norm}\n[deconvolutional]\nfilters=4\nsize=1\nstride=1\nactivation=linear\n");
+        let cfg=format!("[net]\nwidth=3\nheight=2\nchannels=4\nbatch=2\ntry_fix_nan=0\n[dcnv4]\nsize=1\npadding=0\ngroups=2\nd_stride=2\nsoftmax=0\nbatch_normalize=1\nactivation={norm}\n[deform_conv]\nfilters=4\nsize=1\nbatch_normalize=1\nactivation=linear\n");
         let network=Network::from_config(ConfigFile::parse_str("mixed.cfg",&cfg).unwrap()).unwrap();
         let mut cpu=ExecutableNetwork::new(network.clone());fill(&mut cpu.params,true);
         let mut gpu=GpuExecutableNetwork::new(network,be);gpu.params=cpu.params.clone();
