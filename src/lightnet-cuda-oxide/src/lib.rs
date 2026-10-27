@@ -16,6 +16,7 @@ mod local_backend;
 mod pool_backend;
 mod graph_conv_backend;
 mod tucker_attention_backend;
+mod kimi_kda_backend;
 mod graph_conv;
 mod swin;
 mod mambavision;
@@ -6484,7 +6485,7 @@ impl F32TensorOpsBackend for OxideBackend {
         beta: &Self::Tensor, decay: &Self::Tensor, g: lightnet_cuda::kimi_kda::KdaGeometry,
         config: ElementwiseLaunchConfig,
     ) -> Result<lightnet_cuda::kimi_kda::KdaForward<Self::Tensor>, Self::Error> {
-        self.kimi_scan_native(q, k, v, beta, decay, g, config)
+        self.kimi_scan_backend_f32(q, k, v, beta, decay, g, config)
     }
 
     fn kimi_scan_backward_f32(
@@ -6492,14 +6493,14 @@ impl F32TensorOpsBackend for OxideBackend {
         forward: &lightnet_cuda::kimi_kda::KdaForward<Self::Tensor>, dy: &Self::Tensor,
         g: lightnet_cuda::kimi_kda::KdaGeometry, config: ElementwiseLaunchConfig,
     ) -> Result<lightnet_cuda::kimi_kda::KdaGrad<Self::Tensor>, Self::Error> {
-        self.kimi_scan_backward_native(q, v, beta, decay, forward, dy, g, config)
+        self.kimi_scan_backend_backward_f32(q, v, beta, decay, forward, dy, g, config)
     }
 
     fn kimi_router_gates_f32(
         &self, logits: &Self::Tensor, rows: usize, experts: usize, top_k: usize,
         temperature: f32, config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        self.kimi_router_native(logits, rows, experts, top_k, temperature, config)
+        self.kimi_router_backend_gates_f32(logits, rows, experts, top_k, temperature, config)
     }
 
     fn mambavision_depthwise_f32(
