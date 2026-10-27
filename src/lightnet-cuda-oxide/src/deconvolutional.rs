@@ -8,6 +8,65 @@ use crate::{OxideBackend, OxideError, OxideTensorF32, launch_err};
 
 impl OxideBackend {
     #[allow(clippy::too_many_arguments)]
+    pub(crate) fn deconvolutional_f32(
+        &self,
+        x: &OxideTensorF32,
+        weights: &OxideTensorF32,
+        output_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let x_f = self.f32v(x)?;
+        let weights_f = self.f32v(weights)?;
+        self.deconvolutional_forward_native(
+            &x_f,
+            &weights_f,
+            output_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride,
+            config,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn deconvolutional_backward_f32(
+        &self,
+        x: &OxideTensorF32,
+        weights: &OxideTensorF32,
+        output_grad: &OxideTensorF32,
+        input_shape: &[usize],
+        output_shape: &[usize],
+        filters: usize,
+        kernel_size: usize,
+        stride: usize,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<(OxideTensorF32, OxideTensorF32, OxideTensorF32), OxideError> {
+        let x_f = self.f32v(x)?;
+        let weights_f = self.f32v(weights)?;
+        let output_grad_f = self.f32v(output_grad)?;
+        self.deconvolutional_backward_native(
+            &x_f,
+            &weights_f,
+            &output_grad_f,
+            input_shape,
+            output_shape,
+            filters,
+            kernel_size,
+            stride,
+            config,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn deconvolutional_forward_native(
         &self,
         x: &OxideTensorF32,

@@ -8652,11 +8652,9 @@ impl F32TensorOpsBackend for OxideBackend {
         stride: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let x_f = self.f32v(x)?;
-        let weights_f = self.f32v(weights)?;
-        self.deconvolutional_forward_native(
-            &x_f,
-            &weights_f,
+        self.deconvolutional_f32(
+            x,
+            weights,
             output_shape,
             input_channels,
             input_height,
@@ -8680,13 +8678,10 @@ impl F32TensorOpsBackend for OxideBackend {
         stride: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
-        let x_f = self.f32v(x)?;
-        let weights_f = self.f32v(weights)?;
-        let output_grad_f = self.f32v(output_grad)?;
-        self.deconvolutional_backward_native(
-            &x_f,
-            &weights_f,
-            &output_grad_f,
+        self.deconvolutional_backward_f32(
+            x,
+            weights,
+            output_grad,
             input_shape,
             output_shape,
             filters,
