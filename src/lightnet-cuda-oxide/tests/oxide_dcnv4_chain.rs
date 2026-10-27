@@ -194,6 +194,42 @@ fn native_composition_matches_real_cpu_outputs_and_all_math_gradients() {
 }
 
 #[test]
+fn native_large_composition_matches_cpu_parameter_gradients() {
+    let backend = OxideBackend::new().unwrap();
+    let cfg = ElementwiseLaunchConfig::default();
+    let (cpu, desc) = build(32, 2, 1, true, false, 1);
+    let shape = cpu.network.net.input_shape();
+    let data: Vec<_> = (0..shape.batch * shape.element_count())
+        .map(|i| (i % 13) as f32 * 0.03 - 0.18).collect();
+    let input = Tensor::from_data(shape, data.clone()).unwrap();
+    let forward = cpu.forward(&input).unwrap();
+    let out = forward.final_output().unwrap();
+    let seed_data = vec![0.25; out.data.len()];
+    let seed = Tensor::from_data(out.shape, seed_data.clone()).unwrap();
+    let backward = cpu.backward(&input, &forward, &seed).unwrap();
+    let LayerParams::Dcnv4(params) = &cpu.params[0] else { unreachable!() };
+    let LayerParams::Dcnv4(want) = &backward.param_gradients[0] else { unreachable!() };
+    let upload = |v: &[f32]| backend.upload_f32(&[v.len()], v).unwrap();
+    let x = upload(&data);
+    let weights = upload(&params.offset_weights);
+    let (output, offsets) = backend.dcnv4_forward_native(
+        &x, &weights, &upload(&params.offset_biases), desc, cfg,
+    ).unwrap();
+    let got = backend.dcnv4_backward_native(&x, &weights, &offsets, &upload(&seed_data), desc, cfg).unwrap();
+    for (actual, expected, tolerance) in [
+        (backend.download_f32(&output).unwrap(), &out.data, 2e-4),
+        (backend.download_f32(&got.input).unwrap(), &backward.input_gradient.data, 5e-4),
+        (backend.download_f32(&got.offset_weights).unwrap(), &want.offset_weights, 5e-4),
+        (backend.download_f32(&got.offset_biases).unwrap(), &want.offset_biases, 5e-4),
+    ] {
+        assert_eq!(actual.len(), expected.len());
+        for (a, b) in actual.iter().zip(expected) {
+            assert!((a - b).abs() <= tolerance, "{a} vs {b}");
+        }
+    }
+}
+
+#[test]
 fn native_composition_matches_device_finite_differences() {
     let backend = OxideBackend::new().unwrap();
     let cfg = ElementwiseLaunchConfig::default();

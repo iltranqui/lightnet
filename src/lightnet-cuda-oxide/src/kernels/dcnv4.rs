@@ -6,15 +6,10 @@
 //! scatters into `d_input` and owns its row's `d_offsets` (no atomics there).
 //! Input-gradient atomic summation order is not bitwise deterministic.
 //!
-//! Kernel points are held in a fixed-size buffer, so `size * size` must not
-//! exceed [`MAX_POINTS`]; the launcher rejects larger kernels explicitly rather
-//! than silently truncating. The current bound covers kernels through 31x31.
+//! Per-thread mask and gradient scratch lives in device memory.
 
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32};
 use cuda_device::{DisjointSlice, cuda_module, device, kernel, thread};
-
-/// Largest supported kernel area (`size <= 31`).
-pub const MAX_POINTS: usize = 961;
 
 /// Relaxed device-scope `*p += v`.
 ///
@@ -49,6 +44,7 @@ pub mod kernels {
         input: &[f32],
         offsets: &[f32],
         mut out: DisjointSlice<f32>,
+        scratch: *mut f32,
         channels: usize,
         groups: usize,
         in_h: usize,
@@ -86,7 +82,8 @@ pub mod kernels {
         let row_start = (b * spatial + q) * offset_dim;
         let group_offset = g * points * 3;
         let mask_start = group_offset + 2 * points;
-        let mut masks = [0.0f32; MAX_POINTS];
+        // Each thread owns a contiguous scratch row of `points` floats.
+        let masks = unsafe { core::slice::from_raw_parts_mut(scratch.add(i * points), points) };
         let mut k = 0usize;
         while k < points {
             masks[k] = offsets[row_start + mask_start + k];
@@ -185,6 +182,7 @@ pub mod backward {
         dy: &[f32],
         d_input: *mut f32,
         d_offsets: *mut f32,
+        scratch: *mut f32,
         channels: usize,
         groups: usize,
         in_h: usize,
@@ -222,7 +220,8 @@ pub mod backward {
         let row_start = (b * spatial + q) * offset_dim;
         let group_offset = g * points * 3;
         let mask_start = group_offset + 2 * points;
-        let mut masks = [0.0f32; MAX_POINTS];
+        // Each thread owns a contiguous scratch row of `points` floats.
+        let masks = unsafe { core::slice::from_raw_parts_mut(scratch.add(i * points), points) };
         let mut k = 0usize;
         while k < points {
             masks[k] = offsets[row_start + mask_start + k];
@@ -251,7 +250,9 @@ pub mod backward {
                 k += 1;
             }
         }
-        let mut mask_gradient = [0.0f32; MAX_POINTS];
+        let mask_gradient = unsafe {
+            core::slice::from_raw_parts_mut(scratch.add((dy.len() / cpg + i) * points), points)
+        };
         let mut point = 0usize;
         let mut kw = 0usize;
         while kw < size {

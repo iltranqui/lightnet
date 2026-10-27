@@ -1318,8 +1318,8 @@ fn scale_channels_axis_layout_pins_named_source_and_channel_or_spatial_broadcast
 }
 
 #[test]
-fn dcnv4_native_gate_accepts_31x31_and_rejects_33x33() {
-    for (size, expected_host) in [(31, false), (33, true)] {
+fn dcnv4_native_gate_accepts_large_kernels() {
+    for (size, expected_host) in [(31, false), (33, false)] {
         let padding = size / 2;
         let cfg = format!(
             "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=1\n\

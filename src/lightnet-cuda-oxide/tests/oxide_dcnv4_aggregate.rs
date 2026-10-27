@@ -82,23 +82,48 @@ fn device_aggregation_matches_the_host_reference() {
 }
 
 #[test]
-fn device_aggregation_rejects_oversized_kernels_and_bad_operands() {
+fn device_aggregation_large_kernel_matches_host() {
     let backend = backend();
     let cfg = ElementwiseLaunchConfig::default();
-    let mut g = geometry(2, 1, false, false);
-    g.size = 32; // 1,024 > MAX_POINTS (961)
-    let input = vec![0.0f32; g.batch * g.channels * g.input_height * g.input_width];
-    let offsets = vec![0.0f32; g.batch * g.spatial() * g.offset_dim()];
-    let t_in = backend.upload_f32(&[input.len()], &input).unwrap();
-    let t_off = backend.upload_f32(&[offsets.len()], &offsets).unwrap();
-    assert!(
-        backend
-            .dcnv4_aggregate_native(&t_in, &t_off, g, 1.0, cfg)
-            .is_err()
-    );
+    for softmax in [false, true] {
+        for remove_center in [false, true] {
+            let mut g = geometry(2, 1, softmax, remove_center);
+            g.size = 32;
+            g.padding = 16;
+            let input: Vec<_> = (0..g.batch * g.channels * g.input_height * g.input_width)
+                .map(|i| (i % 13) as f32 * 0.1 - 0.6).collect();
+            let offsets: Vec<_> = (0..g.batch * g.spatial() * g.offset_dim())
+                .map(|i| 0.4 + (i % 7) as f32 * 0.02).collect();
+            let seed: Vec<_> = (0..g.batch * g.channels * g.spatial())
+                .map(|i| (i % 9) as f32 * 0.1 - 0.4).collect();
+            let upload = |v: &[f32]| backend.upload_f32(&[v.len()], v).unwrap();
+            let (x, off, dy) = (upload(&input), upload(&offsets), upload(&seed));
+            let out = backend.dcnv4_aggregate_native(&x, &off, g, 1.0, cfg).unwrap();
+            let (dx, doff) = backend.dcnv4_aggregate_backward_native(&x, &off, &dy, g, 1.0, cfg).unwrap();
+            let want = host::aggregate(&input, &offsets, &g, 1.0).unwrap();
+            let (want_dx, want_off) = host::aggregate_backward(&input, &offsets, &seed, &g, 1.0).unwrap();
+            for (got, expected, tolerance) in [
+                (backend.download_f32(&out).unwrap(), want, 2e-4),
+                (backend.download_f32(&dx).unwrap(), want_dx, 5e-4),
+                (backend.download_f32(&doff).unwrap(), want_off, 5e-4),
+            ] {
+                assert_eq!(got.len(), expected.len());
+                for (a, b) in got.iter().zip(expected) {
+                    assert!((a - b).abs() <= tolerance, "{a} vs {b}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn device_aggregation_rejects_bad_operands() {
+    let backend = backend();
+    let cfg = ElementwiseLaunchConfig::default();
     let g = geometry(2, 1, false, false);
-    // Short offsets: rejected by the length check.
-    let short = vec![0.0f32; offsets.len() - 1];
+    let input = vec![0.0; g.batch * g.channels * g.input_height * g.input_width];
+    let t_in = backend.upload_f32(&[input.len()], &input).unwrap();
+    let short = vec![0.0f32; g.batch * g.spatial() * g.offset_dim() - 1];
     let t_short = backend.upload_f32(&[short.len()], &short).unwrap();
     assert!(
         backend

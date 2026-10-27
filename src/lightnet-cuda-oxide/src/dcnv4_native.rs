@@ -171,12 +171,6 @@ impl OxideBackend {
     ) -> Result<(), OxideError> {
         desc.checked().map_err(|msg| shape_err(op, msg))?;
         let g = desc.geometry;
-        if g.kernel_points() > crate::kernels::dcnv4::MAX_POINTS {
-            return Err(shape_err(
-                op,
-                "too many kernel points for device mask buffer".to_owned(),
-            ));
-        }
         if input.len() != g.batch * g.channels * g.input_height * g.input_width
             || weights.len() != desc.weight_count()
         {
@@ -187,8 +181,7 @@ impl OxideBackend {
         }
         Ok(())
     }
-    /// Device DCNv4 aggregation (offsets given). Rejects kernel areas above
-    /// `kernels::dcnv4::MAX_POINTS`, which the fixed-size mask buffer cannot hold.
+    /// Device DCNv4 aggregation (offsets given).
     #[allow(clippy::too_many_arguments)]
     pub fn dcnv4_aggregate_native(
         &self,
@@ -201,12 +194,6 @@ impl OxideBackend {
         let op = "dcnv4_aggregate_native";
         geometry.checked().map_err(|msg| shape_err(op, msg))?;
         let points = geometry.kernel_points();
-        if points > crate::kernels::dcnv4::MAX_POINTS {
-            return Err(shape_err(
-                op,
-                format!("kernel area {points} exceeds the device limit"),
-            ));
-        }
         let plane = geometry.input_height * geometry.input_width;
         let spatial = geometry.spatial();
         let offset_dim = geometry.offset_dim();
@@ -219,6 +206,7 @@ impl OxideBackend {
         // Zeroed: the kernel accumulates into each owned output cell.
         let mut out = self.alloc(out_len)?;
         let threads = geometry.batch * geometry.groups * spatial;
+        let scratch = self.alloc(threads * points)?;
         // SAFETY: one thread per (batch, group, cell); each writes only its own
         // group's channels, and every tap is bounds-checked in the kernel.
         unsafe {
@@ -228,6 +216,7 @@ impl OxideBackend {
                 &input.buf,
                 &offsets.buf,
                 &mut out,
+                scratch.cu_deviceptr() as *mut f32,
                 geometry.channels,
                 geometry.groups,
                 geometry.input_height,
@@ -270,12 +259,6 @@ impl OxideBackend {
         let op = "dcnv4_aggregate_backward_native";
         geometry.checked().map_err(|msg| shape_err(op, msg))?;
         let points = geometry.kernel_points();
-        if points > crate::kernels::dcnv4::MAX_POINTS {
-            return Err(shape_err(
-                op,
-                format!("kernel area {points} exceeds the device limit"),
-            ));
-        }
         let plane = geometry.input_height * geometry.input_width;
         let spatial = geometry.spatial();
         let offset_dim = geometry.offset_dim();
@@ -288,6 +271,7 @@ impl OxideBackend {
         let d_input = self.alloc(geometry.batch * geometry.channels * plane)?;
         let d_offsets = self.alloc(geometry.batch * spatial * offset_dim)?;
         let threads = geometry.batch * geometry.groups * spatial;
+        let scratch = self.alloc(threads * points * 2)?;
         // SAFETY: one thread per (batch, group, cell); `d_offsets` slots are
         // owned by that thread, `d_input` is written only by atomic adds into a
         // zeroed buffer of the validated extent.
@@ -300,6 +284,7 @@ impl OxideBackend {
                 &output_grad.buf,
                 d_input.cu_deviceptr() as *mut f32,
                 d_offsets.cu_deviceptr() as *mut f32,
+                scratch.cu_deviceptr() as *mut f32,
                 geometry.channels,
                 geometry.groups,
                 geometry.input_height,

@@ -585,14 +585,7 @@ fn dcnv4_gpu_and_host_only_deform_choose_the_same_whole_network_path() {
 
 #[test]
 fn dcnv4_gpu_retains_host_cache_for_excluded_and_mixed_variants() {
-    let mut large = dcnv4_network("", "");
-    let LayerKind::Dcnv4(spec) = &mut large.layers[0].kind else {
-        unreachable!()
-    };
-    spec.size = 33;
-    spec.padding = 16;
     for (network_index, network) in [
-        large,
         dcnv4_network(
             "",
             "[deform_conv]\nfilters=2\ngroups=2\nsize=1\nmask=1\nbatch_normalize=1\nactivation=linear\n",
@@ -614,6 +607,11 @@ fn dcnv4_gpu_retains_host_cache_for_excluded_and_mixed_variants() {
         gpu.backward_accumulate_seeded_gpu(&forward, &seeds)
             .unwrap();
     }
+
+    let mut large = dcnv4_network("", "");
+    let LayerKind::Dcnv4(spec) = &mut large.layers[0].kind else { unreachable!() };
+    spec.size = 33;
+    assert!(!crate::layers::dcnv4::gpu::needs_host(spec));
 
     let mut revleaky = dcnv4_network("", "");
     let LayerKind::Dcnv4(spec) = &mut revleaky.layers[0].kind else {
