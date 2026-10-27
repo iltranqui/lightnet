@@ -9,6 +9,7 @@ mod deconvolutional;
 mod channel_shuffle_backend;
 mod gelu_erf_backend;
 mod softmax_backend;
+mod reorg_backend;
 mod graph_conv;
 mod swin;
 mod mambavision;
@@ -4124,7 +4125,7 @@ impl OxideBackend {
     /// Shared reorg launcher for `src_shape -> dst_shape`.  `backward` means
     /// the shapes are (layer output, layer input), i.e. the adjoint direction.
     /// The destination is the small layout exactly when `reverse == backward`.
-    fn reorg_launch(
+    pub(crate) fn reorg_launch(
         &self,
         op: &str,
         src: &OxideTensorF32,
@@ -12878,18 +12879,7 @@ impl F32TensorOpsBackend for OxideBackend {
         reverse: bool,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let x_f = self.f32v(x)?;
-        let x = &*x_f;
-        self.reorg_launch(
-            "reorg_f32",
-            x,
-            input_shape,
-            output_shape,
-            stride,
-            reverse,
-            false,
-            config,
-        )
+        self.reorg_backend_f32(x, input_shape, output_shape, stride, reverse, config)
     }
 
     fn reorg_backward_f32(
@@ -12901,17 +12891,12 @@ impl F32TensorOpsBackend for OxideBackend {
         reverse: bool,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let output_grad_f = self.f32v(output_grad)?;
-        let output_grad = &*output_grad_f;
-        // The adjoint swaps the roles: gradient flows output -> input.
-        self.reorg_launch(
-            "reorg_backward_f32",
+        self.reorg_backend_backward_f32(
             output_grad,
-            output_shape,
             input_shape,
+            output_shape,
             stride,
             reverse,
-            true,
             config,
         )
     }
