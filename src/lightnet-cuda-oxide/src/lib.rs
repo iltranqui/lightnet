@@ -24,6 +24,7 @@ mod upsample_backend;
 mod connected_backend;
 mod eml_backend;
 mod batchnorm_backend;
+mod dense_loss_backend;
 mod graph_conv;
 mod swin;
 mod mambavision;
@@ -11489,40 +11490,7 @@ impl F32TensorOpsBackend for OxideBackend {
         classes: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let x_f = self.f32v(x)?;
-        let x = &*x_f;
-        let op = "centernet_forward_f32";
-        if shape.len() != 4
-            || shape.iter().product::<usize>() != x.len()
-            || x.shape() != shape
-            || shape[0] == 0
-            || shape[1] < classes
-            || classes == 0
-            || shape[2] == 0
-            || shape[3] == 0
-        {
-            return Err(shape_err(
-                op,
-                format!("incompatible CenterNet shape/classes: {shape:?}, {classes}"),
-            ));
-        }
-        let spatial = shape[2] * shape[3];
-        let mut output = self.alloc_uninit(x.len())?;
-        // SAFETY: validated dimensions make the channel/spatial mapping valid;
-        // one thread writes one disjoint output element.
-        unsafe {
-            self.dense_loss.centernet_forward(
-                &self.stream,
-                launch::elementwise(x.len(), config),
-                &x.buf,
-                &mut output,
-                shape[1],
-                spatial,
-                classes,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok(OxideTensorF32::new(output, shape))
+        self.centernet_forward_backend_f32(x, shape, classes, config)
     }
 
     fn modern_yolo_forward_f32(
@@ -11532,40 +11500,7 @@ impl F32TensorOpsBackend for OxideBackend {
         classes: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let x_f = self.f32v(x)?;
-        let x = &*x_f;
-        let op = "modern_yolo_forward_f32";
-        if shape.len() != 4
-            || shape.iter().product::<usize>() != x.len()
-            || x.shape() != shape
-            || shape[0] == 0
-            || shape[1] <= classes
-            || classes == 0
-            || shape[2] == 0
-            || shape[3] == 0
-        {
-            return Err(shape_err(
-                op,
-                format!("incompatible modern-YOLO shape/classes: {shape:?}, {classes}"),
-            ));
-        }
-        let spatial = shape[2] * shape[3];
-        let mut output = self.alloc_uninit(x.len())?;
-        // SAFETY: validated dimensions make the channel/spatial mapping valid;
-        // one thread writes one disjoint output element.
-        unsafe {
-            self.dense_loss.modern_yolo_forward(
-                &self.stream,
-                launch::elementwise(x.len(), config),
-                &x.buf,
-                &mut output,
-                shape[1],
-                spatial,
-                classes,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok(OxideTensorF32::new(output, shape))
+        self.modern_yolo_forward_backend_f32(x, shape, classes, config)
     }
 
     fn segmentation_forward_f32(
