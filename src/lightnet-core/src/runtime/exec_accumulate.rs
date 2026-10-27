@@ -642,6 +642,11 @@ impl ExecutableNetwork {
                         .zip(crate::layers::gru::cpu::projections(gradient)) {
                         accumulate_negative_vec(&mut t.weight_updates,&p.weights)?;
                         accumulate_negative_vec(&mut t.bias_updates,&p.biases)?;
+                        match (&mut t.batch_norm, &p.batch_norm) {
+                            (Some(t), Some(p)) => accumulate_negative_vec(&mut t.scale_updates, &p.scales)?,
+                            (None, None) => {},
+                            _ => return Err(Error::InvalidConfig("GRU batch norm gradient mismatch".into())),
+                        }
                     }
                 }
                 (LayerKind::Rnn(_), LayerParams::Rnn(gradient)) => {

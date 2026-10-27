@@ -906,6 +906,20 @@ pub(super) fn update_recurrent_batch_norm_running_stats(
             })?
         };
         match (&layer.kind, params.get_mut(layer.index)) {
+            (LayerKind::Gru(spec), Some(LayerParams::Gru(recurrent))) if spec.batch_normalize => {
+                let tape = crate::layers::gru::cpu::tape(spec, recurrent, current_input, layer.output_shape)?;
+                let batch = current_input.shape.batch / spec.steps;
+                let input_shape = TensorShape::new(current_input.shape.width, current_input.shape.height, current_input.shape.channels, batch);
+                let state_shape = TensorShape::new(1, 1, spec.output, batch);
+                for step in tape {
+                    let x = Tensor::from_data(input_shape, step.x)?;
+                    let previous = Tensor::from_data(state_shape, step.previous)?;
+                    let reset = Tensor::from_data(state_shape, step.reset)?;
+                    for (p, source) in crate::layers::gru::cpu::projections_mut(recurrent).into_iter().zip([&x, &previous, &x, &previous, &x, &reset]) {
+                        update_connected_batch_norm_from_input(p, source, state_shape)?;
+                    }
+                }
+            }
             (LayerKind::Rnn(spec), Some(LayerParams::Rnn(recurrent))) if spec.batch_normalize => {
                 let sequence_batch =
                     recurrent_sequence_batch(current_input.shape.batch, spec.steps)?;
