@@ -5,6 +5,9 @@
 pub mod conv;
 mod conv2d_backend;
 mod recurrent_backend;
+mod dropout_backend;
+mod scale_channels_backend;
+mod marker_gather_backend;
 mod clifford;
 mod dcnv4_native;
 mod deconvolutional;
@@ -3422,7 +3425,7 @@ impl OxideBackend {
         Ok(out)
     }
 
-    fn scale_channels_layout(
+    pub(crate) fn scale_channels_layout(
         &self,
         op: &str,
         scale: &OxideTensorF32,
@@ -6768,39 +6771,7 @@ fn clifford_fourier_backward_f32(&self, input: &Self::Tensor, grad: &Self::Tenso
         options: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let op = "marker_gather_f32";
-        let d = lightnet_cuda::host_ops::marker_gather::Layout::new(
-            feature_shape,
-            marker_shape,
-            options,
-        )
-        .map_err(|err| shape_err(op, err))?;
-        if features.len() != d.input_len || markers.len() != d.markers_len {
-            return Err(shape_err(
-                op,
-                "tensor storage does not match layout".to_owned(),
-            ));
-        }
-        let features_f = self.f32v(features)?;
-        let markers_f = self.f32v(markers)?;
-        let mut output = self.alloc_uninit(d.output_len)?;
-        // SAFETY: checked dimensions/storage bound every feature and marker index;
-        // one thread owns each output element.
-        unsafe {
-            self.laya.marker_gather(
-                &self.stream,
-                launch::elementwise(d.output_len, config),
-                &features_f.buf,
-                &markers_f.buf,
-                &mut output,
-                d.hidden,
-                d.sequence,
-                d.marker_channels,
-                d.options,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok(OxideTensorF32::new(output, &d.output_shape()))
+        self.marker_gather_f32_backend(features, markers, feature_shape, marker_shape, options, config)
     }
 
     fn marker_gather_backward_f32(
@@ -6812,38 +6783,7 @@ fn clifford_fourier_backward_f32(&self, input: &Self::Tensor, grad: &Self::Tenso
         options: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let op = "marker_gather_backward_f32";
-        let d = lightnet_cuda::host_ops::marker_gather::Layout::new(
-            feature_shape,
-            marker_shape,
-            options,
-        )
-        .map_err(|err| shape_err(op, err))?;
-        if markers.len() != d.markers_len || output_grad.len() != d.output_len {
-            return Err(shape_err(
-                op,
-                "tensor storage does not match layout".to_owned(),
-            ));
-        }
-        let markers_f = self.f32v(markers)?;
-        let grad_f = self.f32v(output_grad)?;
-        let mut dx = self.alloc_uninit(d.input_len)?;
-        // SAFETY: validated layout bounds reads and one thread owns each dx.
-        unsafe {
-            self.laya.marker_gather_backward(
-                &self.stream,
-                launch::elementwise(d.input_len, config),
-                &markers_f.buf,
-                &grad_f.buf,
-                &mut dx,
-                d.hidden,
-                d.sequence,
-                d.marker_channels,
-                d.options,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok(OxideTensorF32::new(dx, feature_shape))
+        self.marker_gather_backward_f32_backend(markers, output_grad, feature_shape, marker_shape, options, config)
     }
 
     fn dropout_f32(
@@ -6854,41 +6794,7 @@ fn clifford_fourier_backward_f32(&self, input: &Self::Tensor, grad: &Self::Tenso
         seed: u64,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
-        let x_f = self.f32v(x)?;
-        let x = &*x_f;
-        let op = "dropout_f32";
-        if !(0.0..1.0).contains(&probability) || x.is_empty() {
-            return Err(shape_err(
-                op,
-                format!("probability {probability} not in [0, 1) or empty input"),
-            ));
-        }
-        if shape.iter().product::<usize>() != x.len() {
-            return Err(shape_err(
-                op,
-                format!("shape {shape:?} does not match {} elements", x.len()),
-            ));
-        }
-        let mut out = self.alloc_uninit(x.len())?;
-        let mut mask = self.alloc_uninit(x.len())?;
-        // SAFETY: one thread per element writes its own `out` and `mask` slot.
-        unsafe {
-            self.dropout.dropout_forward(
-                &self.stream,
-                launch::elementwise(x.len(), config),
-                &x.buf,
-                &mut out,
-                &mut mask,
-                probability,
-                1.0 / (1.0 - probability),
-                seed,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok((
-            OxideTensorF32::new(out, shape),
-            OxideTensorF32::new(mask, shape),
-        ))
+        self.dropout_f32_backend(x, shape, probability, seed, config)
     }
 
     fn dropout_backward_f32(
@@ -6898,30 +6804,7 @@ fn clifford_fourier_backward_f32(&self, input: &Self::Tensor, grad: &Self::Tenso
         shape: &[usize],
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let output_grad_f = self.f32v(output_grad)?;
-        let output_grad = &*output_grad_f;
-        let mask_f = self.f32v(mask)?;
-        let mask = &*mask_f;
-        same_len("dropout_backward_f32", output_grad, mask)?;
-        if shape.iter().product::<usize>() != mask.len() {
-            return Err(shape_err(
-                "dropout_backward_f32",
-                format!("shape {shape:?} does not match {} elements", mask.len()),
-            ));
-        }
-        let mut dx = self.alloc_uninit(output_grad.len())?;
-        // SAFETY: one thread per element.
-        unsafe {
-            self.dropout.dropout_backward(
-                &self.stream,
-                launch::elementwise(dx.len(), config),
-                &output_grad.buf,
-                &mask.buf,
-                &mut dx,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok(OxideTensorF32::new(dx, shape))
+        self.dropout_backward_f32_backend(output_grad, mask, shape, config)
     }
 
     fn dropblock_f32(
@@ -6933,77 +6816,7 @@ fn clifford_fourier_backward_f32(&self, input: &Self::Tensor, grad: &Self::Tenso
         seed: u64,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
-        let x_f = self.f32v(x)?;
-        let x = &*x_f;
-        let op = "dropblock_f32";
-        if shape.len() != 4 || shape.iter().product::<usize>() != x.len() || x.is_empty() {
-            return Err(shape_err(
-                op,
-                format!("shape {shape:?} is not NCHW of {} elements", x.len()),
-            ));
-        }
-        let (n, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
-        if block_size == 0 || block_size > w.min(h) || !(0.0..=1.0).contains(&block_prob) {
-            return Err(shape_err(
-                op,
-                format!(
-                    "block_size {block_size} must be in 1..={} and prob {block_prob} in [0, 1]",
-                    w.min(h)
-                ),
-            ));
-        }
-        let planes = n * c;
-        let mut keep = self.alloc_uninit(x.len())?;
-        let mut dropped = self.alloc_uninit(planes)?;
-        let mut scales = self.alloc_uninit(n)?;
-        let mut out = self.alloc_uninit(x.len())?;
-        let mut mask = self.alloc_uninit(x.len())?;
-        // SAFETY: stage 1 writes only its own plane of `keep` and slot of
-        // `dropped`; stage 2 one `scales` slot per sample; stage 3 one element.
-        unsafe {
-            self.dropout.dropblock_plane(
-                &self.stream,
-                launch::elementwise(planes, config),
-                &mut keep,
-                &mut dropped,
-                seed,
-                w,
-                h,
-                block_prob,
-                block_size,
-            )
-        }
-        .map_err(launch_err)?;
-        // SAFETY: see above.
-        unsafe {
-            self.dropout.dropblock_scales(
-                &self.stream,
-                launch::elementwise(n, config),
-                &dropped,
-                &mut scales,
-                c,
-                c * h * w,
-            )
-        }
-        .map_err(launch_err)?;
-        // SAFETY: see above.
-        unsafe {
-            self.dropout.dropblock_apply(
-                &self.stream,
-                launch::elementwise(x.len(), config),
-                &x.buf,
-                &keep,
-                &scales,
-                &mut out,
-                &mut mask,
-                c * h * w,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok((
-            OxideTensorF32::new(out, shape),
-            OxideTensorF32::new(mask, shape),
-        ))
+        self.dropblock_f32_backend(x, shape, block_prob, block_size, seed, config)
     }
 
     fn constrain_f32(
@@ -7145,29 +6958,7 @@ fn clifford_fourier_backward_f32(&self, input: &Self::Tensor, grad: &Self::Tenso
         scale_wh: bool,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let scale_f = self.f32v(scale)?;
-        let scale = &*scale_f;
-        let source_f = self.f32v(source)?;
-        let source = &*source_f;
-        let (channels, hw) =
-            self.scale_channels_layout("scale_channels_f32", scale, source, shape, scale_wh)?;
-        let mut out = self.alloc_uninit(source.len())?;
-        // SAFETY: one thread per output element; scale index is in range by
-        // the layout check.
-        unsafe {
-            self.scale_channels.scale_channels_forward(
-                &self.stream,
-                launch::elementwise(out.len(), config),
-                &scale.buf,
-                &source.buf,
-                &mut out,
-                channels,
-                hw,
-                scale_wh as u32,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok(OxideTensorF32::new(out, shape))
+        self.scale_channels_f32_backend(scale, source, shape, scale_wh, config)
     }
 
     fn scale_channels_backward_f32(
@@ -7179,49 +6970,7 @@ fn clifford_fourier_backward_f32(&self, input: &Self::Tensor, grad: &Self::Tenso
         scale_wh: bool,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
-        let delta_f = self.f32v(delta)?;
-        let delta = &*delta_f;
-        let scale_f = self.f32v(scale)?;
-        let scale = &*scale_f;
-        let source_f = self.f32v(source)?;
-        let source = &*source_f;
-        let op = "scale_channels_backward_f32";
-        let (channels, hw) = self.scale_channels_layout(op, scale, source, shape, scale_wh)?;
-        same_len(op, delta, source)?;
-        let mut d_src = self.alloc_uninit(source.len())?;
-        let mut d_scale = self.alloc_uninit(scale.len())?;
-        // SAFETY: one thread per `d_src` element / per scale element.
-        unsafe {
-            self.scale_channels.scale_channels_dsource(
-                &self.stream,
-                launch::elementwise(d_src.len(), config),
-                &delta.buf,
-                &scale.buf,
-                &mut d_src,
-                channels,
-                hw,
-                scale_wh as u32,
-            )
-        }
-        .map_err(launch_err)?;
-        // SAFETY: as above; each scale element is owned by one thread.
-        unsafe {
-            self.scale_channels.scale_channels_dscale(
-                &self.stream,
-                launch::elementwise(d_scale.len(), config),
-                &delta.buf,
-                &source.buf,
-                &mut d_scale,
-                channels,
-                hw,
-                scale_wh as u32,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok((
-            OxideTensorF32::new(d_scale, scale.shape()),
-            OxideTensorF32::new(d_src, shape),
-        ))
+        self.scale_channels_backward_f32_backend(delta, scale, source, shape, scale_wh, config)
     }
 
     fn connected_f32(
