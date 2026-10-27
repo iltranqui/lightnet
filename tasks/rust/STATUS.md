@@ -87,6 +87,7 @@ with actual-device CPU parity; head loss/backward remains host-owned. See
 uncommitted, with no `version-map.tsv` row.
 
 Latest increments:
+- v0.2.202 (`eeb6db6d00ec9d189331060755c87b62fb40d6f0`): native DCNv4 kernels above 961 points use per-thread device scratch for masks and mask gradients, preserving reduction order; `needs_host` no longer rejects by point count. Scratch memory grows with point count. `device_aggregation_large_kernel_matches_host` and `native_large_composition_matches_cpu_parameter_gradients` compare with the Rust CPU reference. `cargo xtask check` and `gpu-check` passed; `cargo xtask test dcnv4` passed 31; Oxide `oxide_dcnv4_aggregate` passed 7, `oxide_dcnv4_chain` 4, `oxide_dcnv4_bn` 2, and `oxide_runtime_chain` filtered by `dcnv4` 4. Hand-derived from source, no compiled-C++ golden. Evidence: `implemented.md` §266.
 - v0.2.201 (`74db0cb95b131a47bf558dc0eee8232d8f1245d3`): native RecursiveBlock forward/backward for static bodies containing `channel_shuffle` uses the existing shuffle kernel and its inverse in `recursive_block/gpu.rs`; other variants remain host. `recursive_channel_shuffle_native_forward_and_gradients_match_cpu` checks CPU parity at 2e-4 forward and 5e-4 gradients. `cargo xtask check`, `cargo xtask gpu-check`, `cargo xtask test recursive_block` (11 passed), and `cargo xtask oxide --test oxide_recursive_block` (2 passed). Hand-derived from source; no compiled-C++ golden. Evidence: `implemented.md` §265.
 - v0.2.200 (`44aebc0`): native Clifford Fourier forward/backward uses a direct truncated transform and Oxide coefficient, synthesis and parameter-gradient kernels; `clifford/gpu.rs` selects the native path. `clifford_fourier_native_forward_and_gradients_match_cpu` checks CPU parity at 2e-4 forward and 5e-4 gradients. `cargo xtask check`, `cargo xtask gpu-check`, `cargo xtask test clifford` (14 passed), and `cargo xtask oxide --test oxide_clifford` (5 passed). Hand-derived from source; no compiled-C++ golden. Network-wide CPU backward fallback unchanged. Evidence: `implemented.md` §264.
 - v0.2.199 (`204424c`): native Swin Revleaky training forward/backward maps Revleaky to device Leaky; `swin_revleaky_native_training_backward_and_update_match_cpu` checks forward, gradients and updated parameters against CPU (tolerances 2e-4 forward, 5e-4 gradients/parameters). `cargo xtask check`, `cargo xtask gpu-check`, `cargo xtask test swin` (28 passed), and `cargo xtask oxide --test oxide_swin` (5 passed). Hand-derived from source; no compiled-C++ golden. Evidence: `implemented.md` §263.
@@ -1014,6 +1015,7 @@ believing a `cfg_corpus` failure.
 
 ## Known evidence gaps (not user questions)
 
+- `oxide_dcnv4_normalization` test `normalized_dcnv4_mixed_network_keeps_cpu_cache` fails with `InvalidConfig` reporting missing `[dcnv4]` forward cache for layer #0. The same failure occurred at commit `da19de2` before v0.2.202; it remains open to fix.
 - `[dcnv3]`: forward/backward/update are stubs in **all five** branches that
   carry it (`deform`, `Jev_laya`, `fog`, `jepa`, `depth_3d`), and
   `docs/dcnv3_layer.md` says so. Only its `.weights` order can be ported

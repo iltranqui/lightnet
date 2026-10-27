@@ -283,6 +283,7 @@ file is named inline.
 - [263. Native Swin Revleaky training forward and backward](#263-native-swin-revleaky-training-forward-and-backward)
 - [264. Native Clifford Fourier forward and backward](#264-native-clifford-fourier-forward-and-backward)
 - [265. Native RecursiveBlock channel shuffle forward and backward](#265-native-recursiveblock-channel-shuffle-forward-and-backward)
+- [266. Native DCNv4 for kernels above 961 points](#266-native-dcnv4-for-kernels-above-961-points)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -2793,3 +2794,19 @@ compares CPU forward and gradients at tolerances 2e-4 and 5e-4 respectively.
 recursive_block` passed 11 tests and `cargo xtask oxide --test
 oxide_recursive_block` passed 2. Hand-derived from source; no compiled-C++
 golden. Tag `v0.2.201`.
+
+## 266. Native DCNv4 for kernels above 961 points
+
+v0.2.202 (`eeb6db6d00ec9d189331060755c87b62fb40d6f0`) replaces the
+fixed 961-entry mask and mask-gradient arrays with per-thread device scratch,
+preserving reduction order. `needs_host` no longer rejects by point count;
+scratch memory grows with the number of points.
+
+Evidence: `device_aggregation_large_kernel_matches_host` and
+`native_large_composition_matches_cpu_parameter_gradients` compare large-kernel
+aggregation and composition with the Rust CPU reference. `cargo xtask check`
+and `cargo xtask gpu-check` passed; `cargo xtask test dcnv4` passed 31;
+Oxide suites `oxide_dcnv4_aggregate`, `oxide_dcnv4_chain`, and
+`oxide_dcnv4_bn` passed 7, 4, and 2 tests respectively; the `dcnv4` filter
+of `oxide_runtime_chain` passed 4. Hand-derived from source, no compiled-C++
+golden. Tag `v0.2.202`.

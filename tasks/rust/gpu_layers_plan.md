@@ -28,9 +28,13 @@ deliverable. Sparse MoE remains unstarted.
 
 ## Resume point
 
+v0.2.202 adds native DCNv4 for kernels above 961 points using per-thread
+device scratch (§266); scratch memory grows with point count. The next free
+version is v0.2.203. The mixed-network normalization cache test remains an
+open pre-existing failure; see `STATUS.md`.
 v0.2.201 adds native RecursiveBlock forward/backward for static bodies containing
 `channel_shuffle`, using the existing shuffle kernel and its inverse (§265);
-other variants remain host. The next free version is v0.2.202.
+other variants remain host.
 v0.2.200 adds native Clifford Fourier forward/backward using a direct truncated
 transform and Oxide coefficient, synthesis and parameter-gradient kernels;
 CPU-reference forward and gradient parity passed (§264). The network-wide CPU
@@ -86,8 +90,7 @@ Details/source boundaries: `implemented.md` §51; previous runtime/layout audits
 in §§49–50. Parameter gradients accumulate on-device; v0.2.024/025 apply eligible SGD/Adam updates through device operations. Since v0.2.028, Adam moments remain device-resident between steps and materialize through the host-sidecar representation only on save/load. v0.2.030 caches learned parameters across forwards and optimizer updates, refreshing host-canonical mirrors after the update; rolling statistics remain separately host-managed. v0.2.029 first retained the offset-projection weights in the per-forward cache for backward. The per-forward raw/offset cache avoids repeated projection/aggregation. No end-to-end device-only residency or speedup claim. Previous
 full runtime-chain timed out at 600 s in ViT; **not a full-suite pass**.
 The NormalizeChannels* activation/adjoint slice is done (v0.2.015). Successive
-bounded increments extended native DCNv4 through 31x31/961 points; >961,
-unsupported variants and mixed networks remain host-cached. Adam runtime parity above 23x23 without BN / 19x19 with BN is not claimed; SGD is covered through 31x31. Experimental Adam extensions failed reproducibly at non-BN 25x25 (update deltas -9.674579e-6 vs -9.121373e-6 at offset-weight element 4,032,808) and BN 21x21 (-1.6704202e-5 vs -1.3538636e-5 at element 4,501,490), each with two identical failures. BN21 gradient diagnostics showed 1.594983e-4 vs 1.596287e-4 at the failing element, near a coupled-decay cancellation. The same targeted BN21 case passes with `decoupled_decay=1`, confirming that coupled decay amplifies the small gradient difference; this does not resolve parity for the default coupled-decay semantics. Do not raise the Adam bounds or relax tolerances until that discrepancy is resolved. Compact/f16 and GPU Muon remain open; DCNv4 learned tensors now persist on-device across forwards/updates, but host mirrors still download each optimizer step and rolling stats remain host-managed. Adam moments cross the host boundary only for sidecar save/load. Native deform_conv was already wired in v0.2.007; do not repeat these ports.
+bounded increments extended native DCNv4 through 31x31/961 points; v0.2.202 removes the point-count gate and uses growing per-thread scratch. Unsupported variants and mixed networks can remain host-cached. Adam runtime parity above 23x23 without BN / 19x19 with BN is not claimed; SGD is covered through 31x31. Experimental Adam extensions failed reproducibly at non-BN 25x25 (update deltas -9.674579e-6 vs -9.121373e-6 at offset-weight element 4,032,808) and BN 21x21 (-1.6704202e-5 vs -1.3538636e-5 at element 4,501,490), each with two identical failures. BN21 gradient diagnostics showed 1.594983e-4 vs 1.596287e-4 at the failing element, near a coupled-decay cancellation. The same targeted BN21 case passes with `decoupled_decay=1`, confirming that coupled decay amplifies the small gradient difference; this does not resolve parity for the default coupled-decay semantics. Do not raise the Adam bounds or relax tolerances until that discrepancy is resolved. Compact/f16 and GPU Muon remain open; DCNv4 learned tensors now persist on-device across forwards/updates, but host mirrors still download each optimizer step and rolling stats remain host-managed. Adam moments cross the host boundary only for sidecar save/load. Native deform_conv was already wired in v0.2.007; do not repeat these ports.
 Recheck `version-map.tsv` before allocating another version. Earlier wave
 sections below retain historical findings; this resume point takes precedence.
 
