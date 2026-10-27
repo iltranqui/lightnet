@@ -18,6 +18,7 @@ mod graph_conv_backend;
 mod tucker_attention_backend;
 mod kimi_kda_backend;
 mod mambavision_backend;
+mod swin_backend;
 mod graph_conv;
 mod swin;
 mod mambavision;
@@ -10708,17 +10709,8 @@ impl F32TensorOpsBackend for OxideBackend {
         shift: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        self.swin_window_partition_native(
-            input,
-            batch,
-            channels,
-            height,
-            width,
-            padded_height,
-            padded_width,
-            window,
-            shift,
-            config,
+        self.swin_backend_window_partition_f32(
+            input, batch, channels, height, width, padded_height, padded_width, window, shift, config,
         )
     }
 
@@ -10736,18 +10728,8 @@ impl F32TensorOpsBackend for OxideBackend {
         clip: f32,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        self.swin_window_unpartition_native(
-            windows,
-            batch,
-            channels,
-            height,
-            width,
-            padded_height,
-            padded_width,
-            window,
-            shift,
-            clip,
-            config,
+        self.swin_backend_window_unpartition_f32(
+            windows, batch, channels, height, width, padded_height, padded_width, window, shift, clip, config,
         )
     }
 
@@ -10759,7 +10741,7 @@ impl F32TensorOpsBackend for OxideBackend {
         branch_scale: f32,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        self.swin_mhc_residual_native(skip, branch, skip_scale, branch_scale, config)
+        self.swin_backend_mhc_residual_f32(skip, branch, skip_scale, branch_scale, config)
     }
 
     fn swin_mhc_residual_backward_f32(
@@ -10774,16 +10756,8 @@ impl F32TensorOpsBackend for OxideBackend {
         post_branch: f32,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
-        self.swin_mhc_residual_backward_native(
-            skip,
-            branch,
-            grad,
-            skip_scale,
-            branch_scale,
-            mix,
-            post_skip,
-            post_branch,
-            config,
+        self.swin_backend_mhc_residual_backward_f32(
+            skip, branch, grad, skip_scale, branch_scale, mix, post_skip, post_branch, config,
         )
     }
 
@@ -10799,16 +10773,8 @@ impl F32TensorOpsBackend for OxideBackend {
         heads: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
-        self.swin_window_attention_native(
-            qkv,
-            relative_position_bias,
-            mask,
-            total_windows,
-            spatial_windows,
-            window,
-            channels,
-            heads,
-            config,
+        self.swin_backend_window_attention_f32(
+            qkv, relative_position_bias, mask, total_windows, spatial_windows, window, channels, heads, config,
         )
     }
 
@@ -10824,16 +10790,8 @@ impl F32TensorOpsBackend for OxideBackend {
         heads: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
-        self.swin_window_attention_backward_native(
-            qkv,
-            probabilities,
-            active,
-            context_grad,
-            total_windows,
-            window,
-            channels,
-            heads,
-            config,
+        self.swin_backend_window_attention_backward_f32(
+            qkv, probabilities, active, context_grad, total_windows, window, channels, heads, config,
         )
     }
 
