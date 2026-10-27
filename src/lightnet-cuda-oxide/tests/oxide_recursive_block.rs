@@ -28,6 +28,7 @@ fn params(p:&LayerParams)->Vec<f32>{
         }
         LayerParams::Convolutional(p)=>[p.weights.as_slice(),p.biases.as_slice()].concat(),
         LayerParams::Connected(p)=>[p.weights.as_slice(),p.biases.as_slice()].concat(),
+        LayerParams::None=>Vec::new(),
         _=>panic!("body params"),
     }
 }
@@ -39,8 +40,41 @@ fn updates(t:&LayerTrainBuffers)->Vec<f32>{
         }
         LayerTrainBuffers::Convolutional(t)=>[t.weight_updates.as_slice(),t.bias_updates.as_slice()].concat(),
         LayerTrainBuffers::Connected(t)=>[t.weight_updates.as_slice(),t.bias_updates.as_slice()].concat(),
+        LayerTrainBuffers::None=>Vec::new(),
         _=>panic!("body buffers"),
     }
+}
+
+#[test]
+fn recursive_channel_shuffle_native_forward_and_gradients_match_cpu() {
+    let text="[net]\nbatch=2\nwidth=2\nheight=2\nchannels=4\n[recursive_block]\nbody=2\nloops=3\ninjection=1\nbody_scale=0.4\nresidual_scale=0.3\ninjection_scale=0.2\n[channel_shuffle]\ngroups=2\n[convolutional]\nfilters=4\nsize=1\nactivation=tanh\n";
+    let network=Network::from_config(ConfigFile::parse_str("recursive-shuffle.cfg",text).unwrap()).unwrap();
+    let mut cpu=ExecutableNetwork::new(network.clone());
+    let LayerParams::RecursiveBlock(p)=&mut cpu.params[0] else {panic!("recursive params")};
+    initialize(&mut p.body[1]);
+    let mut gpu=GpuExecutableNetwork::new(network,OxideBackend::new().unwrap());
+    gpu.params=cpu.params.clone();
+    gpu.init_train_buffers_gpu().unwrap();
+    let shape=cpu.network.net.input_shape();
+    let input=Tensor::from_data(shape,(0..shape.batch*shape.element_count()).map(|i|(i as f32*0.17).cos()*0.3).collect()).unwrap();
+    let host=cpu.forward_training(&input).unwrap();
+    let state=gpu.forward_training_device(&input).unwrap();
+    assert!(state.cpu_forward.layer_outputs[0].data.is_empty(),"recursive block must select native execution");
+    let expected=host.final_output().unwrap();
+    let output=gpu.backend.download_f32(&state.gpu_layer_outputs[0]).unwrap();
+    let assert_close=|name:&str,got:&[f32],want:&[f32],tol:f32| {
+        assert_eq!(got.len(),want.len(),"{name}");
+        for (i,(&a,&b)) in got.iter().zip(want).enumerate() {
+            assert!(a.is_finite() && b.is_finite() && (a-b).abs()<=tol,"{name}[{i}]: {a} vs {b}");
+        }
+    };
+    assert_close("forward",&output,&expected.data,2e-4);
+    let seed=Tensor::from_data(expected.shape,(0..expected.len()).map(|i|(i as f32*0.11).sin()*0.2).collect()).unwrap();
+    let seeds=[Some(seed)];
+    let expected=cpu.backward_accumulate_seeded(&input,&host,&seeds).unwrap();
+    let got=gpu.backward_accumulate_seeded_gpu_with_input_gradient(&state,&seeds).unwrap().unwrap();
+    assert_close("input gradient",&got.data,&expected.input_gradient.data,5e-4);
+    assert_close("parameter gradients",&updates(&gpu.host_fallback_train_buffers()[0]),&updates(&cpu.train_buffers[0]),5e-4);
 }
 
 #[test]

@@ -1,4 +1,4 @@
-//! Native static shared-weight recurrence with convolution/connected bodies.
+//! Native static shared-weight recurrence with convolution/connected and shuffle bodies.
 //! Controller, lattice, BN and other body variants keep the explicit host
 //! reference. Backward sums shared parameter adjoints over every recurrence.
 use crate::error::{Error, Result};
@@ -13,6 +13,7 @@ pub(crate) fn supported(spec: &RecursiveBlockSpec) -> bool {
             LayerKind::Convolutional(s) => !s.batch_normalize && s.share_index.is_none()
                 && s.activation.to_cuda_f32_kind().is_some(),
             LayerKind::Connected(s) => !s.batch_normalize && s.activation.to_cuda_f32_kind().is_some(),
+            LayerKind::ChannelShuffle(_) => true,
             _ => false,
         })
 }
@@ -21,7 +22,7 @@ pub(crate) fn supported(spec: &RecursiveBlockSpec) -> bool {
 struct BodyCache<T> { input: T, pre: T, weights: T }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DeviceCache<T> { spec: RecursiveBlockSpec, passes: Vec<Vec<BodyCache<T>>> }
+pub(crate) struct DeviceCache<T> { spec: RecursiveBlockSpec, passes: Vec<Vec<Option<BodyCache<T>>>> }
 
 impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::Display {
     pub(crate) fn forward_recursive_block_gpu(&self, layer: &Layer, spec: &RecursiveBlockSpec,
@@ -46,6 +47,12 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
             let mut body=hidden.clone();
             let mut pass=Vec::with_capacity(if training {spec.body.len()}else{0});
             for (body_layer,parameters) in spec.body.iter().zip(&params.body) {
+                if let (LayerKind::ChannelShuffle(s), LayerParams::None) = (&body_layer.kind, parameters) {
+                    body=be.channel_shuffle_f32(&body,&tensor_backend_shape(body_layer.input_shape),
+                        s.groups,false,config).map_err(err)?;
+                    if training {pass.push(None);}
+                    continue;
+                }
                 let (raw,weights,bias,activation)=match (&body_layer.kind,parameters) {
                     (LayerKind::Convolutional(s),LayerParams::Convolutional(p)) if p.batch_norm.is_none()=>{
                         let c=body_layer.input_shape.channels;
@@ -77,7 +84,7 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
                     body_layer.output_shape.width*body_layer.output_shape.height,config).map_err(err)?}else{raw};
                 let activation=activation.ok_or_else(||Error::InvalidConfig("recursive native activation missing".into()))?;
                 let output=be.activation_f32(&pre,activation,config).map_err(err)?;
-                if training {pass.push(BodyCache{input:body,pre,weights});}
+                if training {pass.push(Some(BodyCache{input:body,pre,weights}));}
                 body=output;
             }
             hidden=add(&scale(&body,spec.body_scale)?,&scale(&hidden,spec.residual_scale)?)?;
@@ -114,6 +121,13 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
             let direct=scale(&hidden_grad,spec.residual_scale)?;
             let mut dy=scale(&hidden_grad,spec.body_scale)?;
             for (i,(body_layer,body_cache)) in spec.body.iter().zip(pass).enumerate().rev() {
+                if let LayerKind::ChannelShuffle(s)=&body_layer.kind {
+                    if body_cache.is_some(){return Err(Error::InvalidConfig("recursive shuffle cache mismatch".into()));}
+                    dy=be.channel_shuffle_f32(&dy,&tensor_backend_shape(body_layer.output_shape),
+                        s.groups,true,config).map_err(err)?;
+                    continue;
+                }
+                let body_cache=body_cache.as_ref().ok_or_else(||Error::InvalidConfig("missing recursive body cache".into()))?;
                 let activation=match &body_layer.kind {
                     LayerKind::Convolutional(s)=>s.activation.to_cuda_f32_kind(),
                     LayerKind::Connected(s)=>s.activation.to_cuda_f32_kind(),
@@ -151,7 +165,8 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
         };
         if train.body.len()!=updates.len(){return Err(Error::InvalidConfig("recursive body buffer count mismatch".into()));}
         // Validate every destination before updating any shared accumulator.
-        for (buffer,update) in train.body.iter().zip(&updates) {
+        for ((body_layer,buffer),update) in spec.body.iter().zip(&train.body).zip(&updates) {
+            if matches!((&body_layer.kind,buffer,update),(LayerKind::ChannelShuffle(_),LayerTrainBuffers::None,None)){continue;}
             let Some((dw,db))=update else{return Err(Error::InvalidConfig("missing recursive body gradient".into()));};
             let (w,b)=match buffer {
                 LayerTrainBuffers::Convolutional(t)=>(t.weight_updates.len(),t.bias_updates.len()),
@@ -161,6 +176,7 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
             if w!=dw.len() || b!=db.len(){return Err(Error::InvalidConfig("recursive train gradient length mismatch".into()));}
         }
         for (buffer,update) in train.body.iter_mut().zip(updates) {
+            if matches!((&*buffer,&update),(LayerTrainBuffers::None,None)){continue;}
             let (dw,db)=update.ok_or_else(||Error::InvalidConfig("missing recursive gradient".into()))?;
             let (w,b)=match buffer {
                 LayerTrainBuffers::Convolutional(t)=>(&mut t.weight_updates,&mut t.bias_updates),
