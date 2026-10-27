@@ -17,6 +17,7 @@ mod pool_backend;
 mod graph_conv_backend;
 mod tucker_attention_backend;
 mod kimi_kda_backend;
+mod mambavision_backend;
 mod graph_conv;
 mod swin;
 mod mambavision;
@@ -6508,7 +6509,7 @@ impl F32TensorOpsBackend for OxideBackend {
         batch: usize, tokens: usize, channels: usize, branch: usize, kernel: usize,
         causal: bool, config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
-        self.mambavision_depthwise_native(input, weights, bias, batch, tokens,
+        self.mambavision_backend_depthwise_f32(input, weights, bias, batch, tokens,
             channels, branch, kernel, causal, config)
     }
 
@@ -6517,7 +6518,7 @@ impl F32TensorOpsBackend for OxideBackend {
         grad: &Self::Tensor, batch: usize, tokens: usize, channels: usize,
         branch: usize, kernel: usize, causal: bool, config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
-        self.mambavision_depthwise_backward_native(input, weights, pre, grad,
+        self.mambavision_backend_depthwise_backward_f32(input, weights, pre, grad,
             batch, tokens, channels, branch, kernel, causal, config)
     }
 
@@ -6527,7 +6528,7 @@ impl F32TensorOpsBackend for OxideBackend {
         state_in: &Self::Tensor, g: lightnet_cuda::mambavision::MambaScanGeometry,
         config: ElementwiseLaunchConfig,
     ) -> Result<lightnet_cuda::mambavision::MambaScanForward<Self::Tensor>, Self::Error> {
-        self.mambavision_scan_native(x, projection, dt_weights, dt_bias, a_log,
+        self.mambavision_backend_scan_f32(x, projection, dt_weights, dt_bias, a_log,
             d_skip, state_in, g, config)
     }
 
@@ -6538,7 +6539,7 @@ impl F32TensorOpsBackend for OxideBackend {
         state_grad: &Self::Tensor, g: lightnet_cuda::mambavision::MambaScanGeometry,
         config: ElementwiseLaunchConfig,
     ) -> Result<lightnet_cuda::mambavision::MambaScanGrad<Self::Tensor>, Self::Error> {
-        self.mambavision_scan_backward_native(x, projection, dt_weights, a_log,
+        self.mambavision_backend_scan_backward_f32(x, projection, dt_weights, a_log,
             d_skip, state_in, dt_pre, states, grad, state_grad, g, config)
     }
 
@@ -6546,7 +6547,7 @@ impl F32TensorOpsBackend for OxideBackend {
         &self, input: &Self::Tensor, batch: usize, tokens: usize, channels: usize,
         heads: usize, block: usize, topk: usize, config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
-        self.mambavision_msa_native(input, batch, tokens, channels, heads, block, topk, config)
+        self.mambavision_backend_msa_f32(input, batch, tokens, channels, heads, block, topk, config)
     }
 
     fn mambavision_msa_backward_f32(
@@ -6554,7 +6555,7 @@ impl F32TensorOpsBackend for OxideBackend {
         grad: &Self::Tensor, batch: usize, tokens: usize, channels: usize,
         heads: usize, config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        self.mambavision_msa_backward_native(input, probabilities, active, grad,
+        self.mambavision_backend_msa_backward_f32(input, probabilities, active, grad,
             batch, tokens, channels, heads, config)
     }
 
