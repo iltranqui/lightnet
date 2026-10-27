@@ -281,6 +281,7 @@ file is named inline.
 - [261. Native Segmentation loss and delta](#261-native-segmentation-loss-and-delta)
 - [262. Native ViT inference forward](#262-native-vit-inference-forward)
 - [263. Native Swin Revleaky training forward and backward](#263-native-swin-revleaky-training-forward-and-backward)
+- [264. Native Clifford Fourier forward and backward](#264-native-clifford-fourier-forward-and-backward)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -1032,7 +1033,7 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 - v0.1.006 (`1cc80d92b06a7b4fcbd90bea0f6a38931bb0d0ed`): integrated `[clifford]` as an ordinary source-derived NCHW layer, not a nested config container. CPU support covers local/global/hybrid branches, avgpool/Fourier global context, inner/wedge/full interaction schedules, abs/diff context, higher vector-bivector mode, and cached DropPath. The guarded C++ `LAYER_CLIFFORD` macro is disabled, so this is hand-derived from `Jev_laya`, not compiled-C++ parity.
 - Added seeded source-scale initialization; exact source-order `.weights` load/save; training forward/backward with internal depthwise BN and rolling-stat updates; SGD, AdamW, and Muon matrix mappings (with AdamW fallback for non-matrix parameters). DNOPT host-Adam/Muon state round trips validate nested state; GPU full/compact execution and updates reject explicitly in Stage 1.
 - Verification: `MEM=3G ./tools/test_host.sh clifford_` passed 13 tests, `weights` passed 44, and `runtime` passed 208. The Clifford tests cover finite differences for input and trainable parameters across avgpool+DropPath, Fourier, inner/abs/local, and wedge/global modes; exact weight bytes/round-trip; seeded initialization; optimizer updates/state; BN stats; and GPU rejection. Targeted Rustfmt and `git diff --check` passed. No training, Oxide tests, or `cfg_corpus` run.
-- Evidence boundary: no compiled-C++ golden exists and no compiled-C++ parity is claimed. Clifford is Stage-1 CPU-only; `recursive_block` remains open and native GPU support/GPU Muon belong to Stage 2.
+- Evidence boundary: no compiled-C++ golden exists and no compiled-C++ parity is claimed. Clifford is Stage-1 CPU-only at this increment; `recursive_block` remains open and native GPU support/GPU Muon belong to Stage 2.
 
 ## 24. Recursive-block Stage-1 CPU reference
 
@@ -2764,3 +2765,16 @@ Evidence: `cargo xtask check` and `cargo xtask gpu-check` passed;
 oxide_swin` passed 5 tests. Tolerances were 2e-4 for forward and 5e-4 for
 gradients and parameters. The reference is hand-derived from source; no
 compiled-C++ golden exists. Tag `v0.2.199`.
+
+## 264. Native Clifford Fourier forward and backward
+
+v0.2.200 (`44aebc0e1b4795b540ef820d4e4a5b7b110fe005`) adds a direct
+truncated Fourier transform with Oxide coefficient, synthesis and parameter-gradient
+kernels; `clifford/gpu.rs` selects the native path.
+
+Evidence: `clifford_fourier_native_forward_and_gradients_match_cpu` compares
+forward and gradients with CPU at tolerances 2e-4 and 5e-4 respectively.
+`cargo xtask check` and `cargo xtask gpu-check` passed; `cargo xtask test
+clifford` passed 14 tests and `cargo xtask oxide --test oxide_clifford` passed
+5. Hand-derived from source; no compiled-C++ golden. The network-wide CPU
+backward fallback is unchanged. Tag `v0.2.200`.

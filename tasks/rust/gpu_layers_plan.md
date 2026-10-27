@@ -28,9 +28,11 @@ deliverable. Sparse MoE remains unstarted.
 
 ## Resume point
 
-v0.2.199 adds native Swin Revleaky training forward/backward by mapping it to
-device Leaky; CPU-reference forward, gradient and update parity passed (§263).
-The next free version is v0.2.200.
+v0.2.200 adds native Clifford Fourier forward/backward using a direct truncated
+transform and Oxide coefficient, synthesis and parameter-gradient kernels;
+CPU-reference forward and gradient parity passed (§264). The network-wide CPU
+backward fallback is unchanged. The next free version is v0.2.201.
+v0.2.199 added native Swin Revleaky training forward/backward (§263).
 
 Marker gather is native in f32 full/compact forward/backward and f16 compact
 inference (v0.2.001–002). v0.2.149 adds compact f16 Logistic sigmoid through the native half-storage channel-affine activation kernel; v0.2.150 adds direct CPU-reference parity. v0.2.151 adds OMD loss inference as a device identity pass-through. The full `oxide_runtime_f16` suite passed 20 tests at that increment; these paths are inference only. v0.2.152 adds group-major JevCe compact f16 inference via native temperature scaling and softmax; v0.2.153 adds native channel-major NCHW group-softmax. Both layouts pass CPU parity. v0.2.154 adds compact f16 LAYA act-head with native half-storage feature extraction and exact-erf GELU; CPU-reference output parity and all 22 f16 tests pass. v0.2.155 adds the native LayaHead masked-attention primitive and v0.2.156 composes it into native full/compact f32 runtime forward; v0.2.157 adds native full/compact f32 LayaScorer inference and v0.2.158 adds its native input adjoint. v0.2.159 adds native full/compact f32 LayaEncoder inference with RoPE full/sliding attention and GeGLU. v0.2.160 adds non-BN DeformConv predictor/runtime support for dilated geometries without changing ordinary conv extents (§199). v0.2.193 adds native f32 deconvolution `NormalizeChannels*` forward/backward, so every parsed deconvolution activation stays on the device (§257); v0.2.194 adds compact f32 deconvolution inference (§258) and v0.2.195 compact f16 deconvolution inference (§259). Act-head inference now supports f32 and compact f16; training/backward/update and shared-file loading gaps remain. Act-head features/exact-erf primitives are native f32

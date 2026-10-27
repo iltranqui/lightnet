@@ -83,6 +83,8 @@ with the command given rather than trusting the number.
 
 ## Counts
 
+These counts are a historical snapshot and do not include v0.2.200 Clifford Fourier support.
+
 | Status | Count |
 |---|---|
 | Represented `LayerKind` variants | 65 (+`Unsupported`) |
@@ -132,7 +134,7 @@ with the command given rather than trusting the number.
 | `DeformConv` | alias | C++ | fwd | exact | T4 | native f32 (all dilation, no BN) / host otherwise | native (same gate; one host hop for the normalization Jacobian) | no |
 | `DsConv` | alias | C++ | fwd | exact | T4 | native Oxide f32 for single-template morph=0/1/2 | native f32 backward; host-staged SGD/Adam and hybrid GPU Muon | no |
 | `Wmhf` | alias | C++ | fwd | exact | T4 | none | none | no |
-| `Clifford` | yes | C++ | fwd | exact | T4 | none | none | no |
+| `Clifford` | yes | C++ | fwd | exact | T4 | native Fourier forward (v0.2.200) | cpu (network-wide fallback unchanged; native Fourier adjoint available) | no |
 | `RecursiveBlock` | alias | body only | fwd | exact | T1 | none | none | no |
 | `HyperbolicFoveation` | yes | C++ | fwd | exact | pin | native Oxide predictor + warp + isotropic/anisotropic fixed-point/Newton grids; native warp, predictor and fixed-point/Newton parameter adjoints | runtime input-gradient parity directly tested; supported hybrid/cache limitations remain | no |
 | `FoveationFilm` | alias | C++ | fwd | exact | T4 | native Oxide f32 (HF source/cache host-managed) | native FiLM adjoint + host HF backward; host SGD/Adam updates | no |
@@ -171,7 +173,8 @@ with the command given rather than trusting the number.
 
 ## GPU hard rejections (no device path at all)
 
-Seven variants (plus `Gru` training) abort before any kernel runs. Source: the explicit rejection
+This historical list recorded seven variants (plus `Gru` training) aborting before
+any kernel runs; Clifford's current Fourier support is noted below. Source: the explicit rejection
 paths in `runtime.rs` (including the `Gru` match arm). `DsConv` is no longer a
 f32 hard rejection; compact f16 remains unsupported, and multi-template CPU
 modes remain unsupported.
@@ -180,7 +183,7 @@ modes remain unsupported.
 |---|---|---|---|
 | `Wmhf` | same | Stage-1 CPU only (DWT + EMA scan + 7 sub-convs) | container/XL wave |
 | `RecursiveBlock` | same | Stage-1 CPU only; full-recurrence gradient | container/XL wave |
-| `Clifford` | same | Stage-1 CPU only (XL mode matrix) | container/XL wave |
+| `Clifford` | historical rejection | Native Fourier forward/backward landed in v0.2.200; network-wide CPU backward fallback remains | complete runtime integration |
 | `DepthAnything` | same | frozen DINOv2 ViT-S/14 | attention wave (after ViT backward) |
 | `DptHead` | same | four-tap fusion neck over DPT features | attention wave |
 | `Yolo3d` | same | raw CPU forward only; loss/decode absent | CPU first, then GPU |
