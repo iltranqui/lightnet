@@ -4,23 +4,28 @@
 //! `swin::block::swin_forward`. Parameter gradients are staged into the host
 //! train buffers, where the existing SGD/Adam/Muon arms update them.
 //!
-//! Variants outside [`supported`] (activations without a device kind, such as
-//! `revleaky`) keep the host round trip in [`GpuExecutableNetwork::forward_swin_host`]
+//! Variants outside [`supported`] keep the host round trip in [`GpuExecutableNetwork::forward_swin_host`]
 //! and the CPU backward fallback (see `requires_cpu_backward_fallback`).
 use super::block::SwinGeometry;
 use crate::error::{Error, Result};
-use crate::layers::vit::gpu::device_activation;
-use crate::model::{Layer, SwinSpec, TensorShape};
+use crate::model::{Activation, Layer, SwinSpec, TensorShape};
 use crate::runtime::{
     GpuExecutableNetwork, LayerTrainBuffers, backend_error, tensor_backend_shape,
 };
 use crate::swin::SWIN_MHC_DEFAULTS;
-use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
+use lightnet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 
 /// LayerNorm epsilon of both Swin LayerNorms (`swin_block::swin_forward`).
 const LN_EPS: f32 = 1.0e-5;
 /// Source output constrain applied after the crop.
 const OUTPUT_CLIP: f32 = 100.0;
+
+fn device_activation(activation: &Activation) -> Option<F32ActivationKind> {
+    match activation {
+        Activation::Revleaky => Some(F32ActivationKind::Leaky),
+        _ => crate::layers::vit::gpu::device_activation(activation),
+    }
+}
 
 /// Block geometry of one `[swin]` layer.
 pub(crate) fn geometry(layer: &Layer, spec: &SwinSpec) -> SwinGeometry {

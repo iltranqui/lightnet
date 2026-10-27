@@ -480,82 +480,20 @@ fn swin_adam_updates_and_optimizer_state_round_trip() {
 }
 
 #[test]
-fn swin_gpu_host_round_trip_matches_cpu_chain_and_backward_updates() {
-    let network = Network::from_config(
-        ConfigFile::parse_str(
-            "swin-fake-backend-chain.cfg",
-            // `revleaky` has no device activation, so this Swin keeps the host
-            // round trip and the CPU backward fallback that this test covers.
-            "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=1\n\
-             [convolutional]\nfilters=2\nsize=1\nactivation=linear\n\
-             [swin]\nfilters=3\nsize=2\nheads=1\nshift=1\nffn_ratio=2\nactivation=revleaky\n",
-        )
-        .unwrap(),
-    )
-    .unwrap();
-    let mut cpu = ExecutableNetwork::new(network.clone());
-    crate::initialize_training_params(&network, &mut cpu.params, 107);
-    let input = Tensor::from_data(
-        TensorShape::new(3, 2, 2, 1),
-        (0..12).map(|index| (index as f32 - 4.0) * 0.06).collect(),
-    )
-    .unwrap();
-    let cpu_forward = cpu.forward(&input).unwrap();
-    let output = cpu_forward.final_output().unwrap();
-    let seeds = vec![
-        None,
-        Some(Tensor::from_data(output.shape, vec![0.2; output.len()]).unwrap()),
-    ];
-    let mut gpu = GpuExecutableNetwork::new(network, FakeBackend);
-    gpu.params = cpu.params.clone();
-    let gpu_forward = gpu.forward_with_state(&input).unwrap();
-    assert_eq!(
-        gpu_forward.cpu_forward.final_output(),
-        cpu_forward.final_output()
-    );
-    assert!(gpu.requires_cpu_backward_fallback());
-    let cpu_backward = cpu.backward_seeded(&input, &cpu_forward, &seeds).unwrap();
-    let fake_backend_backward = cpu
-        .backward_seeded(&input, &gpu_forward.cpu_forward, &seeds)
-        .unwrap();
-    assert_eq!(
-        fake_backend_backward.input_gradient,
-        cpu_backward.input_gradient
-    );
-    assert_eq!(
-        fake_backend_backward.param_gradients,
-        cpu_backward.param_gradients
-    );
-    cpu.zero_train_buffers();
-    cpu.backward_accumulate_seeded(&input, &cpu_forward, &seeds)
-        .unwrap();
-    gpu.zero_train_buffers_gpu().unwrap();
-    gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seeds)
-        .unwrap();
-    assert_eq!(
-        cpu.train_buffers[1],
-        gpu.cpu_fallback_train_buffers.borrow()[1]
-    );
-    cpu.update_weights(0.003, 0.4, 0.0, 1);
-    gpu.update_weights_gpu(0.003, 0.4, 0.0, 1).unwrap();
-    let LayerParams::Swin(cpu_swin) = &cpu.params[1] else {
-        unreachable!()
-    };
-    let LayerParams::Swin(gpu_swin) = &gpu.params[1] else {
-        unreachable!()
-    };
-    assert_eq!(gpu_swin, cpu_swin);
+fn swin_gpu_native_path_matches_cpu_forward_backward_and_staged_gradients() {
+    for activation in ["gelu", "revleaky"] {
+        swin_gpu_native_check(activation);
+    }
 }
 
-#[test]
-fn swin_gpu_native_path_matches_cpu_forward_backward_and_staged_gradients() {
+fn swin_gpu_native_check(activation: &str) {
     // Shifted windows, bottom/right padding (3x5 input, window 2), two heads,
     // a C->N residual projection and batch 2 (per-sample mask reuse).
     let network = Network::from_config(
         ConfigFile::parse_str(
             "swin-native-fake-backend.cfg",
-            "[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\n\
-             [swin]\nfilters=4\nsize=2\nheads=2\nshift=1\nffn_ratio=2\nactivation=gelu\n",
+            &format!("[net]\nwidth=5\nheight=3\nchannels=2\nbatch=2\n\
+             [swin]\nfilters=4\nsize=2\nheads=2\nshift=1\nffn_ratio=2\nactivation={activation}\n"),
         )
         .unwrap(),
     )

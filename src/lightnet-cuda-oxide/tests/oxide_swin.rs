@@ -2,7 +2,7 @@
 //! against host references, and end-to-end `GpuExecutableNetwork<OxideBackend>`
 //! against the Rust CPU reference for inference, the native training forward,
 //! the native backward (input and staged parameter gradients) and the
-//! following SGD update, plus the documented host fallback (`revleaky`).
+//! following SGD update, including the native `revleaky` path.
 //!
 //! Tolerances are relative to `max(1, max |reference|)`: exact for the layout
 //! gathers, 1e-5 for the mHC reductions, 2e-4 for outputs and 5e-4 for
@@ -246,6 +246,7 @@ fn train_check(extra: &str, width: usize, height: usize, channels: usize) {
 
     let cpu_forward = cpu.forward_training(&input).unwrap();
     let gpu_state = gpu.forward_training_with_state(&input).unwrap();
+    assert!(gpu_state.cpu_forward.swin_caches[0].is_none(), "{extra}: expected native Swin path");
     let expected = cpu_forward.final_output().unwrap().clone();
     let actual = gpu_state.cpu_forward.final_output().unwrap().clone();
     close(&format!("{extra} forward"), &actual.data, &expected.data, 2e-4);
@@ -292,8 +293,6 @@ fn swin_native_training_backward_and_update_match_cpu() {
 }
 
 #[test]
-fn swin_revleaky_keeps_the_host_fallback_and_matches_cpu() {
-    // `revleaky` has no device activation kind: forward runs the host block,
-    // backward the CPU fallback, so the same checks hold.
+fn swin_revleaky_native_training_backward_and_update_match_cpu() {
     train_check("filters=4\nsize=2\nheads=2\nshift=1\nffn_ratio=2\nactivation=revleaky", 5, 3, 2);
 }
