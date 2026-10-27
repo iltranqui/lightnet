@@ -20,6 +20,7 @@ mod kimi_kda_backend;
 mod mambavision_backend;
 mod swin_backend;
 mod route_backend;
+mod upsample_backend;
 mod graph_conv;
 mod swin;
 mod mambavision;
@@ -10661,104 +10662,9 @@ impl F32TensorOpsBackend for OxideBackend {
         reverse: bool,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        if x.is_half() && !reverse {
-            let xh = self.as_half(x)?;
-            let out = self.upsample_f16(
-                &xh,
-                output_shape,
-                channels,
-                input_height,
-                input_width,
-                stride,
-                scale,
-                reverse,
-                config,
-            )?;
-            return Ok(self.wrap_half(out));
-        }
-        let x_f = self.f32v(x)?;
-        let x = &*x_f;
-        let op = "upsample_f32";
-        if stride == 0 || channels == 0 || input_height == 0 || input_width == 0 {
-            return Err(shape_err(
-                op,
-                "channels, spatial dims and stride must be > 0".to_owned(),
-            ));
-        }
-        if output_shape.len() != 4 || output_shape[1] != channels {
-            return Err(shape_err(
-                op,
-                format!("output shape {output_shape:?} is not [batch, {channels}, h, w]"),
-            ));
-        }
-        let (batch, out_h, out_w) = (output_shape[0], output_shape[2], output_shape[3]);
-        if x.len() != batch * channels * input_height * input_width {
-            return Err(shape_err(
-                op,
-                format!(
-                    "input has {} elements, expected {batch}*{channels}*{input_height}*{input_width}",
-                    x.len()
-                ),
-            ));
-        }
-        if reverse {
-            // floor (C++) and ceil (cuTile) sized outputs are both accepted.
-            if out_h == 0
-                || out_w == 0
-                || out_h > input_height.div_ceil(stride)
-                || out_w > input_width.div_ceil(stride)
-                || out_h < input_height / stride
-                || out_w < input_width / stride
-            {
-                return Err(shape_err(
-                    op,
-                    format!(
-                        "reverse output {out_h}x{out_w} incompatible with input {input_height}x{input_width} / stride {stride}"
-                    ),
-                ));
-            }
-        } else if out_h != input_height * stride || out_w != input_width * stride {
-            return Err(shape_err(
-                op,
-                format!(
-                    "output {out_h}x{out_w} != input {input_height}x{input_width} * stride {stride}"
-                ),
-            ));
-        }
-        let mut out = self.alloc_uninit(output_shape.iter().product())?;
-        // SAFETY: one thread per output element; input reads are in range by
-        // the shape checks above (reverse additionally bounds-checks taps).
-        unsafe {
-            if reverse {
-                self.resample.upsample_reverse(
-                    &self.stream,
-                    launch::elementwise(out.len(), config),
-                    &x.buf,
-                    &mut out,
-                    input_height,
-                    input_width,
-                    out_h,
-                    out_w,
-                    stride,
-                    scale,
-                )
-            } else {
-                self.resample.upsample_nearest(
-                    &self.stream,
-                    launch::elementwise(out.len(), config),
-                    &x.buf,
-                    &mut out,
-                    input_height,
-                    input_width,
-                    out_h,
-                    out_w,
-                    stride,
-                    scale,
-                )
-            }
-        }
-        .map_err(launch_err)?;
-        Ok(OxideTensorF32::new(out, output_shape))
+        self.upsample_backend_f32(
+            x, output_shape, channels, input_height, input_width, stride, scale, reverse, config,
+        )
     }
 
     /// The trait carries no `reverse` flag: the layer direction is inferred from
@@ -10776,79 +10682,9 @@ impl F32TensorOpsBackend for OxideBackend {
         scale: f32,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        if output_grad.is_half()
-            && input_shape.len() == 4
-            && output_height == input_shape[2] * stride
-            && output_width == input_shape[3] * stride
-        {
-            return self.upsample_backward_amp(
-                output_grad,
-                input_shape,
-                channels,
-                output_height,
-                output_width,
-                stride,
-                scale,
-                config,
-            );
-        }
-        let output_grad_f = self.f32v(output_grad)?;
-        let output_grad = &*output_grad_f;
-        let op = "upsample_backward_f32";
-        if stride == 0 || input_shape.len() != 4 || input_shape[1] != channels {
-            return Err(shape_err(
-                op,
-                format!("bad stride {stride} or input shape {input_shape:?}"),
-            ));
-        }
-        let (batch, in_h, in_w) = (input_shape[0], input_shape[2], input_shape[3]);
-        if in_h == 0 || in_w == 0 || output_height == 0 || output_width == 0 {
-            return Err(shape_err(op, "spatial dims must be > 0".to_owned()));
-        }
-        if output_grad.len() != batch * channels * output_height * output_width {
-            return Err(shape_err(
-                op,
-                format!(
-                    "gradient has {} elements, expected {batch}*{channels}*{output_height}*{output_width}",
-                    output_grad.len()
-                ),
-            ));
-        }
-        let reverse = if output_height == in_h * stride && output_width == in_w * stride {
-            false
-        } else if output_height >= in_h / stride
-            && output_height <= in_h.div_ceil(stride)
-            && output_width >= in_w / stride
-            && output_width <= in_w.div_ceil(stride)
-        {
-            true
-        } else {
-            return Err(shape_err(
-                op,
-                format!(
-                    "output {output_height}x{output_width} fits neither expand nor reverse of input {in_h}x{in_w}, stride {stride}"
-                ),
-            ));
-        };
-        let mut dx = self.alloc_uninit(input_shape.iter().product())?;
-        // SAFETY: one thread per input element (gather); dy reads are bounds-checked.
-        unsafe {
-            self.resample.upsample_backward(
-                &self.stream,
-                launch::elementwise(dx.len(), config),
-                &output_grad.buf,
-                &mut dx,
-                in_h,
-                in_w,
-                output_height,
-                output_width,
-                stride,
-                scale,
-                reverse as u32,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok(OxideTensorF32::new(dx, input_shape))
+        self.upsample_backend_backward_f32(
+            output_grad, input_shape, channels, output_height, output_width, stride, scale, config,
+        )
     }
 
     fn shortcut_fit_f32(
