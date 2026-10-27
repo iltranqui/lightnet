@@ -2675,8 +2675,7 @@ impl Layer {
                     .and_then(|count| count.checked_mul(channels))
                     .and_then(|count| count.checked_mul(9))
                     .expect("validated dsconv offset weight count");
-                Some(LayerWeights {
-                    entries: vec![
+                let mut entries = vec![
                         WeightsEntry {
                             array: WeightsArray::Biases,
                             len: spec.filters,
@@ -2693,8 +2692,14 @@ impl Layer {
                             array: WeightsArray::Named("offset_biases".to_owned()),
                             len: 2 * spec.size,
                         },
-                    ],
-                })
+                    ];
+                for index in 0..(spec.templates - 1) * 2 {
+                    entries.push(WeightsEntry {
+                        array: WeightsArray::Named(format!("extra_offset_weights_{index}")),
+                        len: offset_weights,
+                    });
+                }
+                Some(LayerWeights { entries })
             }
             LayerKind::Wmhf(spec) => {
                 let channels = self.input_shape.channels;
@@ -7588,6 +7593,8 @@ fn reject_unknown_dsconv_keys(section: &RawSection) -> Result<()> {
         "morph",
         "templates",
         "drop_prob",
+        "dsc_templates",
+        "dsc_drop_prob",
         "learning_rate",
         "dont_update",
         "burnin_update",
@@ -7659,29 +7666,39 @@ fn parse_dsconv_spec(section: &RawSection, input: TensorShape) -> Result<DsConvS
 
     let extend_scope = section.get_f32("extend_scope", 1.0)?;
     let mut morph = section.get_i64("morph", 0)?;
-    let mut templates = section.get_i64("templates", 1)?;
-    let mut drop_prob = section.get_f32("drop_prob", 0.0)?;
+    if section.values.contains_key("templates") && section.values.contains_key("dsc_templates")
+        || section.values.contains_key("drop_prob") && section.values.contains_key("dsc_drop_prob")
+    {
+        return Err(invalid("duplicate DSConv template option aliases"));
+    }
+    let templates = if section.values.contains_key("dsc_templates") {
+        section.get_i64("dsc_templates", 1)?
+    } else {
+        section.get_i64("templates", 1)?
+    };
+    let drop_prob = if section.values.contains_key("dsc_drop_prob") {
+        section.get_f32("dsc_drop_prob", 0.0)?
+    } else {
+        section.get_f32("drop_prob", 0.0)?
+    };
     if !extend_scope.is_finite() || !drop_prob.is_finite() {
         return Err(invalid("extend_scope and drop_prob must be finite"));
+    }
+    if templates < 1 {
+        return Err(invalid("templates must be at least 1"));
+    }
+    let templates = usize::try_from(templates).map_err(|_| invalid("templates is out of range"))?;
+    if !(0.0..1.0).contains(&drop_prob) {
+        return Err(invalid("drop_prob must be in [0, 1)"));
     }
     if morph < 0 || morph > 2 {
         morph = 0;
     }
-    if templates < 1 {
-        templates = 1;
-    }
     if morph == 2 && filters < 2 {
         return Err(invalid("morph=2 requires at least two filters"));
     }
-    if morph == 2 && templates != 1 {
-        templates = 1;
-        drop_prob = 0.0;
-    }
-    drop_prob = drop_prob.clamp(0.0, 1.0);
-    if templates > 1 {
-        return Err(invalid(
-            "templates>1 multi-view execution is not yet supported by the Rust CPU port",
-        ));
+    if morph == 2 && templates > 1 {
+        return Err(invalid("morph=2 does not support templates>1"));
     }
 
     filters
@@ -7691,6 +7708,7 @@ fn parse_dsconv_spec(section: &RawSection, input: TensorShape) -> Result<DsConvS
     size.checked_mul(2)
         .and_then(|count| count.checked_mul(input.channels))
         .and_then(|count| count.checked_mul(9))
+        .and_then(|count| templates.checked_sub(1).and_then(|n| n.checked_mul(2)).and_then(|n| n.checked_add(1)).and_then(|n| count.checked_mul(n)))
         .ok_or_else(|| invalid("offset weight count overflows"))?;
     Ok(DsConvSpec {
         filters,
@@ -7698,7 +7716,7 @@ fn parse_dsconv_spec(section: &RawSection, input: TensorShape) -> Result<DsConvS
         padding,
         extend_scope,
         morph: morph as usize,
-        templates: templates as usize,
+        templates,
         drop_prob,
         activation: Activation::parse(&section.get_str("activation", "relu")),
     })
@@ -11549,34 +11567,41 @@ output=2
             };
             assert_eq!(spec.morph, expected);
         }
-        let normalized = make("filters=3\nsize=-1\ntemplates=0\ndrop_prob=2")
+        let normalized = make("filters=3\nsize=-1")
             .expect("source-normalized factory options parse");
         let LayerKind::DsConv(spec) = &normalized.layers[0].kind else {
             panic!("DSConv layer")
         };
         assert_eq!(
             (spec.size, spec.padding, spec.templates, spec.drop_prob),
-            (1, 0, 1, 1.0)
+            (1, 0, 1, 0.0)
         );
-
-        let morph2 = make("filters=3\nsize=3\nmorph=2\ntemplates=4\ndrop_prob=0.4")
-            .expect("morph=2 forces one template");
-        let LayerKind::DsConv(spec) = &morph2.layers[0].kind else {
-            panic!("DSConv layer")
-        };
-        assert_eq!((spec.templates, spec.drop_prob), (1, 0.0));
 
         for (options, expected_message) in [
             ("size=2", "size must be odd"),
             ("stride=2", "only stride=1"),
             ("filters=1\nsize=3\nmorph=2", "morph=2 requires"),
-            ("templates=2", "templates>1 multi-view"),
+            ("templates=0", "templates must be at least 1"),
+            ("drop_prob=1", "drop_prob must be in"),
+            ("drop_prob=-0.1", "drop_prob must be in"),
+            ("morph=2\ntemplates=2", "morph=2 does not support"),
             ("extend_scope=NaN", "must be finite"),
             ("unknown_option=1", "unknown option"),
         ] {
             let error = make(options).expect_err("invalid DSConv cfg should fail");
             assert!(error.to_string().contains(expected_message), "{error}");
         }
+    }
+
+    #[test]
+    fn dsconv_multi_template_config_aliases_and_parameter_count() {
+        for options in ["templates=3\ndrop_prob=0.25", "dsc_templates=3\ndsc_drop_prob=0.25"] {
+            let network = build(&format!("[net]\nwidth=3\nheight=2\nchannels=2\n[dsconv]\nfilters=3\nsize=3\n{options}\n")).unwrap();
+            let LayerKind::DsConv(spec) = &network.layers[0].kind else { panic!("dsconv") };
+            assert_eq!((spec.templates, spec.drop_prob), (3, 0.25));
+            assert_eq!(network.layers[0].weights().unwrap().parameter_count(), 3 + 18 + 108 + 6 + 4 * 108);
+        }
+        assert!(build("[net]\nwidth=1\nheight=1\nchannels=1\n[dsconv]\ndsc_drop_prob=0.25\n").is_ok());
     }
 
     #[test]

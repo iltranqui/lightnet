@@ -356,6 +356,7 @@ pub fn initialize_training_params(network: &Network, params: &mut [LayerParams],
                 p.collapse.biases.fill(0.0);
                 p.offset_weights.fill(0.0);
                 p.offset_biases.fill(0.0);
+                for block in &mut p.extra_offset_weights { block.fill(0.0); }
             }
             LayerParams::Wmhf(p) => {
                 let crate::LayerKind::Wmhf(spec) = &layer.kind else {

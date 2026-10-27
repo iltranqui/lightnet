@@ -20,6 +20,9 @@ where
         current_input: &B::Tensor,
         launch_config: ElementwiseLaunchConfig,
     ) -> Result<B::Tensor> {
+        if spec.templates > 1 {
+            return Err(Error::UnsupportedLayer { layer_index: layer.index, name: "[dsconv] templates>1 GPU execution is not yet supported".to_owned() });
+        }
         let activation = spec.activation.to_cuda_f32_kind().ok_or_else(|| {
             Error::UnsupportedLayer {
                 layer_index: layer.index,
@@ -93,6 +96,9 @@ where
         config: ElementwiseLaunchConfig,
         layer_output_gradients: &mut [Option<B::Tensor>],
     ) -> Result<()> {
+        if spec.templates > 1 {
+            return Err(Error::UnsupportedLayer { layer_index: layer.index, name: "[dsconv] templates>1 GPU backward is not yet supported".to_owned() });
+        }
         let activation = spec.activation.to_cuda_f32_kind().ok_or_else(|| {
             Error::UnsupportedLayer {
                 layer_index: layer.index,

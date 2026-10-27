@@ -220,6 +220,7 @@ pub struct DsConvParams {
     pub collapse: ConvolutionalParams,
     pub offset_weights: Vec<f32>,
     pub offset_biases: Vec<f32>,
+    pub extra_offset_weights: Vec<Vec<f32>>,
 }
 
 /// `[wmhf]`: seven independent convolution blocks followed by four scan

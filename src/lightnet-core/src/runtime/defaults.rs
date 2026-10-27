@@ -802,6 +802,7 @@ pub(super) fn default_dsconv_params(input_channels: usize, spec: &crate::model::
         },
         offset_weights: vec![0.0; offset_weights],
         offset_biases: vec![0.0; 2 * spec.size],
+        extra_offset_weights: vec![vec![0.0; offset_weights]; (spec.templates - 1) * 2],
     }
 }
 

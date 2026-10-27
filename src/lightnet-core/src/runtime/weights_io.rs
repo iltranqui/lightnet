@@ -357,6 +357,7 @@ pub(super) fn load_weights_into_params(
                 read_f32_into(&mut file, &mut dsconv.collapse.weights)?;
                 read_f32_into(&mut file, &mut dsconv.offset_weights)?;
                 read_f32_into(&mut file, &mut dsconv.offset_biases)?;
+                for block in &mut dsconv.extra_offset_weights { read_f32_into(&mut file, block)?; }
             }
             LayerParams::Wmhf(wmhf) => {
                 let LayerKind::Wmhf(spec) = &layer.kind else {

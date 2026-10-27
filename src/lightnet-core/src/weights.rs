@@ -294,6 +294,7 @@ pub fn save_weights(
                 write_f32_slice(&mut file, &dsconv.collapse.weights)?;
                 write_f32_slice(&mut file, &dsconv.offset_weights)?;
                 write_f32_slice(&mut file, &dsconv.offset_biases)?;
+                for block in &dsconv.extra_offset_weights { write_f32_slice(&mut file, block)?; }
             }
             (LayerKind::Wmhf(_), LayerParams::Wmhf(wmhf)) => {
                 for conv in [
@@ -1811,10 +1812,11 @@ num_dwconv=2
 
     #[test]
     fn dsconv_weights_round_trip_with_exact_source_order_and_file_size() {
+        for templates in [1, 3] {
         let network = Network::from_config(
             ConfigFile::parse_str(
                 "dsconv-weights.cfg",
-                "[net]\nwidth=3\nheight=2\nchannels=2\n[dynamic_snake_conv]\nfilters=3\nsize=3\nmorph=2\nactivation=linear\n",
+                &format!("[net]\nwidth=3\nheight=2\nchannels=2\n[dynamic_snake_conv]\nfilters=3\nsize=3\nmorph=0\nactivation=linear\ntemplates={templates}\n"),
             )
             .unwrap(),
         )
@@ -1835,10 +1837,14 @@ num_dwconv=2
         for (index, value) in params.offset_biases.iter_mut().enumerate() {
             *value = 0.25 + index as f32 * 0.1;
         }
+        for (i, block) in params.extra_offset_weights.iter_mut().enumerate() {
+            block.fill(10.0 + i as f32);
+        }
         let mut expected = params.collapse.biases.clone();
         expected.extend_from_slice(&params.collapse.weights);
         expected.extend_from_slice(&params.offset_weights);
         expected.extend_from_slice(&params.offset_biases);
+        for block in &params.extra_offset_weights { expected.extend_from_slice(block); }
 
         let path = std::env::temp_dir().join(format!(
             "darknet-dsconv-weights-{}.weights",
@@ -1847,6 +1853,7 @@ num_dwconv=2
         save_weights(&network, &executable.params, &path, 23).expect("weights save");
         let inspection = inspect_weights_file(&network, &path).expect("weights inspect");
         let parameter_count = network.layers[0].weights().unwrap().parameter_count();
+        assert_eq!(parameter_count, 3 + 18 + 108 + 6 + (templates - 1) * 2 * 108);
         assert_eq!(inspection.file_size, 20 + 4 * parameter_count as u64);
         assert_eq!(inspection.trailing_bytes, 0);
         assert_eq!(
@@ -1855,9 +1862,20 @@ num_dwconv=2
                 .iter()
                 .map(|array| array.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["biases", "weights", "offset_weights", "offset_biases"]
+            [vec!["biases".to_owned(), "weights".to_owned(), "offset_weights".to_owned(), "offset_biases".to_owned()], (0..(templates - 1) * 2).map(|i| format!("extra_offset_weights_{i}")).collect()].concat()
         );
         let bytes = fs::read(&path).expect("read weights");
+        if templates == 1 {
+            let mut legacy = Vec::new();
+            legacy.extend_from_slice(&crate::DARKNET_WEIGHTS_VERSION_MAJOR.to_le_bytes());
+            legacy.extend_from_slice(&crate::DARKNET_WEIGHTS_VERSION_MINOR.to_le_bytes());
+            legacy.extend_from_slice(&crate::DARKNET_WEIGHTS_VERSION_PATCH.to_le_bytes());
+            legacy.extend_from_slice(&23u64.to_le_bytes());
+            for value in &expected {
+                legacy.extend_from_slice(&value.to_le_bytes());
+            }
+            assert_eq!(bytes, legacy, "single-template legacy bytes changed");
+        }
         let stream = bytes[20..]
             .chunks_exact(4)
             .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
@@ -1867,6 +1885,7 @@ num_dwconv=2
         reloaded.load_weights_file(&path).expect("weights load");
         assert_eq!(reloaded.params, executable.params);
         let _ = fs::remove_file(path);
+        }
     }
 
     #[test]

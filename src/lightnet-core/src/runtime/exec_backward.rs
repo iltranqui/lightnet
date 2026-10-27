@@ -902,6 +902,7 @@ impl ExecutableNetwork {
                         },
                         offset_weights: math_gradient.offset_weights,
                         offset_biases: math_gradient.offset_biases,
+                        extra_offset_weights: Vec::new(),
                     };
                     let Some(LayerParams::DsConv(dst)) = param_gradients.get_mut(layer.index)
                     else {

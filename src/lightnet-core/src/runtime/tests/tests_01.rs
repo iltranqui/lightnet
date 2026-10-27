@@ -1407,6 +1407,19 @@ fn dsconv_runtime_forward_backward_and_native_backend_gate() {
 }
 
 #[test]
+fn dsconv_multi_template_runtime_rejects_cpu_and_gpu() {
+    let network = Network::from_config(ConfigFile::parse_str(
+        "dsconv-multi.cfg",
+        "[net]\nwidth=2\nheight=2\nchannels=1\n[dsconv]\nsize=3\ntemplates=3\n",
+    ).unwrap()).unwrap();
+    let input = Tensor::filled(TensorShape::new(2, 2, 1, 1), 1.0);
+    let cpu = ExecutableNetwork::new(network.clone());
+    assert!(cpu.forward_training(&input).unwrap_err().to_string().contains("templates>1"));
+    let gpu = GpuExecutableNetwork::new(network, FakeBackend);
+    assert!(gpu.forward(&input).unwrap_err().to_string().contains("templates>1"));
+}
+
+#[test]
 fn dsconv_sgd_uses_source_rate_groups_and_update_gates() {
     let network = Network::from_config(
             ConfigFile::parse_str(
