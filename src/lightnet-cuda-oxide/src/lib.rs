@@ -12,6 +12,7 @@ mod softmax_backend;
 mod reorg_backend;
 mod crop_backend;
 mod local_backend;
+mod pool_backend;
 mod graph_conv;
 mod swin;
 mod mambavision;
@@ -544,7 +545,7 @@ fn shape_err(op: &str, msg: String) -> OxideError {
 }
 
 /// Checks an NCHW `[batch, channels, h, w]` shape and returns its batch.
-fn nchw_batch(
+pub(crate) fn nchw_batch(
     op: &str,
     what: &str,
     shape: &[usize],
@@ -562,7 +563,7 @@ fn nchw_batch(
 }
 
 /// Validated pooling geometry: `(batch, out_h, out_w)`.
-fn pool_layout(
+pub(crate) fn pool_layout(
     op: &str,
     x_shape_len: usize,
     out_shape: &[usize],
@@ -594,7 +595,6 @@ fn pool_layout(
     }
     Ok((batch, out_shape[2], out_shape[3]))
 }
-
 
 impl OxideBackend {
     /// Native f32 WMHF four-direction scan backward and parameter gradients.
@@ -8493,27 +8493,8 @@ impl F32TensorOpsBackend for OxideBackend {
         padding: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        if x.is_half() {
-            let xh = self.as_half(x)?;
-            let out = self.maxpool_f16(
-                &xh,
-                output_shape,
-                channels,
-                input_height,
-                input_width,
-                size,
-                stride_x,
-                stride_y,
-                padding,
-                config,
-            )?;
-            return Ok(self.wrap_half(out));
-        }
-        let x_f = self.f32v(x)?;
-        let x = &*x_f;
-        let (_, out_h, out_w) = pool_layout(
-            "maxpool_f32",
-            x.len(),
+        self.pool_backend_maxpool_f32(
+            x,
             output_shape,
             channels,
             input_height,
@@ -8521,28 +8502,9 @@ impl F32TensorOpsBackend for OxideBackend {
             size,
             stride_x,
             stride_y,
-        )?;
-        let mut out = self.alloc_uninit(output_shape.iter().product())?;
-        // SAFETY: one thread per output element; all input reads are
-        // bounds-checked against the image and `x` covers the validated extent.
-        unsafe {
-            self.pool.maxpool_forward(
-                &self.stream,
-                launch::elementwise(out.len(), config),
-                &x.buf,
-                &mut out,
-                input_height,
-                input_width,
-                out_h,
-                out_w,
-                size,
-                stride_x,
-                stride_y,
-                padding / 2,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok(OxideTensorF32::new(out, output_shape))
+            padding,
+            config,
+        )
     }
 
     fn maxpool_backward_f32(
@@ -8558,65 +8520,18 @@ impl F32TensorOpsBackend for OxideBackend {
         padding: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        if x.is_half() {
-            return self.maxpool_backward_amp(
-                x,
-                output_grad,
-                channels,
-                input_height,
-                input_width,
-                size,
-                stride_x,
-                stride_y,
-                padding,
-                config,
-            );
-        }
-        let x_f = self.f32v(x)?;
-        let x = &*x_f;
-        let output_grad_f = self.f32v(output_grad)?;
-        let output_grad = &*output_grad_f;
-        let (out_h, out_w) = Self::grad_hw(
-            "maxpool_backward_f32",
+        self.pool_backend_maxpool_backward_f32(
+            x,
             output_grad,
-            x.len(),
-            channels,
-            input_height,
-            input_width,
-        )?;
-        pool_layout(
-            "maxpool_backward_f32",
-            x.len(),
-            output_grad.shape(),
             channels,
             input_height,
             input_width,
             size,
             stride_x,
             stride_y,
-        )?;
-        let mut dx = self.alloc_uninit(x.len())?;
-        // SAFETY: one thread per input element (gather, no atomics); reads are
-        // bounds-checked and `x` / `output_grad` cover the validated extents.
-        unsafe {
-            self.pool.maxpool_backward(
-                &self.stream,
-                launch::elementwise(dx.len(), config),
-                &x.buf,
-                &output_grad.buf,
-                &mut dx,
-                input_height,
-                input_width,
-                out_h,
-                out_w,
-                size,
-                stride_x,
-                stride_y,
-                padding / 2,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok(OxideTensorF32::new(dx, x.shape()))
+            padding,
+            config,
+        )
     }
 
     fn maxpool_depth_f32(
@@ -8728,11 +8643,8 @@ impl F32TensorOpsBackend for OxideBackend {
         padding: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let x_f = self.f32v(x)?;
-        let x = &*x_f;
-        let (_, out_h, out_w) = pool_layout(
-            "local_avgpool_f32",
-            x.len(),
+        self.pool_backend_local_avgpool_f32(
+            x,
             output_shape,
             channels,
             input_height,
@@ -8740,27 +8652,9 @@ impl F32TensorOpsBackend for OxideBackend {
             size,
             stride_x,
             stride_y,
-        )?;
-        let mut out = self.alloc_uninit(output_shape.iter().product())?;
-        // SAFETY: one thread per output element; reads are bounds-checked.
-        unsafe {
-            self.pool.local_avgpool_forward(
-                &self.stream,
-                launch::elementwise(out.len(), config),
-                &x.buf,
-                &mut out,
-                input_height,
-                input_width,
-                out_h,
-                out_w,
-                size,
-                stride_x,
-                stride_y,
-                padding / 2,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok(OxideTensorF32::new(out, output_shape))
+            padding,
+            config,
+        )
     }
 
     fn local_avgpool_backward_f32(
@@ -8776,56 +8670,18 @@ impl F32TensorOpsBackend for OxideBackend {
         padding: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let output_grad_f = self.f32v(output_grad)?;
-        let output_grad = &*output_grad_f;
-        let op = "local_avgpool_backward_f32";
-        let batch = nchw_batch(
-            op,
-            "input",
-            input_shape,
-            channels,
-            input_height,
-            input_width,
-        )?;
-        let (out_h, out_w) = Self::grad_hw(
-            op,
+        self.pool_backend_local_avgpool_backward_f32(
             output_grad,
-            batch * channels * input_height * input_width,
-            channels,
-            input_height,
-            input_width,
-        )?;
-        pool_layout(
-            op,
-            input_shape.iter().product(),
-            output_grad.shape(),
+            input_shape,
             channels,
             input_height,
             input_width,
             size,
             stride_x,
             stride_y,
-        )?;
-        let mut dx = self.alloc_uninit(input_shape.iter().product())?;
-        // SAFETY: one thread per input element (gather); reads bounds-checked.
-        unsafe {
-            self.pool.local_avgpool_backward(
-                &self.stream,
-                launch::elementwise(dx.len(), config),
-                &output_grad.buf,
-                &mut dx,
-                input_height,
-                input_width,
-                out_h,
-                out_w,
-                size,
-                stride_x,
-                stride_y,
-                padding / 2,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok(OxideTensorF32::new(dx, input_shape))
+            padding,
+            config,
+        )
     }
 
     fn avgpool_f32(
@@ -8837,33 +8693,14 @@ impl F32TensorOpsBackend for OxideBackend {
         input_width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let x_f = self.f32v(x)?;
-        let x = &*x_f;
-        let op = "avgpool_f32";
-        let batch = nchw_batch(op, "output", output_shape, channels, 1, 1)?;
-        let area = input_height * input_width;
-        if area == 0 || x.len() != batch * channels * area {
-            return Err(shape_err(
-                op,
-                format!(
-                    "input has {} elements, expected {batch}*{channels}*{area}",
-                    x.len()
-                ),
-            ));
-        }
-        let mut out = self.alloc_uninit(batch * channels)?;
-        // SAFETY: one thread per (batch, channel) plane, reading `area` elements.
-        unsafe {
-            self.pool.avgpool_forward(
-                &self.stream,
-                launch::elementwise(out.len(), config),
-                &x.buf,
-                &mut out,
-                area,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok(OxideTensorF32::new(out, output_shape))
+        self.pool_backend_avgpool_f32(
+            x,
+            output_shape,
+            channels,
+            input_height,
+            input_width,
+            config,
+        )
     }
 
     fn avgpool_backward_f32(
@@ -8875,40 +8712,14 @@ impl F32TensorOpsBackend for OxideBackend {
         input_width: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        let output_grad_f = self.f32v(output_grad)?;
-        let output_grad = &*output_grad_f;
-        let op = "avgpool_backward_f32";
-        let batch = nchw_batch(
-            op,
-            "input",
+        self.pool_backend_avgpool_backward_f32(
+            output_grad,
             input_shape,
             channels,
             input_height,
             input_width,
-        )?;
-        let area = input_height * input_width;
-        if area == 0 || output_grad.len() != batch * channels {
-            return Err(shape_err(
-                op,
-                format!(
-                    "gradient has {} elements, expected {batch}*{channels}",
-                    output_grad.len()
-                ),
-            ));
-        }
-        let mut dx = self.alloc_uninit(input_shape.iter().product())?;
-        // SAFETY: one thread per input element reading `dy[i / area]`.
-        unsafe {
-            self.pool.avgpool_backward(
-                &self.stream,
-                launch::elementwise(dx.len(), config),
-                &output_grad.buf,
-                &mut dx,
-                area,
-            )
-        }
-        .map_err(launch_err)?;
-        Ok(OxideTensorF32::new(dx, input_shape))
+            config,
+        )
     }
 
     fn moe_router_gates_f32(
