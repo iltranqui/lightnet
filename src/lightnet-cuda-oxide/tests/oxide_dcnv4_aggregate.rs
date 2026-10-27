@@ -86,7 +86,7 @@ fn device_aggregation_rejects_oversized_kernels_and_bad_operands() {
     let backend = backend();
     let cfg = ElementwiseLaunchConfig::default();
     let mut g = geometry(2, 1, false, false);
-    g.size = 7; // 49 > MAX_POINTS
+    g.size = 32; // 1,024 > MAX_POINTS (961)
     let input = vec![0.0f32; g.batch * g.channels * g.input_height * g.input_width];
     let offsets = vec![0.0f32; g.batch * g.spatial() * g.offset_dim()];
     let t_in = backend.upload_f32(&[input.len()], &input).unwrap();
