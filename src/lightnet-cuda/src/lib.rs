@@ -5317,6 +5317,45 @@ pub trait F32TensorOpsBackend {
         self.upload_f32(&[batch * tokens, channels], &out)
     }
 
+fn clifford_fourier_f32(&self, input: &Self::Tensor, wr: &Self::Tensor, wi: &Self::Tensor,
+    batch: usize, channels: usize, height: usize, width: usize, mh: usize, mw: usize,
+    config: ElementwiseLaunchConfig) -> Result<Self::Tensor, Self::Error> {
+    let _ = config;
+    let x = self.download_f32(input)?; let wr = self.download_f32(wr)?; let wi = self.download_f32(wi)?;
+    let spatial = height * width; let modes = mh * mw;
+    assert!(batch > 0 && channels > 0 && spatial > 0 && modes > 0);
+    assert_eq!(x.len(), batch * channels * spatial); assert_eq!(wr.len(), channels * modes); assert_eq!(wi.len(), wr.len());
+    let mut out = vec![0.0; x.len()];
+    for bc in 0..batch * channels { for m in 0..modes {
+        let kh = m / mw; let kw = m % mw; let mut re = 0.0; let mut im = 0.0;
+        for p in 0..spatial { let t = std::f32::consts::TAU * ((kh * (p / width)) as f32 / height as f32 + (kw * (p % width)) as f32 / width as f32); re += x[bc * spatial + p] * t.cos(); im -= x[bc * spatial + p] * t.sin(); }
+        let w = (bc % channels) * modes + m; let yr = re * wr[w] - im * wi[w]; let yi = re * wi[w] + im * wr[w];
+        let scale = (if kw == 0 { 1.0 } else { 2.0 }) / spatial as f32;
+        for p in 0..spatial { let t = std::f32::consts::TAU * ((kh * (p / width)) as f32 / height as f32 + (kw * (p % width)) as f32 / width as f32); out[bc * spatial + p] += scale * (yr * t.cos() - yi * t.sin()); }
+    }}
+    self.upload_f32(&[batch, channels, height, width], &out)
+}
+
+fn clifford_fourier_backward_f32(&self, input: &Self::Tensor, grad: &Self::Tensor, wr: &Self::Tensor, wi: &Self::Tensor,
+    batch: usize, channels: usize, height: usize, width: usize, mh: usize, mw: usize,
+    config: ElementwiseLaunchConfig) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+    let _ = config;
+    let x = self.download_f32(input)?; let g = self.download_f32(grad)?; let wr = self.download_f32(wr)?; let wi = self.download_f32(wi)?;
+    let spatial = height * width; let modes = mh * mw;
+    assert!(batch > 0 && channels > 0 && spatial > 0 && modes > 0);
+    assert_eq!(x.len(), batch * channels * spatial); assert_eq!(g.len(), x.len()); assert_eq!(wr.len(), channels * modes); assert_eq!(wi.len(), wr.len());
+    let mut dx = vec![0.0; x.len()]; let mut dw = vec![0.0; wr.len()]; let mut dv = vec![0.0; wr.len()];
+    for bc in 0..batch * channels { for m in 0..modes {
+        let kh = m / mw; let kw = m % mw; let mut re = 0.0; let mut im = 0.0; let mut dr = 0.0; let mut di = 0.0;
+        for p in 0..spatial { let t = std::f32::consts::TAU * ((kh * (p / width)) as f32 / height as f32 + (kw * (p % width)) as f32 / width as f32); let co = t.cos(); let si = t.sin(); let j = bc * spatial + p; re += x[j] * co; im -= x[j] * si; dr += g[j] * co; di -= g[j] * si; }
+        let scale = (if kw == 0 { 1.0 } else { 2.0 }) / spatial as f32; dr *= scale; di *= scale;
+        let w = (bc % channels) * modes + m; dw[w] += dr * re + di * im; dv[w] += -dr * im + di * re;
+        let a = dr * wr[w] + di * wi[w]; let b = -dr * wi[w] + di * wr[w];
+        for p in 0..spatial { let t = std::f32::consts::TAU * ((kh * (p / width)) as f32 / height as f32 + (kw * (p % width)) as f32 / width as f32); dx[bc * spatial + p] += a * t.cos() - b * t.sin(); }
+    }}
+    Ok((self.upload_f32(&[batch, channels, height, width], &dx)?, self.upload_f32(&[channels, modes], &dw)?, self.upload_f32(&[channels, modes], &dv)?))
+}
+
     /// One Clifford rolling block in NCHW order. `pooled` context is `[B,C]`;
     /// otherwise it has the state shape. Inner blocks apply SiLU to the product.
     fn clifford_interaction_f32(

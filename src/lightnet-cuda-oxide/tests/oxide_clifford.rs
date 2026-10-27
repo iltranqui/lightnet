@@ -1,6 +1,6 @@
 //! Rust CPU versus native f32 Clifford inference, training forward, input and
 //! parameter gradients, BN running statistics, and one host-staged SGD/Adam
-//! update. Fourier explicitly exercises the reported host fallback.
+//! update, including the direct truncated Fourier operator.
 //!
 //! Tolerances use max(1, max |reference|): 2e-4 forward, 8e-4 backward,
 //! statistics and updates; primitive products/adjoints use 2e-5. Reduction
@@ -64,7 +64,7 @@ fn network(options: &str, width: usize, height: usize, channels: usize, adam: bo
     if let Some(branch) = &mut p.global { fill_branch(&mut rng, branch); }
     if let Some(fourier) = &mut p.fourier {
         rng.fill(&mut fourier.real, 0.2);
-        rng.fill(&mut fourier.imaginary, 0.0);
+        rng.fill(&mut fourier.imaginary, 0.15);
     }
     cpu
 }
@@ -150,9 +150,10 @@ fn train_check(options: &str, w: usize, h: usize, c: usize, adam: bool, fallback
     gpu.zero_train_buffers_gpu().unwrap();
     let want = cpu.backward_accumulate_seeded(&input, &forward, &seeds).unwrap();
     let got = gpu.backward_accumulate_seeded_gpu_with_input_gradient(&device, &seeds).unwrap().unwrap();
-    close("input gradient", &got.data, &want.input_gradient.data, 8e-4);
+    let gradient_tolerance = if options.contains("global_op=fourier") { 5e-4 } else { 8e-4 };
+    close("input gradient", &got.data, &want.input_gradient.data, gradient_tolerance);
     close("parameter gradients", &update_values(&gpu.host_fallback_train_buffers()[0]),
-        &update_values(&cpu.train_buffers[0]), 8e-4);
+        &update_values(&cpu.train_buffers[0]), gradient_tolerance);
     close("BN running statistics", &parameter_values(&gpu.params[0]), &parameter_values(&cpu.params[0]), 8e-4);
     let before = parameter_values(&cpu.params[0]);
     // The CPU API selects the optimizer explicitly; the GPU API reads [net].
@@ -187,8 +188,8 @@ fn clifford_native_adam_update_matches_cpu() {
 }
 
 #[test]
-fn clifford_fourier_keeps_reported_host_fallback() {
-    train_check("gffn_mode=hybrid\ncli_mode=full\nglobal_op=fourier\nfno_modes_h=1\nfno_modes_w=2\ndwconv_size=1", 3, 2, 3, false, true);
+fn clifford_fourier_native_forward_and_gradients_match_cpu() {
+    train_check("gffn_mode=hybrid\ncli_mode=full\nglobal_op=fourier\nfno_modes_h=2\nfno_modes_w=2\ndwconv_size=1", 3, 2, 3, false, false);
 }
 
 #[test]

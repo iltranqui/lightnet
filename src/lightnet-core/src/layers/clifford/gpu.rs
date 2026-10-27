@@ -1,6 +1,6 @@
 //! Native f32 Clifford runtime. Activations and their adjoints stay on the
 //! device; parameter gradients and BN statistics are staged for host updates.
-//! Fourier branches retain the reported Rust host fallback. No C++ golden.
+//! Fourier branches use the direct truncated transform. No C++ golden.
 use super::cpu::*;
 use crate::error::{Error, Result};
 use crate::model::{
@@ -12,8 +12,8 @@ use crate::runtime::{
 };
 use lightnet_cuda::{ElementwiseLaunchConfig, F32ActivationKind, F32TensorOpsBackend};
 
-pub(crate) fn needs_host(spec: &CliffordSpec) -> bool {
-    has_fourier(spec)
+pub(crate) fn needs_host(_spec: &CliffordSpec) -> bool {
+    false
 }
 
 fn device_error(error: impl std::fmt::Display) -> Error {
@@ -66,7 +66,7 @@ pub(crate) struct DeviceCache<T> {
     gamma: T,
     normalized: T,
     local: Option<LocalCache<T>>,
-    global: Option<(T, BranchCache<T>)>,
+    global: Option<(T, BranchCache<T>, Option<(T, T)>)>,
     mixed: T,
     scale: T,
     mask: T,
@@ -325,12 +325,21 @@ where B::Error: std::fmt::Display {
             Some(LocalCache { determinant, depthwise, context_pre, context, branch })
         } else { None };
         let global = if has_global(spec) {
-            let pooled = self.backend.avgpool_f32(&normalized, &[layer.input_shape.batch, c, 1, 1],
-                c, layer.input_shape.height, layer.input_shape.width, config).map_err(device_error)?;
-            let params = params.global.as_ref().ok_or_else(|| Error::InvalidConfig("[clifford] missing global weights".to_owned()))?;
-            let branch = op.branch(spec, params, &normalized, &normalized, &pooled, true)?;
+            let fourier = if has_fourier(spec) {
+                let f = params.fourier.as_ref().ok_or_else(|| Error::InvalidConfig("[clifford] missing Fourier weights".to_owned()))?;
+                Some((op.upload(&f.real)?, op.upload(&f.imaginary)?))
+            } else { None };
+            let context = if let Some((wr, wi)) = &fourier {
+                self.backend.clifford_fourier_f32(&normalized, wr, wi, layer.input_shape.batch, c,
+                    layer.input_shape.height, layer.input_shape.width, spec.fno_modes_h, spec.fno_modes_w, config).map_err(device_error)?
+            } else {
+                self.backend.avgpool_f32(&normalized, &[layer.input_shape.batch, c, 1, 1],
+                    c, layer.input_shape.height, layer.input_shape.width, config).map_err(device_error)?
+            };
+            let global_params = params.global.as_ref().ok_or_else(|| Error::InvalidConfig("[clifford] missing global weights".to_owned()))?;
+            let branch = op.branch(spec, global_params, &normalized, &normalized, &context, fourier.is_none())?;
             mixed = op.add(&mixed, &op.mul(&branch.gate, &branch.projection.output)?)?;
-            Some((pooled, branch))
+            Some((context, branch, fourier))
         } else { None };
         let scale = op.upload(&params.layer_scale)?;
         let mask = op.upload(mask)?;
@@ -396,13 +405,20 @@ where B::Error: std::fmt::Display {
             gradients.determinant_biases = op.host(&db)?;
             d_norm = op.add(&d_norm, &dn)?;
         }
-        if let Some((pooled, global)) = &cache.global {
+        if let Some((context, global, fourier)) = &cache.global {
             let (dn, ds, dc, branch_gradient) = op.branch_backward(spec, global, &cache.normalized,
-                pooled, true, &d_mixed, None)?;
+                context, fourier.is_none(), &d_mixed, None)?;
             gradients.global = Some(branch_gradient);
-            let d_pooled = self.backend.avgpool_backward_f32(&dc, &op.dims(c), c,
-                cache.shape.height, cache.shape.width, config).map_err(device_error)?;
-            d_norm = op.add(&op.add(&op.add(&d_norm, &dn)?, &ds)?, &d_pooled)?;
+            let d_context = if let Some((wr, wi)) = fourier {
+                let (dx, dw, dv) = self.backend.clifford_fourier_backward_f32(&cache.normalized, &dc, wr, wi,
+                    cache.shape.batch, c, cache.shape.height, cache.shape.width, spec.fno_modes_h, spec.fno_modes_w, config).map_err(device_error)?;
+                let f = gradients.fourier.as_mut().ok_or_else(|| Error::InvalidConfig("[clifford] missing Fourier gradients".to_owned()))?;
+                f.real = op.host(&dw)?; f.imaginary = op.host(&dv)?; dx
+            } else {
+                self.backend.avgpool_backward_f32(&dc, &op.dims(c), c,
+                    cache.shape.height, cache.shape.width, config).map_err(device_error)?
+            };
+            d_norm = op.add(&op.add(&op.add(&d_norm, &dn)?, &ds)?, &d_context)?;
         }
         let d_rows = op.rows(&d_norm, c)?;
         let dx_rows = self.backend.layernorm_backward_f32(&d_rows, &cache.input_rows, Some(&cache.gamma),
@@ -427,6 +443,11 @@ where B::Error: std::fmt::Display {
             (Some(train), Some(gradient)) => stage_branch(train, gradient)?,
             (None, None) => {}
             _ => return Err(Error::InvalidConfig("[clifford] global train buffer mismatch".to_owned())),
+        }
+        match (&mut train.fourier, &gradients.fourier) {
+            (Some(t), Some(g)) => { stage(&mut t.real_updates, &g.real)?; stage(&mut t.imaginary_updates, &g.imaginary)?; }
+            (None, None) => {}
+            _ => return Err(Error::InvalidConfig("[clifford] Fourier train buffer mismatch".to_owned())),
         }
         if train.depthwise.len() != gradients.depthwise.len() {
             return Err(Error::InvalidConfig("[clifford] depthwise train buffer count mismatch".to_owned()));

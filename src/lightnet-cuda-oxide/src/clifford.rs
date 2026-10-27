@@ -11,6 +11,43 @@ fn geometry(batch: usize, channels: usize, spatial: usize) -> Result<usize, Oxid
 }
 
 impl OxideBackend {
+pub(crate) fn clifford_fourier_native(
+    &self, input: &OxideTensorF32, grad: Option<&OxideTensorF32>, wr: &OxideTensorF32, wi: &OxideTensorF32,
+    batch: usize, channels: usize, height: usize, width: usize, mh: usize, mw: usize,
+    config: ElementwiseLaunchConfig,
+) -> Result<(OxideTensorF32, Option<(OxideTensorF32, OxideTensorF32)>), OxideError> {
+    let spatial = height.checked_mul(width).ok_or_else(|| OxideError::Shape("Fourier spatial overflow".into()))?;
+    let modes = mh.checked_mul(mw).filter(|&n| n > 0).ok_or_else(|| OxideError::Shape("Fourier modes invalid".into()))?;
+    let len = geometry(batch, channels, spatial)?;
+    let weights = channels.checked_mul(modes).ok_or_else(|| OxideError::Shape("Fourier weights overflow".into()))?;
+    let coeffs = batch.checked_mul(weights).ok_or_else(|| OxideError::Shape("Fourier coefficients overflow".into()))?;
+    let input = self.f32v(input)?; let wr = self.f32v(wr)?; let wi = self.f32v(wi)?;
+    let grad = grad.map(|g| self.f32v(g)).transpose()?;
+    if input.len() != len || wr.len() != weights || wi.len() != weights || grad.as_ref().is_some_and(|g| g.len() != len) {
+        return Err(OxideError::Shape("Fourier length mismatch".into()));
+    }
+    let mut re = self.alloc_uninit(coeffs)?; let mut im = self.alloc_uninit(coeffs)?;
+    // SAFETY: validated sizes and each thread owns one coefficient or output.
+    unsafe { self.clifford.clifford_fourier_coeff(&self.stream, launch::elementwise(coeffs, config),
+        &input.buf, &mut re, &mut im, width, height, mh, mw) }.map_err(launch_err)?;
+    let mut out = self.alloc_uninit(len)?;
+    if let Some(grad) = grad {
+        let mut dre = self.alloc_uninit(coeffs)?; let mut dim = self.alloc_uninit(coeffs)?;
+        unsafe { self.clifford.clifford_fourier_coeff(&self.stream, launch::elementwise(coeffs, config),
+            &grad.buf, &mut dre, &mut dim, width, height, mh, mw) }.map_err(launch_err)?;
+        unsafe { self.clifford.clifford_fourier_synthesis(&self.stream, launch::elementwise(len, config),
+            &dre, &dim, &wr.buf, &wi.buf, &mut out, channels, width, height, mh, mw, true) }.map_err(launch_err)?;
+        let mut dw = self.alloc_uninit(weights)?; let mut dv = self.alloc_uninit(weights)?;
+        unsafe { self.clifford.clifford_fourier_weights(&self.stream, launch::elementwise(weights, config),
+            &re, &im, &dre, &dim, &mut dw, &mut dv, batch, channels, spatial, mh, mw) }.map_err(launch_err)?;
+        Ok((OxideTensorF32::new(out, &[batch, channels, height, width]), Some((OxideTensorF32::new(dw, &[channels, modes]), OxideTensorF32::new(dv, &[channels, modes])))))
+    } else {
+        unsafe { self.clifford.clifford_fourier_synthesis(&self.stream, launch::elementwise(len, config),
+            &re, &im, &wr.buf, &wi.buf, &mut out, channels, width, height, mh, mw, false) }.map_err(launch_err)?;
+        Ok((OxideTensorF32::new(out, &[batch, channels, height, width]), None))
+    }
+}
+
     pub(crate) fn clifford_interaction_native(
         &self, state: &OxideTensorF32, context: &OxideTensorF32,
         batch: usize, channels: usize, spatial: usize, shift: usize,

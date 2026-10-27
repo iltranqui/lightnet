@@ -6830,6 +6830,18 @@ impl F32TensorOpsBackend for OxideBackend {
         )
     }
 
+fn clifford_fourier_f32(&self, input: &Self::Tensor, wr: &Self::Tensor, wi: &Self::Tensor,
+    batch: usize, channels: usize, height: usize, width: usize, mh: usize, mw: usize,
+    config: ElementwiseLaunchConfig) -> Result<Self::Tensor, Self::Error> {
+    self.clifford_fourier_native(input, None, wr, wi, batch, channels, height, width, mh, mw, config).map(|v| v.0)
+}
+fn clifford_fourier_backward_f32(&self, input: &Self::Tensor, grad: &Self::Tensor, wr: &Self::Tensor, wi: &Self::Tensor,
+    batch: usize, channels: usize, height: usize, width: usize, mh: usize, mw: usize,
+    config: ElementwiseLaunchConfig) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+    let (dx, weights) = self.clifford_fourier_native(input, Some(grad), wr, wi, batch, channels, height, width, mh, mw, config)?;
+    let (dw, dv) = weights.expect("backward returns weight gradients"); Ok((dx, dw, dv))
+}
+
     fn clifford_interaction_f32(
         &self, state: &Self::Tensor, context: &Self::Tensor,
         batch: usize, channels: usize, spatial: usize, shift: usize,

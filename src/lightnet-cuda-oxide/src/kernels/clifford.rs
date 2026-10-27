@@ -133,4 +133,58 @@ pub mod kernels {
         }
         if let Some(dst) = output.get_mut(idx) { *dst = value; }
     }
+#[kernel]
+pub fn clifford_fourier_coeff(input: &[f32], mut re: DisjointSlice<f32>, mut im: DisjointSlice<f32>,
+    width: usize, height: usize, modes_h: usize, modes_w: usize) {
+    let idx = thread::index_1d(); let i = idx.get();
+    if i >= re.len() { return; }
+    let modes = modes_h * modes_w; let mode = i % modes;
+    let kh = mode / modes_w; let kw = mode % modes_w;
+    let spatial = width * height; let start = (i / modes) * spatial;
+    let mut a = 0.0; let mut b = 0.0;
+    for y in 0..height { for x in 0..width {
+        let theta = 6.283185307179586f32 * ((kh * y) as f32 / height as f32 + (kw * x) as f32 / width as f32);
+        a += input[start + y * width + x] * theta.cos();
+        b -= input[start + y * width + x] * theta.sin();
+    }}
+    if let Some(v) = re.get_mut(idx) { *v = a; }
+    if let Some(v) = im.get_mut(thread::index_1d()) { *v = b; }
+}
+
+#[kernel]
+pub fn clifford_fourier_synthesis(re: &[f32], im: &[f32], wr: &[f32], wi: &[f32],
+    mut out: DisjointSlice<f32>, channels: usize, width: usize, height: usize,
+    modes_h: usize, modes_w: usize, adjoint: bool) {
+    let idx = thread::index_1d(); let i = idx.get(); if i >= out.len() { return; }
+    let spatial = width * height; let modes = modes_h * modes_w;
+    let p = i % spatial; let channel = (i / spatial) % channels;
+    let start = (i / spatial) * modes; let mut value = 0.0;
+    for mode in 0..modes {
+        let kh = mode / modes_w; let kw = mode % modes_w;
+        let theta = 6.283185307179586f32 * ((kh * (p / width)) as f32 / height as f32 + (kw * (p % width)) as f32 / width as f32);
+        let a = re[start + mode]; let b = im[start + mode];
+        let u = wr[channel * modes + mode]; let v = wi[channel * modes + mode];
+        let (yr, yi) = if adjoint { (a * u + b * v, -a * v + b * u) } else { (a * u - b * v, a * v + b * u) };
+        let mult = if kw == 0 { 1.0 } else { 2.0 };
+        value += mult * (yr * theta.cos() - yi * theta.sin()) / spatial as f32;
+    }
+    if let Some(v) = out.get_mut(idx) { *v = value; }
+}
+
+#[kernel]
+pub fn clifford_fourier_weights(re: &[f32], im: &[f32], dre: &[f32], dim: &[f32],
+    mut dwre: DisjointSlice<f32>, mut dwim: DisjointSlice<f32>, batch: usize,
+    channels: usize, spatial: usize, modes_h: usize, modes_w: usize) {
+    let idx = thread::index_1d(); let i = idx.get(); if i >= dwre.len() { return; }
+    let modes = modes_h * modes_w; let kw = (i % modes) % modes_w;
+    let scale = (if kw == 0 { 1.0 } else { 2.0 }) / spatial as f32;
+    let mut a = 0.0; let mut b = 0.0;
+    for n in 0..batch { let j = n * channels * modes + i;
+        let dr = dre[j] * scale; let di = dim[j] * scale;
+        a += dr * re[j] + di * im[j]; b += -dr * im[j] + di * re[j];
+    }
+    if let Some(v) = dwre.get_mut(idx) { *v = a; }
+    if let Some(v) = dwim.get_mut(thread::index_1d()) { *v = b; }
+}
+
 }
