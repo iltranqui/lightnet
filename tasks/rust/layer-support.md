@@ -137,7 +137,7 @@ with the command given rather than trusting the number.
 | `HyperbolicFoveation` | yes | C++ | fwd | exact | pin | native Oxide predictor + warp + isotropic/anisotropic fixed-point/Newton grids; native warp, predictor and fixed-point/Newton parameter adjoints | runtime input-gradient parity directly tested; supported hybrid/cache limitations remain | no |
 | `FoveationFilm` | alias | C++ | fwd | exact | T4 | native Oxide f32 (HF source/cache host-managed) | native FiLM adjoint + host HF backward; host SGD/Adam updates | no |
 | `Vit` | yes | C++ | fwd | exact | pin | native f32 inference (flash/non-flash, no MSA/VC, head_dim<=128, mapped activation; v0.2.198) / host for training | cpu | no |
-| `Swin` | alias | Rust | fwd | exact | pin | host | cpu | no |
+| `Swin` | alias | Rust | fwd | exact | pin | native f32 training forward/backward incl. Revleaky (v0.2.199); unsupported variants host | cpu | no |
 | `TuckerAttention` | alias | C++ | fwd | exact | pin | host | cpu | no |
 | `MambaVision` | alias | C++ | fwd | exact | pin | host | cpu | no |
 | `KimiKda` | alias | C++ | fwd | exact | pin | host | cpu | no |
@@ -246,7 +246,7 @@ layer count.
 |---|---|---|
 | `Dcnv4` excluded/mixed variants | host round trip (>961 points, unsupported activation or another fallback layer) | remaining unsupported/unknown activations and larger kernels; BN and NormalizeChannels* math native since v0.2.014/015; Revleaky native since v0.2.026; 961-point bound since v0.2.111 |
 | `Vit` | host round trip for training, MSA, VC attention, head_dim>128, unmapped activation | device attention/MLP backward (flash dQ/dK/dV primitives exist) |
-| `Swin` | host round trip | device windowed-attention backward |
+| `Swin` | native f32 forward/backward for supported variants, including Revleaky | unsupported variants retain host fallback |
 | `TuckerAttention` | host round trip | device low-rank factor backward |
 | `MambaVision` | host round trip | device selective-scan backward |
 | `KimiKda` | host round trip | device delta-rule backward |
@@ -279,7 +279,8 @@ no compact arm, so compact and f16 inference reject them (`Vit`: "layer #0
 (vit) and parameter set are inconsistent"). `Vit` native inference
 (v0.2.198, `runtime/vit_gpu.rs`) runs only through `forward_with_state` with
 `training=false`; it leaves `vit_cache` empty, so a backward pass needs a
-`forward_training_with_state` forward (host path). `Swin`, `TuckerAttention`,
+`forward_training_with_state` forward (host path). `Swin` supports native f32 training forward/backward including Revleaky since
+v0.2.199 (§263); unsupported variants retain host fallback. `TuckerAttention`,
 `MambaVision` and `KimiKda` are still host round trips in both directions.
 
 `vc_attention` is worse than "forward only": it is host-reference on **all**

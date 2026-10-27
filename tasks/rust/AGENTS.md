@@ -122,7 +122,7 @@ cargo test -p lightnet-core --test cfg_corpus -j 2   # run alone; >1 h under loa
 
 - Version lines: `v0.0.NNN` is closed at `v0.0.274`. New work uses minor lines, each numbered from 1 in three digits:
   - `v0.1.NNN`: Stage 1, CPU parity of all layers (missing layers, axis alignment, CPU Muon). Incomplete; latest `v0.1.042`.
-  - `v0.2.NNN`: Stage 2, all GPU paths complete (native kernels for every layer, GPU Muon). Active under the GPU-priority override; latest `v0.2.198`, so the next free number is `v0.2.199`.
+  - `v0.2.NNN`: Stage 2, all GPU paths complete (native kernels for every layer, GPU Muon). Active under the GPU-priority override; latest `v0.2.199`, so the next free number is `v0.2.200`.
   - `v0.3.NNN`: sparse MoE, CPU and GPU (`MOE.md`). Unstarted; default sequencing starts it only when `v0.2` is complete.
   Next version = highest number in `version-map.tsv` + 1; never reuse a number.
 - Code commits are `v0.M.NNN: <what>`. Docs-only commits are `docs(rust): <what>` and take no number.
@@ -143,7 +143,7 @@ cargo test -p lightnet-core --test cfg_corpus -j 2   # run alone; >1 h under loa
 | `STATUS.md` | 1046 | Resume point: ground rules, per-version "Implemented" log, evidence gaps | Need history of a version or an evidence gap |
 | `layer-support.md` | 363 | Per-`LayerKind` CPU/GPU/f16/axis matrix + gap lists; derived from code, not prose | Checking whether a layer has a CPU port, a GPU path, or an axis pin |
 | `todo.md` | 808 | Deduplicated open items by area | Choosing next work |
-| `implemented.md` | 2745 | Consolidated done ledger (sections 1–262) | Checking whether X exists |
+| `implemented.md` | 2745 | Consolidated done ledger (sections 1–263) | Checking whether X exists |
 | `plan-open-items.md` | 292 | Waves 0–2 done; remaining scope = layer parity + axis alignment (checklist, backlog) | Dispatching the next layer task |
 | `layers.md` | 3396 | Layer Port Contract (lines 61–97) + Phase 0 TDD recipe + phase tables (end of file) | Porting a layer: read the contract and the tail only |
 | `onnx.md` | 1238 | 21-step ONNX export plan, complete (Rust-runtime numeric checks passed) | Evidence/history for `export-onnx` |
@@ -152,7 +152,7 @@ cargo test -p lightnet-core --test cfg_corpus -j 2   # run alone; >1 h under loa
 | `gui_plan.md` | 265 | Merged egui GUI plan (M0–M6); partly implemented in v0.1.019 (JSON+txt sidecars, scan/filter/nav/undo, edit model, actions, project creation, class remap, `detect-server` + worker, launcher/canvas/views/class-editor/overlay). Open: class add/delete dialog, mapped-but-unimplemented hotkeys, train runner, DarkMark file diff | GUI work |
 | `archive/` | - | Superseded `gui_iced_plan.md`, `gui_code_phase_plan.md`; the latter holds DarkMark ground-truth tables G1–G17/D1–D16 | Citing `Gn`/`Dn` |
 | `MOE.md` | 150 | True sparse `[moe_convolutional]` plan (opt-in, CPU then GPU, dense-masked as oracle), literature, open questions | Sparse MoE work |
-| `gpu_layers_plan.md` | 673 | Operator-authorized GPU-first continuation; deconvolution, dense-head loss and ViT inference progress through v0.2.198; remaining DCNv4 variants, GPU Muon and native updates/residency open; current resume point at top | GPU layer work and resume |
+| `gpu_layers_plan.md` | 673 | Operator-authorized GPU-first continuation; deconvolution, dense-head loss, ViT inference and Swin Revleaky training progress through v0.2.199; remaining DCNv4 variants, GPU Muon and native updates/residency open; current resume point at top | GPU layer work and resume |
 | `AGENTS_fp8.md` | 105 | Low-precision fp16/bf16/fp8 goal, plans, delegation and user gates | Low-precision work |
 | `fp8_fp4.md` | 157 | FP8 GEMM / FP4 emulation design, sm_89 | FP8/FP4 design history |
 | `vit_plan.md`, `vit_notes.md` | 71 | `[vit]` subplan and source audit | ViT / attention work |
@@ -163,7 +163,7 @@ cargo test -p lightnet-core --test cfg_corpus -j 2   # run alone; >1 h under loa
 
 ## Current State
 
-- The active line is `v0.2` under the GPU-priority override. Latest version is `v0.2.198` (native f32 ViT inference forward, `implemented.md` §262); `v0.2.197` added native Segmentation loss/delta, `v0.2.196` native JevCe loss/delta, and `v0.2.193`–`v0.2.195` finished deconvolution channel normalization plus compact f32/f16 inference. Next free is `v0.2.199`.
+- The active line is `v0.2` under the GPU-priority override. Latest version is `v0.2.199` (native Swin Revleaky training forward/backward, `implemented.md` §263); `v0.2.198` added native f32 ViT inference forward, `v0.2.197` added native Segmentation loss/delta, `v0.2.196` native JevCe loss/delta, and `v0.2.193`–`v0.2.195` finished deconvolution channel normalization plus compact f32/f16 inference. Next free is `v0.2.200`.
 - The layer-layout move is in progress: host code and most small device arms are under `lightnet-core/src/layers/<layer>/`; see the [Layout Move Queue](#layout-move-queue) for what is done and open. These moves are `refactor(rust):` commits with no version number.
 - Per-kind CPU/GPU/f16/axis status is tabulated in `layer-support.md`; use it instead of re-deriving from plan prose.
 - Waves 0–2 of `plan-open-items.md` are complete: Waves 0–1 (v0.0.247–253) closed the OBB CPU training gaps; Wave 2 implemented ONNX export (`v0.0.254`–`v0.0.257`) and completed docs as `2b998051`; v0.0.258 adds caller-supplied CARPN mAP dispatch.
@@ -183,13 +183,13 @@ Default order across release lines (the current GPU-priority operator override a
 2. **v0.2 / Stage 2, GPU for all:** give every layer a native GPU path, including layers that currently only have a host round-trip fallback (`swin`, `tucker_attention`, `mambavision`, `kimi_kda`, `dcnv4`, `laya_*`, ...), plus GPU Muon. A host fallback is only interim; completion requires native cuda-oxide kernels with CPU-parity tests (`./tools/test_oxide.sh`). Mark each layer's GPU status (native / host fallback / none) in `implemented.md`.
 3. **v0.3 / Stage 3, sparse MoE:** implement the opt-in true sparse path per `MOE.md`, CPU then GPU, after v0.2 is complete.
 
-Stage 1 remains incomplete; the latest version-mapped CPU increment is v0.1.042. The operator explicitly authorized GPU priority: continue bounded native work per `gpu_layers_plan.md`, retaining CPU gaps and leaving v0.3 unstarted. The latest version-mapped GPU increment is v0.2.198. Recent versioned work: v0.2.194 compact f32 deconvolution, v0.2.195 compact f16 deconvolution, v0.2.196 native JevCe loss/delta, v0.2.197 native Segmentation loss/delta, and v0.2.198 native f32 ViT inference forward. The WMHF primitives are not a runtime GPU path; keep its GPU support marked incomplete.
+Stage 1 remains incomplete; the latest version-mapped CPU increment is v0.1.042. The operator explicitly authorized GPU priority: continue bounded native work per `gpu_layers_plan.md`, retaining CPU gaps and leaving v0.3 unstarted. The latest version-mapped GPU increment is v0.2.199. Recent versioned work: v0.2.194 compact f32 deconvolution, v0.2.195 compact f16 deconvolution, v0.2.196 native JevCe loss/delta, v0.2.197 native Segmentation loss/delta, v0.2.198 native f32 ViT inference forward, and v0.2.199 native Swin Revleaky training forward/backward. The WMHF primitives are not a runtime GPU path; keep its GPU support marked incomplete.
 
 **Device completion queue.** Work through this list in order, after the open items in the [Layout Move Queue](#layout-move-queue). Each item ends with the layer meeting the [Layer Completion Contract](#layer-completion-contract). The current state of each layer is in `layer-support.md`.
 
 1. Transformer family, which shares kernels (LayerNorm, GEMM, flash attention, mHC residual):
    - `vit`: device backward (flash dQ/dK/dV primitives exist), a `forward_compact` arm, and a training path that fills the cache natively, so the host fallback is no longer needed for training.
-   - `swin`, `tucker_attention`, `mambavision`, `kimi_kda`: native forward and backward; today they are host round trips in both directions.
+   - `swin`: extend native forward and backward beyond supported variants, including the v0.2.199 Revleaky training path; `tucker_attention`, `mambavision`, `kimi_kda`: native forward and backward remain open.
    - `depth_anything` and `dpt_head`: native forward after `vit`, then backward.
 2. Layers with device primitives but no runtime path: `wmhf` (Haar DWT/IWT, scan, split, gate and high-frequency primitives exist; the seven convolution branches do not), then `clifford`, `recursive_block`.
 3. Layers with no device path and a CPU gap: `yolo_3d` (needs the v0.1 loss and decode work first) and `obb_refine`/CARPN (CPU training first).
@@ -202,7 +202,7 @@ A host fallback listed in `layer-support.md` is interim until the layer passes t
 
 **Sparse MoE (also in scope):** `[moe_convolutional]` currently runs every expert and masks the output (same as C++). `MOE.md` plans an opt-in true sparse path (CPU first, then GPU) that must equal the dense-masked result.
 
-Current gaps and completed CPU work (see `implemented.md`, `todo.md`, `layer-support.md`, and `STATUS.md`; latest version-mapped CPU increment is v0.1.042 and GPU increment is v0.2.198):
+Current gaps and completed CPU work (see `implemented.md`, `todo.md`, `layer-support.md`, and `STATUS.md`; latest version-mapped CPU increment is v0.1.042 and GPU increment is v0.2.199):
 
 1. **`[yolo_3d]` remains a partial v0.1 layer, not a complete port.** The `depth_3d` source confirms scope, and `[dpt_head]` is CPU-ported. The accepted `yolo_3d_plan.md` supersedes the draft; S1–S13 are transcribed in `yolo_3d_notes.md`. v0.1.024 adds config/spec/shape helpers; v0.1.025 adds standalone label/truth helpers; v0.1.026 integrates network aliases/shared class-K validation and weightless raw CPU forward/exact supplied-seed backward, with checkpoint/optimizer and legacy consumer/GPU rejection tests (`implemented.md` §§38–40). The `yolo_3d` filter passes 42 core + 1 CLI tests. Next: projected math/assignments/loss and exact derivatives, standalone/mixed training APIs consuming truths and map/counter metadata, decode/evaluator and the A2 output-axis pin; then depth/metric CPU support. Seeded optimizer tests are not full loss-to-conv training evidence; all legacy detector consumers still reject cuboid networks. Axis status remains Open, GPU status none, no compiled-C++ golden. The plan's projected version numbers are stale; use `version-map.tsv` and never reuse them.
 2. **DSConv multi-template `morph=0/1` is required for full source parity and remains an open v0.1 gap.** The executable C++ CPU forward implements multi-view averaging and training-time view dropout (`Jev_laya:src-lib/dsconv_layer.cpp:597-638`), although the header calls it experimental and the CPU backward is a stub. Rust v0.1.002 explicitly rejects it. Treat the variant as a separate Opus-planned task covering cached active views and exact gradients for all offset blocks; do not claim full DSConv parity yet.

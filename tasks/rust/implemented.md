@@ -274,6 +274,13 @@ file is named inline.
 - [254. fp16 convergence verdict (plan_fp16 Task 5)](#254-fp16-convergence-verdict-plan_fp16-task-5)
 - [255. FP8 delayed-history pool-incarnation fix](#255-fp8-delayed-history-pool-incarnation-fix)
 - [256. Stable FP8 delayed-history site keys](#256-stable-fp8-delayed-history-site-keys)
+- [257. Native deconvolution channel normalization](#257-native-deconvolution-channel-normalization)
+- [258. Deconvolution in compact inference](#258-deconvolution-in-compact-inference)
+- [259. Deconvolution in compact f16 inference](#259-deconvolution-in-compact-f16-inference)
+- [260. Native JevCe loss and delta](#260-native-jevce-loss-and-delta)
+- [261. Native Segmentation loss and delta](#261-native-segmentation-loss-and-delta)
+- [262. Native ViT inference forward](#262-native-vit-inference-forward)
+- [263. Native Swin Revleaky training forward and backward](#263-native-swin-revleaky-training-forward-and-backward)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -2743,3 +2750,17 @@ tol 2e-4); `cargo xtask test vit` 33 passed after two host tests were updated
 (inference compared with tolerance, backward test uses
 `forward_training_with_state`). Runs uncapped (`systemd-run --user`
 unavailable). No training run, no full-suite claim. Tag `v0.2.198`.
+
+## 263. Native Swin Revleaky training forward and backward
+
+v0.2.199 (`204424c69058c421b5c514f9c44d93e530a0641a`). `swin/gpu.rs`
+maps `Activation::Revleaky` to the device Leaky operation, allowing native Swin
+training forward and backward for this activation. The
+`swin_revleaky_native_training_backward_and_update_match_cpu` test compares
+forward output, gradients and updated parameters with the Rust CPU reference.
+
+Evidence: `cargo xtask check` and `cargo xtask gpu-check` passed;
+`cargo xtask test swin` passed 28 tests and `cargo xtask oxide --test
+oxide_swin` passed 5 tests. Tolerances were 2e-4 for forward and 5e-4 for
+gradients and parameters. The reference is hand-derived from source; no
+compiled-C++ golden exists. Tag `v0.2.199`.
