@@ -7,6 +7,7 @@ mod clifford;
 mod dcnv4_native;
 mod deconvolutional;
 mod channel_shuffle_backend;
+mod clifford_backend;
 mod gelu_erf_backend;
 mod softmax_backend;
 mod reorg_backend;
@@ -10655,7 +10656,7 @@ impl F32TensorOpsBackend for OxideBackend {
         batch: usize, channels: usize, spatial: usize, shift: usize,
         inner: bool, pooled: bool, config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        self.clifford_interaction_native(state, context, batch, channels, spatial, shift, inner, pooled, config)
+        self.clifford_backend_interaction_f32(state, context, batch, channels, spatial, shift, inner, pooled, config)
     }
 
     fn clifford_interaction_backward_f32(
@@ -10663,7 +10664,7 @@ impl F32TensorOpsBackend for OxideBackend {
         batch: usize, channels: usize, spatial: usize, shift: usize,
         inner: bool, pooled: bool, config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
-        self.clifford_interaction_backward_native(state, context, grad, batch, channels, spatial, shift, inner, pooled, config)
+        self.clifford_backend_interaction_backward_f32(state, context, grad, batch, channels, spatial, shift, inner, pooled, config)
     }
 
     fn clifford_residual_f32(
@@ -10671,7 +10672,7 @@ impl F32TensorOpsBackend for OxideBackend {
         mask: &Self::Tensor, batch: usize, channels: usize, spatial: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
-        self.clifford_residual_native(input, mixed, scale, mask, batch, channels, spatial, config)
+        self.clifford_backend_residual_f32(input, mixed, scale, mask, batch, channels, spatial, config)
     }
 
     fn clifford_residual_backward_f32(
@@ -10679,7 +10680,7 @@ impl F32TensorOpsBackend for OxideBackend {
         mask: &Self::Tensor, batch: usize, channels: usize, spatial: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
-        self.clifford_residual_backward_native(mixed, grad, scale, mask, batch, channels, spatial, config)
+        self.clifford_backend_residual_backward_f32(mixed, grad, scale, mask, batch, channels, spatial, config)
     }
 
     fn swin_window_partition_f32(
