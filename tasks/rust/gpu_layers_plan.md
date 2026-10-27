@@ -28,10 +28,13 @@ deliverable. Sparse MoE remains unstarted.
 
 ## Resume point
 
+v0.2.201 adds native RecursiveBlock forward/backward for static bodies containing
+`channel_shuffle`, using the existing shuffle kernel and its inverse (§265);
+other variants remain host. The next free version is v0.2.202.
 v0.2.200 adds native Clifford Fourier forward/backward using a direct truncated
 transform and Oxide coefficient, synthesis and parameter-gradient kernels;
 CPU-reference forward and gradient parity passed (§264). The network-wide CPU
-backward fallback is unchanged. The next free version is v0.2.201.
+backward fallback is unchanged.
 v0.2.199 added native Swin Revleaky training forward/backward (§263).
 
 Marker gather is native in f32 full/compact forward/backward and f16 compact

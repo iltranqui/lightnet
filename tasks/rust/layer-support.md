@@ -83,7 +83,7 @@ with the command given rather than trusting the number.
 
 ## Counts
 
-These counts are a historical snapshot and do not include v0.2.200 Clifford Fourier support.
+These counts are a historical snapshot and do not include v0.2.200 Clifford Fourier or v0.2.201 RecursiveBlock channel shuffle support.
 
 | Status | Count |
 |---|---|
@@ -135,7 +135,7 @@ These counts are a historical snapshot and do not include v0.2.200 Clifford Four
 | `DsConv` | alias | C++ | fwd | exact | T4 | native Oxide f32 for single-template morph=0/1/2 | native f32 backward; host-staged SGD/Adam and hybrid GPU Muon | no |
 | `Wmhf` | alias | C++ | fwd | exact | T4 | none | none | no |
 | `Clifford` | yes | C++ | fwd | exact | T4 | native Fourier forward (v0.2.200) | cpu (network-wide fallback unchanged; native Fourier adjoint available) | no |
-| `RecursiveBlock` | alias | body only | fwd | exact | T1 | none | none | no |
+| `RecursiveBlock` | alias | body only | fwd | exact | T1 | native for static bodies containing channel_shuffle; other variants host | native for static bodies containing channel_shuffle; other variants host | no |
 | `HyperbolicFoveation` | yes | C++ | fwd | exact | pin | native Oxide predictor + warp + isotropic/anisotropic fixed-point/Newton grids; native warp, predictor and fixed-point/Newton parameter adjoints | runtime input-gradient parity directly tested; supported hybrid/cache limitations remain | no |
 | `FoveationFilm` | alias | C++ | fwd | exact | T4 | native Oxide f32 (HF source/cache host-managed) | native FiLM adjoint + host HF backward; host SGD/Adam updates | no |
 | `Vit` | yes | C++ | fwd | exact | pin | native f32 inference (flash/non-flash, no MSA/VC, head_dim<=128, mapped activation; v0.2.198) / host for training | cpu | no |
@@ -174,7 +174,7 @@ These counts are a historical snapshot and do not include v0.2.200 Clifford Four
 ## GPU hard rejections (no device path at all)
 
 This historical list recorded seven variants (plus `Gru` training) aborting before
-any kernel runs; Clifford's current Fourier support is noted below. Source: the explicit rejection
+any kernel runs; current Clifford and RecursiveBlock support is noted below. Source: the explicit rejection
 paths in `runtime.rs` (including the `Gru` match arm). `DsConv` is no longer a
 f32 hard rejection; compact f16 remains unsupported, and multi-template CPU
 modes remain unsupported.
@@ -182,7 +182,7 @@ modes remain unsupported.
 | Variant | Rejection message | Why it exists | Work item |
 |---|---|---|---|
 | `Wmhf` | same | Stage-1 CPU only (DWT + EMA scan + 7 sub-convs) | container/XL wave |
-| `RecursiveBlock` | same | Stage-1 CPU only; full-recurrence gradient | container/XL wave |
+| `RecursiveBlock` | historical rejection | Static bodies containing channel_shuffle have native forward/backward since v0.2.201; other variants remain host | complete remaining variants |
 | `Clifford` | historical rejection | Native Fourier forward/backward landed in v0.2.200; network-wide CPU backward fallback remains | complete runtime integration |
 | `DepthAnything` | same | frozen DINOv2 ViT-S/14 | attention wave (after ViT backward) |
 | `DptHead` | same | four-tap fusion neck over DPT features | attention wave |

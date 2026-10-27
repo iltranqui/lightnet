@@ -282,6 +282,7 @@ file is named inline.
 - [262. Native ViT inference forward](#262-native-vit-inference-forward)
 - [263. Native Swin Revleaky training forward and backward](#263-native-swin-revleaky-training-forward-and-backward)
 - [264. Native Clifford Fourier forward and backward](#264-native-clifford-fourier-forward-and-backward)
+- [265. Native RecursiveBlock channel shuffle forward and backward](#265-native-recursiveblock-channel-shuffle-forward-and-backward)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -2778,3 +2779,17 @@ forward and gradients with CPU at tolerances 2e-4 and 5e-4 respectively.
 clifford` passed 14 tests and `cargo xtask oxide --test oxide_clifford` passed
 5. Hand-derived from source; no compiled-C++ golden. The network-wide CPU
 backward fallback is unchanged. Tag `v0.2.200`.
+
+## 265. Native RecursiveBlock channel shuffle forward and backward
+
+v0.2.201 (`74db0cb95b131a47bf558dc0eee8232d8f1245d3`) adds native
+`recursive_block` forward and backward for static bodies containing
+`channel_shuffle`. `recursive_block/gpu.rs` uses the existing shuffle kernel
+and its inverse for backward. Other variants remain on the host.
+
+Evidence: `recursive_channel_shuffle_native_forward_and_gradients_match_cpu`
+compares CPU forward and gradients at tolerances 2e-4 and 5e-4 respectively.
+`cargo xtask check` and `cargo xtask gpu-check` passed; `cargo xtask test
+recursive_block` passed 11 tests and `cargo xtask oxide --test
+oxide_recursive_block` passed 2. Hand-derived from source; no compiled-C++
+golden. Tag `v0.2.201`.
