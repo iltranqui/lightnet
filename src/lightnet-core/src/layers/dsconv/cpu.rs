@@ -46,6 +46,98 @@ pub(crate) struct DsConvGradients {
     pub offset_biases: Vec<f32>,
 }
 
+/// Per-view caches preserve the exact sampling plans selected by forward.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DsConvMultiViewCache {
+    active: Vec<bool>,
+    views: Vec<Option<DsConvForwardCache>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct DsConvMultiViewGradients {
+    pub shared: DsConvGradients,
+    pub extra_offset_weights: Vec<Vec<f32>>,
+}
+
+pub(crate) fn dsconv_multi_view_forward(
+    input: &Tensor,
+    output_shape: TensorShape,
+    spec: &DsConvSpec,
+    weights: &[f32],
+    biases: &[f32],
+    offset_weights: &[f32],
+    offset_biases: &[f32],
+    extra: &[Vec<f32>],
+    active: &[bool],
+) -> Result<(Tensor, DsConvMultiViewCache)> {
+    let count = spec.templates.checked_mul(2).ok_or_else(|| invalid("view count overflows"))?;
+    if spec.templates < 2 || spec.morph > 1 || extra.len() != count - 2
+        || active.len() != count || !active.iter().any(|&v| v)
+        || extra.iter().any(|block| block.len() != offset_weights.len())
+    {
+        return Err(invalid("invalid multi-view specification, offset blocks, or active mask"));
+    }
+    let mut single = spec.clone();
+    single.templates = 1;
+    let mut output = Tensor::zeros(output_shape);
+    let mut views = vec![None; count];
+    let scale = 1.0 / active.iter().filter(|&&v| v).count() as f32;
+    let zero_bias = vec![0.0; biases.len()];
+    for slot in 0..count {
+        if !active[slot] { continue; }
+        single.morph = if slot % 2 == 0 { spec.morph } else { 1 - spec.morph };
+        let block = if slot < 2 { offset_weights } else { &extra[slot - 2] };
+        let (view, cache) = dsconv_forward(input, output_shape, &single, weights, &zero_bias, block, offset_biases)?;
+        for (dst, value) in output.data.iter_mut().zip(view.data) { *dst += scale * value; }
+        views[slot] = Some(cache);
+    }
+    let area = output_shape.width * output_shape.height;
+    for batch in 0..output_shape.batch {
+        for channel in 0..output_shape.channels {
+            for value in &mut output.data[(batch * output_shape.channels + channel) * area..][..area] {
+                *value += biases[channel];
+            }
+        }
+    }
+    Ok((output, DsConvMultiViewCache { active: active.to_vec(), views }))
+}
+
+pub(crate) fn dsconv_multi_view_backward(
+    input: &Tensor, spec: &DsConvSpec, weights: &[f32], offset_weights: &[f32],
+    extra: &[Vec<f32>], cache: &DsConvMultiViewCache, output_gradient: &[f32],
+) -> Result<DsConvMultiViewGradients> {
+    let count = spec.templates.checked_mul(2).ok_or_else(|| invalid("view count overflows"))?;
+    if spec.templates < 2 || spec.morph > 1 || cache.active.len() != count
+        || cache.views.len() != count || extra.len() != count - 2
+        || extra.iter().any(|block| block.len() != offset_weights.len())
+        || !cache.active.iter().any(|&v| v)
+        || cache.active.iter().zip(&cache.views).any(|(&active, view)| active != view.is_some())
+    { return Err(invalid("invalid multi-view cache or offset blocks")); }
+    let scale = 1.0 / cache.active.iter().filter(|&&v| v).count() as f32;
+    let scaled: Vec<f32> = output_gradient.iter().map(|v| v * scale).collect();
+    let mut result = DsConvMultiViewGradients {
+        shared: DsConvGradients { input: vec![0.0; input.data.len()], weights: vec![0.0; weights.len()],
+            biases: vec![0.0; spec.filters], offset_weights: vec![0.0; offset_weights.len()],
+            offset_biases: vec![0.0; 2 * spec.size] },
+        extra_offset_weights: extra.iter().map(|block| vec![0.0; block.len()]).collect(),
+    };
+    let mut single = spec.clone();
+    single.templates = 1;
+    for slot in 0..count {
+        let Some(view) = &cache.views[slot] else { continue; };
+        single.morph = if slot % 2 == 0 { spec.morph } else { 1 - spec.morph };
+        let block = if slot < 2 { offset_weights } else { &extra[slot - 2] };
+        let g = dsconv_backward(input, &single, weights, block, view, &scaled)?;
+        for (dst, value) in result.shared.input.iter_mut().zip(g.input) { *dst += value; }
+        for (dst, value) in result.shared.weights.iter_mut().zip(g.weights) { *dst += value; }
+        for (dst, value) in result.shared.biases.iter_mut().zip(g.biases) { *dst += value; }
+        for (dst, value) in result.shared.offset_biases.iter_mut().zip(g.offset_biases) { *dst += value; }
+        let dst = if slot < 2 { &mut result.shared.offset_weights } else { &mut result.extra_offset_weights[slot - 2] };
+        for (dst, value) in dst.iter_mut().zip(g.offset_weights) { *dst += value; }
+    }
+    Ok(result)
+}
+
 fn invalid(message: impl Into<String>) -> Error {
     Error::InvalidConfig(format!("[dsconv]: {}", message.into()))
 }
@@ -675,6 +767,42 @@ pub(crate) fn dsconv_backward(
 mod tests {
     use super::*;
     use crate::model::Activation;
+
+    #[test]
+    fn dsconv_multi_view_axis_layout_and_cached_backward() {
+        let input = input(1, 1, 3, 3);
+        let mut multi = spec(0, 1, 3);
+        multi.templates = 2;
+        let (_, biases, offsets, mut offset_biases) = zeros_for(&input, &multi);
+        let weights = vec![0.3, -0.2, 0.5];
+        offset_biases[0] = 0.2;
+        offset_biases[2] = -0.15;
+        offset_biases[3] = 0.1;
+        offset_biases[5] = -0.2;
+        let extra = vec![offsets.clone(), offsets.clone()];
+        let shape = TensorShape::new(3, 3, 1, 1);
+        let mask = [true, false, true, false];
+        let (out, cache) = dsconv_multi_view_forward(&input, shape, &multi, &weights, &biases,
+            &offsets, &offset_biases, &extra, &mask).unwrap();
+        let mut single = multi.clone();
+        single.templates = 1;
+        let (expected, _) = dsconv_forward(&input, shape, &single, &weights, &biases, &offsets, &offset_biases).unwrap();
+        for (a, b) in out.data.iter().zip(expected.data) { assert!((a - b).abs() < 1e-6); }
+        let seed = vec![1.0; out.data.len()];
+        let g = dsconv_multi_view_backward(&input, &multi, &weights, &offsets, &extra, &cache, &seed).unwrap();
+        let again = dsconv_multi_view_backward(&input, &multi, &weights, &offsets, &extra, &cache, &seed).unwrap();
+        assert_eq!(g, again);
+        assert!(g.extra_offset_weights[1].iter().all(|&v| v == 0.0));
+        let mut changed = extra.clone();
+        let index = 2 * 9 + 4;
+        let epsilon = 0.001;
+        changed[0][index] += epsilon;
+        let plus = dsconv_multi_view_forward(&input, shape, &multi, &weights, &biases, &offsets, &offset_biases, &changed, &mask).unwrap().0.data.iter().sum::<f32>();
+        changed[0][index] -= 2.0 * epsilon;
+        let minus = dsconv_multi_view_forward(&input, shape, &multi, &weights, &biases, &offsets, &offset_biases, &changed, &mask).unwrap().0.data.iter().sum::<f32>();
+        assert!((g.extra_offset_weights[0][index] - (plus - minus) / (2.0 * epsilon)).abs() < 0.01);
+        assert!(dsconv_multi_view_forward(&input, shape, &multi, &weights, &biases, &offsets, &offset_biases, &extra[..1], &mask).is_err());
+    }
 
     fn spec(morph: usize, filters: usize, size: usize) -> DsConvSpec {
         DsConvSpec {
