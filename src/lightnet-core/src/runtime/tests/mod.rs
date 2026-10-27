@@ -54,3 +54,6 @@ mod laya_act_gpu_tests;
 mod marker_gather_gpu_tests;
 #[path = "yolo_3d_runtime_tests.rs"]
 mod yolo_3d_runtime_tests;
+
+#[path = "dsconv_multi_tests.rs"]
+mod dsconv_multi_tests;
