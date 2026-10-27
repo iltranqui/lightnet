@@ -123,7 +123,7 @@ These counts are a historical snapshot and do not include v0.2.200 Clifford Four
 | `BatchNorm` | yes | C++ | fwd | exact | rust | native inference + batch-statistics training | device backward / host AdamW parameter update | yes |
 | `Crop` | yes | none | fwd | exact | rust | native inference + geometric training, RGB-shift and saturation/exposure HSV augmentation | device (atomic scatter) | no |
 | `Local` | yes | C++ | fwd | exact | rust | native f32 / host (unsupported activation) | device / CPU fallback | no |
-| `Gru` | yes | Rust | fwd | exact non-BN BPTT (host finite differences passed) | rust | native full/compact non-BN training/inference; rolling-stat BN inference | non-BN native backward and resident SGD/Adam/Muon; oxide_gru_training passed; BN training open | half inference and dense AMP training (GPU-tested); f32 islands remain |
+| `Gru` | yes | Rust | fwd | exact non-BN BPTT and BN training backward for all six projections (v0.1.043) | rust | native full/compact non-BN training/inference; rolling-stat BN inference | non-BN native backward and resident SGD/Adam/Muon; oxide_gru_training passed; BN training still rejects, native GPU path open and unblocked | half inference and dense AMP training (GPU-tested); f32 islands remain |
 | `Rnn` | yes | C++ | fwd | exact | T3 | native f32 inference/training incl. rolling-stat BN (supported activations) | mixed (unsupported activation host fallback) | no |
 | `Lstm` | yes | C++ | fwd | exact | T3 | native f32 inference/training incl. rolling-stat BN | mixed (unsupported variants host fallback) | no |
 | `Crnn` | yes | C++ | fwd | exact | T3 | native f32 inference/training incl. rolling-stat BN (supported activations) | mixed (unsupported activation host fallback) | no |
@@ -363,8 +363,9 @@ variants or non-layer work.
 
 ## Defects found while deriving this matrix
 
-1. GRU has native f32 inference including rolling-stat BN, but training is
-   still explicitly rejected because no backward cache/gradient path exists.
+1. GRU has native non-BN training and f32 inference including rolling-stat BN;
+   GPU BN training is still explicitly rejected. Its CPU reference is done in
+   v0.1.043, unblocking the native GPU path.
    `Local` has native f32 forward/backward math, but its optimizer remains
    host-staged.
 2. `Sam` now uses native elementwise forward/backward for supported activations;

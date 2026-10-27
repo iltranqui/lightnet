@@ -284,6 +284,7 @@ file is named inline.
 - [264. Native Clifford Fourier forward and backward](#264-native-clifford-fourier-forward-and-backward)
 - [265. Native RecursiveBlock channel shuffle forward and backward](#265-native-recursiveblock-channel-shuffle-forward-and-backward)
 - [266. Native DCNv4 for kernels above 961 points](#266-native-dcnv4-for-kernels-above-961-points)
+- [267. CPU GRU batch-normalization training backward](#267-cpu-gru-batch-normalization-training-backward)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -2810,3 +2811,9 @@ Oxide suites `oxide_dcnv4_aggregate`, `oxide_dcnv4_chain`, and
 `oxide_dcnv4_bn` passed 7, 4, and 2 tests respectively; the `dcnv4` filter
 of `oxide_runtime_chain` passed 4. Hand-derived from source, no compiled-C++
 golden. Tag `v0.2.202`.
+
+## 267. CPU GRU batch-normalization training backward
+
+v0.1.043 (`7ccfe000ce8be7c24fc0319d21ca5a56cf691ea4`) implements the exact adjoint of the Rust forward for all six GRU projections with batch normalization. As in RNN, LSTM and CRNN, forward uses rolling statistics and backward treats them as constants. `runtime/exec_accumulate.rs` accumulates BN scale gradients; `runtime/forward_layers.rs` updates rolling statistics after backward in timestep order with EMA keep 0.9. The separate BN bias array has zero gradient. GPU GRU BN training still rejects; the native GPU path is open.
+
+Evidence: `gru_bn_adjoint_each_timestep_and_three_step_bptt`, `gru_bn_rejects_inconsistent_projection_and_preserves_gpu_rejection`, and `gru_bn_accumulation_updates_stats_after_backward_and_optimizers`. `cargo xtask check` and `cargo xtask gpu-check` passed; host filters `gru`, `lstm`, `rnn`, `crnn` and `recurrent` passed 7, 4, 9, 4 and 2 tests; Oxide regression `oxide_gru_training` passed 1 and `oxide_runtime_chain` filtered by `gru` passed 3. A separate `.weights` round-trip test was not run. Hand-derived from the Rust forward, no compiled-C++ golden. Tag `v0.1.043`.

@@ -28,6 +28,10 @@ deliverable. Sparse MoE remains unstarted.
 
 ## Resume point
 
+v0.1.043 completes the CPU GRU BN training reference (§267); native GPU GRU BN
+training is the next slice and remains open. The next free CPU version is
+v0.1.044; the GPU line remains at v0.2.202, next free v0.2.203.
+
 v0.2.202 adds native DCNv4 for kernels above 961 points using per-thread
 device scratch (§266); scratch memory grows with point count. The next free
 version is v0.2.203. The mixed-network normalization cache test remains an
@@ -47,8 +51,9 @@ inference (v0.2.001–002). v0.2.149 adds compact f16 Logistic sigmoid through t
 Evidence/limits are in `implemented.md` §§41–45. Do not repeat these ports.
 Act-head uses four uncached weight uploads per forward; no residency/speedup
 claim. Runtime backward still uses CPU, act params remain frozen, f16 rejected.
-v0.2.079 adds native f32 GRU inference with rolling-stat BN and multi-step CPU
-reference parity; GPU training/backward remains explicitly unsupported (§102).
+v0.2.079 added native f32 GRU inference with rolling-stat BN and multi-step CPU
+reference parity (§102). Native non-BN training has since landed; GPU BN
+training remains explicitly unsupported, with its CPU reference now complete (§267).
 v0.2.080 extends native RNN f32 inference to rolling-stat BN by folding the
 projection affine; BN training remains on the host fallback (§103).
 v0.2.081 extends native LSTM f32 inference to rolling-stat BN across all eight
