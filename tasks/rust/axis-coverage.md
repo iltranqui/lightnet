@@ -9,7 +9,7 @@ Measured 2026-10-24 against `model.rs` (65 represented variants plus
 `Unsupported`), `Jev_laya:src-lib/darknet_enums.hpp` and the `depth_3d`
 YOLO-3D source. Represented does not imply a complete layer port:
 
-- **46 C++-backed variants pinned**; `axis_layout` selects 50 named tests,
+- **46 C++-backed LayerKind variants pinned**, with an additional DSConv multi-template contract row; `axis_layout` selects 52 named tests,
   including the Rust-only Crop contract pin and additional convolution/Swin
   probes.
 - **14 C++-backed variants open** (12 on `Jev_laya`, plus `Regression` on
@@ -98,7 +98,7 @@ classes that apply.
 
 | Status | Count | Notes |
 |---|---|---|
-| Pinned | 46 C++-backed variants; 50 `axis_layout` tests total | transformer, LAYA, MoE/EML, DCNv4/DSConv/DeformConv/GraphConv/WMHF/Clifford/DepthAnything, DPT, conv/connected, maxpool/avgpool, localavgpool, route/upsample/reorg/shuffle/softmax/scale/SAM, slice/shortcut/deconv, Logistic, RNN/LSTM/CRNN, Contrastive/JevCe/OMD, FoveationFilm, HyperbolicFoveation; one Rust-only Crop contract test |
+| Pinned | 46 C++-backed LayerKind variants, 47 contract rows; 52 `axis_layout` tests total | transformer, LAYA, MoE/EML, DCNv4/DSConv/DeformConv/GraphConv/WMHF/Clifford/DepthAnything, DPT, conv/connected, maxpool/avgpool, localavgpool, route/upsample/reorg/shuffle/softmax/scale/SAM, slice/shortcut/deconv, Logistic, RNN/LSTM/CRNN, Contrastive/JevCe/OMD, FoveationFilm, HyperbolicFoveation; one Rust-only Crop contract test |
 | Open, Tier 1 | 3 | dropout, cost, recursive block |
 | Open, Tier 2 | 11 | yolo family including partial yolo_3d, modern heads, OBB, losses, segmentation, regression |
 | Open, Tier 3 | 0 | — |
@@ -107,7 +107,7 @@ classes that apply.
 | Ports incomplete/partial | 4 | Region truth-loss/decode; yolo_3d partial; dcnv3 and detr_decoder blocked |
 
 `axis_layout` current baseline after the GRU Rust-contract, geometry/layout pins, DSConv, DeformConv, GraphConv, WMHF, Clifford and DepthAnything pins:
-**50 passed, 946 filtered out** (996 lib tests; run under `MEM=3G`). Logistic, RNN/LSTM/CRNN, Contrastive/JevCe/OMD, FoveationFilm and HyperbolicFoveation have hand-computed source-derived pins; Crop's Rust-contract pin is included. Every tier below grows that count, which must never shrink.
+**52 passed** in `cargo xtask test axis_layout` for v0.1.044; the prior baseline was 50 passed, 946 filtered out (996 lib tests; run under `MEM=3G`). Logistic, RNN/LSTM/CRNN, Contrastive/JevCe/OMD, FoveationFilm and HyperbolicFoveation have hand-computed source-derived pins; Crop's Rust-contract pin is included. Every tier below grows that count, which must never shrink.
 
 ## Pinned variants (46)
 

@@ -28,9 +28,10 @@ deliverable. Sparse MoE remains unstarted.
 
 ## Resume point
 
-v0.1.043 completes the CPU GRU BN training reference (§267); native GPU GRU BN
-training is the next slice and remains open. The next free CPU version is
-v0.1.044; the GPU line remains at v0.2.202, next free v0.2.203.
+v0.1.044 completes DSConv multi-template CPU forward and exact backward (§268);
+extra-array Muon and multi-template GPU remain open. v0.1.043 completed the CPU
+GRU BN reference (§267); native GPU GRU BN training remains open. The next free CPU version is
+v0.1.045; the GPU line remains at v0.2.202, next free v0.2.203.
 
 v0.2.202 adds native DCNv4 for kernels above 961 points using per-thread
 device scratch (§266); scratch memory grows with point count. The next free
@@ -611,8 +612,9 @@ No performance/compiled-C++ claim without actual measurements/golden evidence.
 ## DsConv: bounded native f32 runtime landed; multi-template remains open
 
 `layer-support.md` records native Oxide f32 support for the single-template
-`morph=0/1/2` contract. `templates>1` for morph 0/1 remains an explicit CPU
-gap; compact f16 remains unsupported. Hybrid GPU Muon is now covered for the
+`morph=0/1/2` contract. `templates>1` for morph 0/1 has CPU forward and exact
+backward since v0.1.044 (§268); its GPU path is explicitly rejected and extra-array
+Muon remains open. Compact f16 remains unsupported. Hybrid GPU Muon is now covered for the
 bounded single-template runtime path. Do not claim full DSConv source parity or
 silently accept multi-template modes.
 
@@ -647,7 +649,7 @@ two-step hybrid GPU Muon parity. No compiled-C++ golden or performance claim.
    SGD/Adam integration for single-template layers. Hybrid GPU Muon covers
    collapse and offset matrices with actual-device two-step CPU parity; other
    matrix-family Muon coverage remains in the global backlog. Compact f16 and
-   multi-template modes remain unsupported.
+   multi-template GPU modes remain unsupported.
 
 ### Verification gates
 

@@ -87,6 +87,7 @@ with actual-device CPU parity; head loss/backward remains host-owned. See
 uncommitted, with no `version-map.tsv` row.
 
 Latest increments:
+- v0.1.044 (`b82fdab5e67b707f29f4788d699b875e87c31ba9`): DSConv multi-template CPU forward, cached dropout mask and exact backward, source-order weights and SGD/Adam with DNOPT resume; Muon on extra arrays and multi-template GPU remain explicitly rejected and open. `cargo xtask check` and `gpu-check` passed; `cargo xtask test dsconv` passed 22 and `axis_layout` passed 52. Hand-derived from `Jev_laya:src-lib/dsconv_layer.cpp`, no compiled-C++ golden; named tests and details: `implemented.md` §268.
 - v0.1.043 (`7ccfe000ce8be7c24fc0319d21ca5a56cf691ea4`): exact CPU GRU BN training backward for all six projections, with rolling statistics treated as constants and post-backward timestep-ordered 0.9 EMA; scale gradients accumulate and the separate BN bias gradient is zero. GPU BN training still rejects. `cargo xtask check` and `gpu-check` passed; host filters `gru` 7, `lstm` 4, `rnn` 9, `crnn` 4 and `recurrent` 2 passed; Oxide `oxide_gru_training` 1 and `oxide_runtime_chain` filtered by `gru` 3 passed. Separate `.weights` round-trip not run; hand-derived from the Rust forward, no compiled-C++ golden. Named tests and details: `implemented.md` §267.
 - v0.2.202 (`eeb6db6d00ec9d189331060755c87b62fb40d6f0`): native DCNv4 kernels above 961 points use per-thread device scratch for masks and mask gradients, preserving reduction order; `needs_host` no longer rejects by point count. Scratch memory grows with point count. `device_aggregation_large_kernel_matches_host` and `native_large_composition_matches_cpu_parameter_gradients` compare with the Rust CPU reference. `cargo xtask check` and `gpu-check` passed; `cargo xtask test dcnv4` passed 31; Oxide `oxide_dcnv4_aggregate` passed 7, `oxide_dcnv4_chain` 4, `oxide_dcnv4_bn` 2, and `oxide_runtime_chain` filtered by `dcnv4` 4. Hand-derived from source, no compiled-C++ golden. Evidence: `implemented.md` §266.
 - v0.2.201 (`74db0cb95b131a47bf558dc0eee8232d8f1245d3`): native RecursiveBlock forward/backward for static bodies containing `channel_shuffle` uses the existing shuffle kernel and its inverse in `recursive_block/gpu.rs`; other variants remain host. `recursive_channel_shuffle_native_forward_and_gradients_match_cpu` checks CPU parity at 2e-4 forward and 5e-4 gradients. `cargo xtask check`, `cargo xtask gpu-check`, `cargo xtask test recursive_block` (11 passed), and `cargo xtask oxide --test oxide_recursive_block` (2 passed). Hand-derived from source; no compiled-C++ golden. Evidence: `implemented.md` §265.
@@ -1003,13 +1004,13 @@ believing a `cfg_corpus` failure.
    conv blocks. `[dcnv3]` remains blocked (no reference numerics anywhere).
 5. Phase 3B CPU family — DCNv1/2 CPU reference is integrated in v0.1.001
    (GPU is host fallback only); bounded single-template DSConv CPU support is
-   integrated in v0.1.002 (`morph=0/1/2`), while multi-template morph 0/1
-   remains open; graph-conv CPU support is integrated in v0.1.003 and WMHF in
+   integrated in v0.1.002 (`morph=0/1/2`), with multi-template morph 0/1 CPU
+   forward/backward added in v0.1.044 (§268); graph-conv CPU support is integrated in v0.1.003 and WMHF in
    v0.1.004. CPU Muon is integrated in v0.1.005, Clifford in v0.1.006, and
    `recursive_block` in v0.1.007. The bounded Phase 3B CPU layer ports are
    complete. DSConv now has bounded native Oxide f32 runtime forward/backward
    plus actual-device CPU parity for SGD (morph 2) and Adam (morph 1); see
-   `implemented.md` §§200–201. Multi-template morph 0/1 and compact f16 remain
+   `implemented.md` §§200–201. Multi-template GPU, extra-array Muon and compact f16 remain
    open; broader matrix-family GPU Muon and remaining `dcnv4`/`deform_conv`
    Stage-2 work remain open.
 6. Phase 2C OBB, then Phase 4.

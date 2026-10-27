@@ -285,6 +285,7 @@ file is named inline.
 - [265. Native RecursiveBlock channel shuffle forward and backward](#265-native-recursiveblock-channel-shuffle-forward-and-backward)
 - [266. Native DCNv4 for kernels above 961 points](#266-native-dcnv4-for-kernels-above-961-points)
 - [267. CPU GRU batch-normalization training backward](#267-cpu-gru-batch-normalization-training-backward)
+- [268. DSConv multi-template CPU forward and backward](#268-dsconv-multi-template-cpu-forward-and-backward)
 - [Not implemented / open (pointer)](#not-implemented--open-pointer)
 
 ## 1. Workspace, build, tooling
@@ -1010,7 +1011,7 @@ No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
 
 - v0.1.002 (`f49cfc56f571329c14f6b43224d635199b6cca1b`): integrated `[dsconv]` / `[dynamic_snake_conv]` with strict source-derived config/shape handling, source-order weights, seeded initialization, NCHW CPU forward for `morph=0/1/2`, exact backward of the Rust forward, activation handling, SGD source-rate groups, and Adam with persisted moments. Multi-template `morph=0/1` explicitly rejects; `morph=2` follows the source normalization to one template.
 - Verification: `MEM=3G ./tools/test_host.sh dsconv` passed 12 core tests, `weights` passed 40 core tests, and `runtime` passed 187 runtime tests. Coverage includes named hand-computed NCHW axes, finite differences for input and every parameter block across all morphs, integer/border derivative conventions, exact source-order bytes/file length, seeded initialization, update rates/gates, optimizer-state round trip, and explicit GPU rejection. Targeted `rustfmt --check --edition 2024` and `git diff --check` passed. No training or Oxide tests were run.
-- Source contract: hand-derived from `Jev_laya`; no compiled-C++ golden/parity. The later bounded single-template f32 GPU runtime path is recorded in §200; full multi-template/drop-mask gradients remain open. CPU Muon was delivered separately in v0.1.005. Do not claim full DSConv parity or v0.1 completion.
+- Source contract: hand-derived from `Jev_laya`; no compiled-C++ golden/parity. The later bounded single-template f32 GPU runtime path is recorded in §200; multi-template/drop-mask gradients landed in §268. CPU Muon was delivered separately in v0.1.005. Do not claim full DSConv parity or v0.1 completion.
 
 ## 20. Graph-convolution Stage-1 CPU reference
 
@@ -2817,3 +2818,11 @@ golden. Tag `v0.2.202`.
 v0.1.043 (`7ccfe000ce8be7c24fc0319d21ca5a56cf691ea4`) implements the exact adjoint of the Rust forward for all six GRU projections with batch normalization. As in RNN, LSTM and CRNN, forward uses rolling statistics and backward treats them as constants. `runtime/exec_accumulate.rs` accumulates BN scale gradients; `runtime/forward_layers.rs` updates rolling statistics after backward in timestep order with EMA keep 0.9. The separate BN bias array has zero gradient. GPU GRU BN training still rejects; the native GPU path is open.
 
 Evidence: `gru_bn_adjoint_each_timestep_and_three_step_bptt`, `gru_bn_rejects_inconsistent_projection_and_preserves_gpu_rejection`, and `gru_bn_accumulation_updates_stats_after_backward_and_optimizers`. `cargo xtask check` and `cargo xtask gpu-check` passed; host filters `gru`, `lstm`, `rnn`, `crnn` and `recurrent` passed 7, 4, 9, 4 and 2 tests; Oxide regression `oxide_gru_training` passed 1 and `oxide_runtime_chain` filtered by `gru` passed 3. A separate `.weights` round-trip test was not run. Hand-derived from the Rust forward, no compiled-C++ golden. Tag `v0.1.043`.
+
+## 268. DSConv multi-template CPU forward and backward
+
+v0.1.044 (`b82fdab5e67b707f29f4788d699b875e87c31ba9`, tag `v0.1.044`; built over WIP commits `a2701ed`, `6b844a1`, `1417865`) implements CPU forward and exact Rust-forward backward for `dsc_templates>1`, `morph=0/1`. There are `2*templates` views: slots 0/1 use primary offsets with `morph` and `1-morph`; slots >=2 use the extra `dsc_offset_weights` arrays, with `2*(templates-1)` arrays matching C++ allocation. Training uses the repository's seeded dropout counter hash; C++ uses `rand()`, so sequences differ. If every view is dropped, slot 0 stays active. Inference uses all views. Output is the sum of active views scaled by `1/n_active`, plus one bias; the active mask is cached for backward. C++ backward is a stub.
+
+`.weights` order is collapse biases, collapse weights, primary offset weights, shared offset biases, then extra offset arrays in index order; legacy single-template bytes are unchanged. SGD and Adam update the extra arrays, and Adam supports DNOPT sidecar resume. Muon on extra arrays remains open and explicitly errors; its matrix visitor in `muon_runtime.rs` is user WIP. Multi-template GPU execution is explicitly rejected and remains open.
+
+Evidence provided for this version: `cargo xtask check` and `cargo xtask gpu-check` passed; `cargo xtask test dsconv` passed 22 and `cargo xtask test axis_layout` passed 52. Named tests: `dsconv_multi_template_forward_matches_single_view_sum_and_inference_uses_all_views`, `dsconv_multi_template_mask_reuse_and_seeded_fallback`, `dsconv_multi_template_runtime_finite_differences_all_parameters_and_input`, `dsconv_multi_template_end_to_end_sgd_and_adam_update_every_extra_array`, `dsconv_multi_template_adam_sidecar_resume_matches_uninterrupted_update`, and `dsconv_multi_template_axis_layout_pins_view_order_and_nchw`. Hand-derived from `Jev_laya:src-lib/dsconv_layer.cpp`, no compiled-C++ golden.

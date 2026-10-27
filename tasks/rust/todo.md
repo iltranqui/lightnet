@@ -92,6 +92,8 @@ for the cache would erase the gain. **Backward stage 1 (host reference) landed:*
 - [x] **v0.2.024 (`0087d109`): native DCNv4 SGD optimizer update.** Eligible native f32 DCNv4 steps use device gradients/momentum and device SGD; host parameters remain canonical. See `implemented.md` §61.
 - [x] **v0.2.081: native `[lstm]` f32 inference now supports rolling-stat BN** by folding each of its eight projection affines into weights/biases; actual-Oxide multi-step output matches CPU. BN training stays on the host fallback. No C++ parity; see `implemented.md` §104.
 - [x] **v0.2.080: native `[rnn]` f32 inference now supports rolling-stat BN** by folding its affine into recurrent projections; actual-Oxide multi-step output matches CPU. BN training stays on the existing host fallback. No C++ parity; see `implemented.md` §103.
+- [x] **v0.1.044: DSConv multi-template CPU.** Forward, cached view dropout, exact backward, source-order weights and SGD/Adam with DNOPT resume; checks passed, `dsconv` 22 and `axis_layout` 52 passed. Hand-derived from source, no compiled-C++ golden. See `implemented.md` §268.
+- [ ] **DSConv multi-template:** implement Muon for extra offset arrays (currently explicit error; matrix visitor is user WIP) and the explicitly rejected GPU path.
 - [x] **v0.1.043: CPU GRU BN training backward.** Exact six-projection adjoint, scale accumulation and post-backward timestep-ordered rolling-stat EMA; checks, recurrent host filters and GRU Oxide regressions passed. Separate `.weights` round-trip not run; hand-derived from the Rust forward, no compiled-C++ golden. See `implemented.md` §267.
 - [ ] **GRU BN training on GPU:** CPU reference done in v0.1.043; implement and verify the native GPU path.
 - [x] **v0.2.079: native `[gru]` f32 inference**, including rolling-stat BN, matched the Rust CPU reference across multiple steps on actual Oxide at that increment; see `implemented.md` §102.
@@ -676,7 +678,7 @@ Immediately next, in dependency order:
   `recursive_block` v0.1.007 (§24) are source-derived from `Jev_laya`; no
   compiled-C++ golden/parity or GPU path is claimed. CPU Muon is integrated in
   v0.1.005 (§22). This closes the bounded CPU-port task set, not every source
-  variant: DSConv multi-template `morph=0/1` remains open, and DCNv1/2 plus
+  variant: DSConv multi-template CPU landed in v0.1.044, with extra-array Muon and GPU open, and DCNv1/2 plus
   `[dcnv4]` still use the bounded CPU/reference or host-fallback scope recorded
   in §§17–19. Native GPU support and GPU Muon remain Stage 2.
 - [x] CPU Muon: spec and Stage-1 hybrid implementation complete in v0.1.005
@@ -741,7 +743,7 @@ Immediately next, in dependency order:
 - [x] `carpn_network_map_plan.md` — v0.0.259 completes CPU network inference, `detect-image`, and direct `detector map`; CARPN training/`detector train -map` remain explicitly deferred.
 - [x] `dcnv4_plan.md` — source-audited CPU/reference + GPU f32 host-fallback implementation completed in v0.0.273; v0.0.274 matches the deformable-layer `try_fix_nan` config default. No native kernel or compiled-C++ parity.
 - [x] `deform_conv_plan.md` — bounded DCNv1/2 CPU reference and f32 host-fallback implementation completed in v0.1.001. No native kernel or compiled-C++ parity; CPU Muon was added separately in v0.1.005.
-- [x] `dsconv_plan.md` — bounded single-template CPU implementation completed in v0.1.002; multi-template modes remain open. CPU Muon was added separately in v0.1.005. Native Oxide f32 forward/backward compositions have actual-device evidence (`oxide_dsconv`, 11 tests), and generic single-template f32 runtime integration now has Oxide-vs-CPU backward/SGD parity (morph 2) and Adam parity (morph 1). Intermediates are recomputed; there is no runtime cache. Hybrid GPU Muon now has actual-device two-step CPU parity for the collapse and offset matrices (morph 1); remaining runtime morph/optimizer combinations and broader layer-family GPU Muon remain open. No compiled-C++ parity.
+- [x] `dsconv_plan.md` — bounded single-template CPU implementation completed in v0.1.002; multi-template CPU landed in v0.1.044 (§268), with extra-array Muon and GPU open. CPU Muon was added separately in v0.1.005. Native Oxide f32 forward/backward compositions have actual-device evidence (`oxide_dsconv`, 11 tests), and generic single-template f32 runtime integration now has Oxide-vs-CPU backward/SGD parity (morph 2) and Adam parity (morph 1). Intermediates are recomputed; there is no runtime cache. Hybrid GPU Muon now has actual-device two-step CPU parity for the collapse and offset matrices (morph 1); remaining runtime morph/optimizer combinations and broader layer-family GPU Muon remain open. No compiled-C++ parity.
 - [x] `graph_conv_plan.md` — Stage-1 CPU implementation completed in v0.1.003; CPU Muon was added separately in v0.1.005 and native GPU support remains Stage 2. No compiled-C++ parity.
 - [x] `wmhf_plan.md` — bounded Stage-1 CPU implementation completed in v0.1.004; source/config/backward/weights audit is in `wmhf_notes.md`. CPU Muon was added in v0.1.005. No compiled-C++ golden.
 - [x] `clifford_plan.md` — source-derived Stage-1 CPU implementation and focused verification completed in v0.1.006; no compiled-C++ golden/parity. Native GPU is Stage 2.
