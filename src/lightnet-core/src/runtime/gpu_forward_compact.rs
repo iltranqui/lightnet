@@ -420,7 +420,6 @@ where
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
-                | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Dropout { .. }, LayerParams::None)
                 | (LayerKind::OmdLoss(_), LayerParams::None)

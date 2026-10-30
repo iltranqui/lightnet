@@ -1445,23 +1445,6 @@ pub struct LocalSpec {
     pub activation: Activation,
 }
 
-/// Legacy YOLOv1 detection-loss configuration.
-#[derive(Clone, Debug, PartialEq)]
-pub struct DetectionSpec {
-    pub classes: usize,
-    pub coords: usize,
-    pub side: usize,
-    pub num: usize,
-    pub rescore: bool,
-    pub softmax: bool,
-    pub sqrt: bool,
-    pub jitter: f32,
-    pub object_scale: f32,
-    pub noobject_scale: f32,
-    pub class_scale: f32,
-    pub coord_scale: f32,
-}
-
 /// Gated recurrent unit configuration.  Parameters are owned by the runtime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GruSpec {
@@ -1682,7 +1665,6 @@ pub enum LayerKind {
     Crop(CropSpec),
     BatchNorm(BatchNormSpec),
     Local(LocalSpec),
-    Detection(DetectionSpec),
     /// Weightless projected cuboid head; CPU runtime stores raw logits.
     Yolo3d(Yolo3dSpec),
     Unsupported(String),
@@ -1755,7 +1737,6 @@ impl LayerKind {
             Self::Crop(_) => "crop",
             Self::BatchNorm(_) => "batchnorm",
             Self::Local(_) => "local",
-            Self::Detection(_) => "detection",
             Self::Unsupported(name) => name.as_str(),
         }
     }
@@ -1895,7 +1876,6 @@ pub const AXIS_PINS: &[AxisPin] = &[
     AxisPin::RustOnly("GPU-only crop_layer_kernels.cu; no CPU layer"),
     AxisPin::RustOnly("batchnorm_layer.cpp exists but has no ELayerType"),
     AxisPin::RustOnly("no C++ layer type"),
-    AxisPin::RustOnly("no C++ layer type; identity passthrough"),
     AxisPin::Open("Tier 2: cuboid anchor/entry/vertex layout; decode pending"),
     AxisPin::RustOnly("not a layer: configs fail in infer_output_shape"),
 ];
@@ -1969,9 +1949,8 @@ impl LayerKind {
             Self::Crop(_) => 60,
             Self::BatchNorm(_) => 61,
             Self::Local(_) => 62,
-            Self::Detection(_) => 63,
-            Self::Yolo3d(_) => 64,
-            Self::Unsupported(_) => 65,
+            Self::Yolo3d(_) => 63,
+            Self::Unsupported(_) => 64,
         };
         AXIS_PINS[index]
     }
@@ -4173,20 +4152,6 @@ fn parse_layer_kind(
                 activation: Activation::parse(&section.get_str("activation", "logistic")),
             })
         }
-        "detection" => LayerKind::Detection(DetectionSpec {
-            classes: section.get_usize("classes", 20)?,
-            coords: section.get_usize("coords", 4)?,
-            side: section.get_usize("side", 7)?,
-            num: section.get_usize("num", 2)?,
-            rescore: section.get_bool_int("rescore", false)?,
-            softmax: section.get_bool_int("softmax", false)?,
-            sqrt: section.get_bool_int("sqrt", false)?,
-            jitter: section.get_f32("jitter", 0.2)?,
-            object_scale: section.get_f32("object_scale", 1.0)?,
-            noobject_scale: section.get_f32("noobject_scale", 1.0)?,
-            class_scale: section.get_f32("class_scale", 1.0)?,
-            coord_scale: section.get_f32("coord_scale", 1.0)?,
-        }),
         "route" => LayerKind::Route(RouteSpec {
             layers: section.get_isize_list("layers")?,
             groups: section.get_usize("groups", 1)?,
@@ -5593,7 +5558,7 @@ fn infer_output_shape(
             current.channels,
             current.batch,
         )),
-        LayerKind::BatchNorm(_) | LayerKind::Detection(_) => Ok(current),
+        LayerKind::BatchNorm(_) => Ok(current),
         LayerKind::Local(spec) => Ok(TensorShape::new(
             conv_dim(current.width, spec.padding, spec.size, spec.stride_x),
             conv_dim(current.height, spec.padding, spec.size, spec.stride_y),
@@ -10552,12 +10517,6 @@ output=2
                     stride=1
                     pad=1
 
-                    [detection]
-                    classes=2
-                    coords=4
-                    side=7
-                    num=2
-
                     [gru]
                     output=11
                 "#,
@@ -10572,11 +10531,10 @@ output=2
         assert!(matches!(network.layers[1].kind, LayerKind::BatchNorm(_)));
         assert!(matches!(network.layers[2].kind, LayerKind::Local(_)));
         assert_eq!(network.layers[2].output_shape.channels, 5);
-        assert!(matches!(network.layers[3].kind, LayerKind::Detection(_)));
-        assert!(matches!(network.layers[4].kind, LayerKind::Gru(_)));
-        assert_eq!(network.layers[4].output_shape.channels, 11);
-        assert_eq!(network.layers[4].output_shape.width, 1);
-        assert_eq!(network.layers[4].output_shape.height, 1);
+        assert!(matches!(network.layers[3].kind, LayerKind::Gru(_)));
+        assert_eq!(network.layers[3].output_shape.channels, 11);
+        assert_eq!(network.layers[3].output_shape.width, 1);
+        assert_eq!(network.layers[3].output_shape.height, 1);
     }
 
     #[test]
@@ -11630,7 +11588,7 @@ output=2
         // `tasks/rust/02_state/axis-coverage.md`.
         assert_eq!(
             AXIS_PINS.len(),
-            66,
+            65,
             "one axis decision per LayerKind variant plus Unsupported"
         );
 

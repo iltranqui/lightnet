@@ -1994,7 +1994,6 @@ impl ExecutableNetwork {
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
-                | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Logistic, LayerParams::None)
                 | (LayerKind::Segmentation(_), LayerParams::None)

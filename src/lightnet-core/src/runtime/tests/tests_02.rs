@@ -670,43 +670,6 @@ fn vit_vc_gpu_host_fallback_matches_cpu_forward_and_backward() {
 }
 
 #[test]
-fn legacy_detection_layer_preserves_forward_and_backward_tensors() {
-    let network = Network::from_config(
-        ConfigFile::parse_str(
-            "detection.cfg",
-            r#"
-                    [net]
-                    width=1
-                    height=1
-                    channels=7
-                    batch=1
-
-                    [detection]
-                    classes=2
-                    coords=4
-                    side=1
-                    num=1
-                "#,
-        )
-        .expect("cfg parses"),
-    )
-    .expect("network constructs");
-    let executable = ExecutableNetwork::new(network);
-    let input = Tensor::from_data(executable.network.net.input_shape(), vec![1.0; 7])
-        .expect("input tensor");
-    let forward = executable
-        .forward_training(&input)
-        .expect("forward succeeds");
-    assert_eq!(forward.final_output(), Some(&input));
-
-    let gradient = Tensor::filled(input.shape, 0.25);
-    let backward = executable
-        .backward(&input, &forward, &gradient)
-        .expect("backward succeeds");
-    assert_eq!(backward.input_gradient, gradient);
-}
-
-#[test]
 fn crop_layer_center_samples_and_scatters_bilinear_gradients() {
     let network = Network::from_config(
         ConfigFile::parse_str(

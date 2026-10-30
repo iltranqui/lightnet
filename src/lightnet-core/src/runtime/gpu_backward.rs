@@ -515,7 +515,6 @@ where
                 (LayerKind::Yolo(_), Some(LayerParams::None))
                 | (LayerKind::ObbYolo(_), Some(LayerParams::None))
                 | (LayerKind::GaussianYolo(_), Some(LayerParams::None))
-                | (LayerKind::Detection(_), Some(LayerParams::None))
                 | (LayerKind::Cost { .. }, Some(LayerParams::None))
                 | (LayerKind::Logistic, Some(LayerParams::None))
                 | (LayerKind::Segmentation(_), Some(LayerParams::None))

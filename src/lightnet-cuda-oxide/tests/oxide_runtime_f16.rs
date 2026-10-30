@@ -195,11 +195,10 @@ fn channel_shuffle_f16_inference_matches_f32() {
 }
 
 #[test]
-fn detection_and_regression_f16_inference_preserve_identity() {
+fn regression_f16_inference_preserves_identity() {
     let cfg = "[net]\nwidth=3\nheight=2\nchannels=2\nbatch=2\n\
-        [detection]\n\
         [regression]\nscale=3\n";
-    run_pair("detection+regression f16", network(cfg), 81, 0.7, 4e-3);
+    run_pair("regression f16", network(cfg), 81, 0.7, 4e-3);
 }
 
 #[test]

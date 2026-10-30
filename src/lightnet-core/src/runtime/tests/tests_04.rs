@@ -940,7 +940,6 @@ fn gpu_runtime_runs_primary_yolov4_tiny_targets() {
                         | LayerKind::ObbYolo(_)
                         | LayerKind::GaussianYolo(_)
                         | LayerKind::Region(_)
-                        | LayerKind::Detection(_)
                         | LayerKind::Softmax { .. }
                         | LayerKind::Cost { .. }
                         | LayerKind::Dropout { .. }

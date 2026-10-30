@@ -204,7 +204,7 @@ Weights order is covered for all of them (see [Weights axis](#weights-axis)).
 | Variant | C++ reference | Axis classes | Required pin |
 |---|---|---|---|
 
-## Rust-only extensions (5)
+## Rust-only extensions (4)
 
 Not in `ELayerType` on any branch (`layers.md:79`), so there is no C++
 layer type to anchor against. Pin Rust's documented contract and record the
@@ -216,7 +216,6 @@ named test; use `no-C++-reference` rather than claiming C++ parity.
 | `Crop` | `crop` | Rust-only layer; GPU-only `Jev_laya:src-lib/crop_layer_kernels.cu` | crop window to output index mapping, `batch=2` | `runtime.rs` `crop_axis_layout_maps_batches_channels_and_center_window` (Rust contract; no C++ golden) |
 | `Local` | `local` | none | per-sample weight sharing; `C*H*W` to `out` layout | open |
 | `BatchNorm` | `batchnorm` | `Jev_laya:src-lib/batchnorm_layer.cpp` exists but has no `ELayerType` | channel-axis reduction; `(C)` scale/beta order | open |
-| `Detection` | `detection` | none | identity passthrough preserves layout | open |
 
 ## Not complete (4)
 

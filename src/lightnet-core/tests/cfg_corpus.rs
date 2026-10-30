@@ -81,7 +81,6 @@ fn unsupported_sections(cfg: &ConfigFile) -> String {
         "crop",
         "batchnorm",
         "local",
-        "detection",
         "gru",
         "rnn",
         "lstm",

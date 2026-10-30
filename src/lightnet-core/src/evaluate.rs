@@ -305,8 +305,7 @@ fn obb_validation_classes(network: &Network) -> Result<usize> {
             | LayerKind::Yolox(_)
             | LayerKind::Ppyoloe(_)
             | LayerKind::Yolonas(_)
-            | LayerKind::CenterNet(_)
-            | LayerKind::Detection(_) => {
+            | LayerKind::CenterNet(_) => {
                 return Err(invalid(
                     "OBB validation requires an OBB-only detector graph",
                 ));

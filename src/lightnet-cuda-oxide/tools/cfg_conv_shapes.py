@@ -37,7 +37,7 @@ ACT_DEFAULT = {
 ALIASES = {"conv": "convolutional", "max": "maxpool", "avg": "avgpool", "conn": "connected",
            "network": "net", "reorg3d": "reorg", "local_avg": "local_avgpool",
            "Gaussian_yolo": "gaussian_yolo"}
-SAME_SHAPE = {"yolo", "gaussian_yolo", "region", "detection", "dropout", "softmax", "cost",
+SAME_SHAPE = {"yolo", "gaussian_yolo", "region", "dropout", "softmax", "cost",
               "batchnorm", "sam", "contrastive", "silence"}
 
 

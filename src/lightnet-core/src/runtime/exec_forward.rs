@@ -53,7 +53,6 @@ impl ExecutableNetwork {
                     | LayerKind::ObbYolo(_)
                     | LayerKind::GaussianYolo(_)
                     | LayerKind::Region(_)
-                    | LayerKind::Detection(_)
                     | LayerKind::Softmax { .. }
                     | LayerKind::Cost { .. }
                     | LayerKind::Contrastive(_)
@@ -175,7 +174,6 @@ impl ExecutableNetwork {
                 | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
                 | (LayerKind::Region(_), LayerParams::None)
-                | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Contrastive(_), LayerParams::None) => {
                     current_input.expect("pass-through input").clone()
@@ -910,7 +908,6 @@ impl ExecutableNetwork {
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)
-                | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None) => (current_input.clone(), None),
                 (LayerKind::Softmax { groups, spatial }, LayerParams::None) => {

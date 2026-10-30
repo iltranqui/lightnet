@@ -111,7 +111,6 @@ where
                 | LayerKind::Yolo(_)
                 | LayerKind::ObbYolo(_)
                 | LayerKind::GaussianYolo(_)
-                | LayerKind::Detection(_)
                 | LayerKind::Regression(_) => {}
                 LayerKind::Shortcut(spec) => {
                     if spec.from.is_empty() {
@@ -649,7 +648,6 @@ where
                 (LayerKind::Dropout { .. }, LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::OmdLoss(_), LayerParams::None)
-                | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None) => current_input
                     .expect("identity layer requires current input")
                     .clone(),
