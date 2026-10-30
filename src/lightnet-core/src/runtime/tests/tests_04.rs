@@ -2579,6 +2579,47 @@ fn cpu_laya_act_head_backward_scatters_dcls_into_the_head_source() {
 }
 
 #[test]
+fn conv_before_detection_or_segmentation_head_skips_low_precision() {
+    let parse = |body: &str| {
+        Network::from_config(
+            ConfigFile::parse_str(
+                "inline.cfg",
+                &format!("[net]\nbatch=1\nwidth=8\nheight=8\nchannels=1\n{body}"),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    };
+
+    // Conv directly feeding a classic YOLO head: head boundary.
+    let yolo = parse(
+        "[convolutional]\nfilters=6\nsize=1\nactivation=linear\n\
+         [yolo]\nmask=0\nanchors=2,3\nclasses=1\nnum=1\niou_loss=ciou\n",
+    );
+    assert!(crate::runtime::conv_feeds_detection_head(&yolo, 0));
+
+    // Conv feeding another conv: ordinary FP8-eligible convolution.
+    let stack = parse(
+        "[convolutional]\nfilters=4\nsize=1\nactivation=linear\n\
+         [convolutional]\nfilters=4\nsize=1\nactivation=linear\n",
+    );
+    assert!(!crate::runtime::conv_feeds_detection_head(&stack, 0));
+    assert!(!crate::runtime::conv_feeds_detection_head(&stack, 1));
+
+    // Conv directly feeding a segmentation head: head boundary.
+    let segmentation = parse(
+        "[convolutional]\nfilters=3\nsize=1\nactivation=linear\n\
+         [segmentation]\nclasses=3\n",
+    );
+    assert!(crate::runtime::conv_feeds_detection_head(&segmentation, 0));
+
+    // A non-convolutional layer never claims the boundary policy.
+    let pooling = parse("[maxpool]\nsize=2\nstride=2\n");
+    assert!(!crate::runtime::conv_feeds_detection_head(&pooling, 0));
+    assert!(!crate::runtime::conv_feeds_detection_head(&pooling, 5));
+}
+
+#[test]
 fn gpu_yolo_loss_falls_back_when_backend_has_no_native_loss() {
     let cfg = ConfigFile::parse_str(
         "inline.cfg",

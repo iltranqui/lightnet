@@ -7,13 +7,24 @@ use crate::runtime::{
     GpuBatchNormCache, GpuExecutableNetwork, backend_error, gpu_activation_kind,
     resolve_convolutional_owner, resolve_convolutional_params, tensor_backend_shape,
 };
-use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend, NanInfMode};
+use lightnet_cuda::{ConvPrecision, ElementwiseLaunchConfig, F32TensorOpsBackend, NanInfMode};
 
 impl<B> GpuExecutableNetwork<B>
 where
     B: F32TensorOpsBackend,
     B::Error: std::fmt::Display,
 {
+    /// Conv precision for this layer: the convolution immediately before a
+    /// detection or segmentation head keeps f32 GEMMs even when the backend is
+    /// configured for quantised (FP8/FP4) convs.
+    fn conv_precision(&self, layer: &Layer) -> ConvPrecision {
+        if crate::runtime::conv_feeds_detection_head(&self.network, layer.index) {
+            ConvPrecision::NoLowPrecision
+        } else {
+            ConvPrecision::Auto
+        }
+    }
+
     /// Native convolution, then batch-statistics batch norm (training) or bias, then
     /// activation or channel normalization. Returns the output, the pre-activation tensor kept
     /// for backward, and the batch-norm cache when batch statistics were used.
@@ -54,9 +65,10 @@ where
         } else {
             &cached.weights
         };
+        let precision = self.conv_precision(layer);
         let conv_output = self
             .backend
-            .conv2d_f32(
+            .conv2d_f32_with_precision(
                 current_input,
                 weights,
                 &tensor_backend_shape(layer.output_shape),
@@ -70,6 +82,7 @@ where
                 spec.dilation,
                 spec.padding,
                 spec.groups.max(1),
+                precision,
                 launch_config,
             )
             .map_err(|err| backend_error("convolution", err))?;
@@ -140,7 +153,7 @@ where
         )?;
         let conv_output = self
             .backend
-            .conv2d_f32(
+            .conv2d_f32_with_precision(
                 current_input,
                 &cached.weights,
                 &tensor_backend_shape(layer.output_shape),
@@ -154,6 +167,7 @@ where
                 spec.dilation,
                 spec.padding,
                 spec.groups.max(1),
+                self.conv_precision(layer),
                 launch_config,
             )
             .map_err(|err| backend_error("convolution", err))?;
@@ -209,6 +223,7 @@ where
         let conv =
             resolve_convolutional_params(&self.network, &self.params, layer.index)?;
         let owner = resolve_convolutional_owner(&self.network, layer.index)?;
+        let precision = self.conv_precision(layer);
         // The batch-statistics BN backward only needs the raw tensors.
         let cached = if forward.gpu_batch_norm_caches[layer.index].is_some() {
             self.cached_convolution_params_raw(
@@ -309,7 +324,7 @@ where
             let scale_grad = if let Some(batch_norm) = conv.batch_norm.as_ref() {
                 let raw_output = self
                     .backend
-                    .conv2d_f32(
+                    .conv2d_f32_with_precision(
                         current_input,
                         &cached.raw_weights,
                         &tensor_backend_shape(layer.output_shape),
@@ -323,6 +338,7 @@ where
                         spec.dilation,
                         spec.padding,
                         spec.groups.max(1),
+                        precision,
                         config,
                     )
                     .map_err(|err| backend_error("GPU batch-norm raw convolution", err))?;
@@ -354,7 +370,7 @@ where
         let grouped_channels = layer.input_shape.channels / spec.groups.max(1);
         let weight_grad = self
             .backend
-            .conv2d_backward_weights_f32(
+            .conv2d_backward_weights_f32_with_precision(
                 current_input,
                 &grad_for_conv,
                 &[spec.filters, grouped_channels, spec.size, spec.size],
@@ -368,12 +384,13 @@ where
                 spec.dilation,
                 spec.padding,
                 spec.groups.max(1),
+                precision,
                 config,
             )
             .map_err(|err| backend_error("GPU convolution weight backward", err))?;
         let input_grad = self
             .backend
-            .conv2d_backward_input_f32(
+            .conv2d_backward_input_f32_with_precision(
                 &grad_for_conv,
                 &cached.raw_weights,
                 &tensor_backend_shape(layer.input_shape),
@@ -387,6 +404,7 @@ where
                 spec.dilation,
                 spec.padding,
                 spec.groups.max(1),
+                precision,
                 config,
             )
             .map_err(|err| backend_error("GPU convolution input backward", err))?;

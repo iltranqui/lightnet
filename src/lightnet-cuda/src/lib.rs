@@ -150,6 +150,19 @@ pub enum KernelLanguage {
     CutileDsl,
 }
 
+/// Low-precision policy for one convolution call.
+///
+/// The runtime asks for [`ConvPrecision::NoLowPrecision`] on the convolution
+/// immediately before a detection or segmentation head, so those GEMMs keep the
+/// f32/kernel default even when a quantised tensor-core mode (FP8/FP4) is
+/// selected globally. `Auto` follows the backend's configured mode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConvPrecision {
+    #[default]
+    Auto,
+    NoLowPrecision,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeviceTensorDesc {
     pub name: String,
@@ -1713,6 +1726,125 @@ pub trait F32TensorOpsBackend {
         groups: usize,
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error>;
+
+    /// [`Self::conv2d_f32`] with an explicit low-precision policy per call.
+    ///
+    /// Backends without quantised conv GEMMs ignore the policy.
+    #[allow(clippy::too_many_arguments)]
+    fn conv2d_f32_with_precision(
+        &self,
+        x: &Self::Tensor,
+        weights: &Self::Tensor,
+        output_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        precision: ConvPrecision,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = precision;
+        self.conv2d_f32(
+            x,
+            weights,
+            output_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride_x,
+            stride_y,
+            dilation,
+            padding,
+            groups,
+            config,
+        )
+    }
+
+    /// [`Self::conv2d_backward_input_f32`] with an explicit low-precision policy.
+    #[allow(clippy::too_many_arguments)]
+    fn conv2d_backward_input_f32_with_precision(
+        &self,
+        output_grad: &Self::Tensor,
+        weights: &Self::Tensor,
+        input_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        precision: ConvPrecision,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = precision;
+        self.conv2d_backward_input_f32(
+            output_grad,
+            weights,
+            input_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride_x,
+            stride_y,
+            dilation,
+            padding,
+            groups,
+            config,
+        )
+    }
+
+    /// [`Self::conv2d_backward_weights_f32`] with an explicit low-precision policy.
+    #[allow(clippy::too_many_arguments)]
+    fn conv2d_backward_weights_f32_with_precision(
+        &self,
+        x: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        weight_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        precision: ConvPrecision,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _ = precision;
+        self.conv2d_backward_weights_f32(
+            x,
+            output_grad,
+            weight_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride_x,
+            stride_y,
+            dilation,
+            padding,
+            groups,
+            config,
+        )
+    }
     /// Locally connected f32 projection. Weights use `[location, filter, channel, ky, kx]`.
     #[allow(clippy::too_many_arguments)]
     fn local_f32(

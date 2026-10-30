@@ -453,7 +453,7 @@ impl OxideBackend {
             let chunk = (col_cap_bytes() / 4 / g.col_len())
                 .clamp(1, g.batch)
                 .min(chunk_limit());
-            if self.gemm_mode == GemmMode::Fp8 {
+            if self.conv_gemm_mode() == GemmMode::Fp8 {
                 // Quantise while gathering: the column never exists as f32.
                 let wq = self.fp8_weights(weights, Fp8Format::E4M3)?;
                 let amax = self.fp8_amax_slot(&x.buf, x.len())?;
@@ -719,7 +719,7 @@ impl OxideBackend {
             let chunk = col_chunk.min(part_chunk).min(g.batch);
             // Byte column in wgrad: the column is the activation operand, so it
             // takes the recipe's first format and `dy` the second.
-            let byte_col = self.gemm_mode == GemmMode::Fp8;
+            let byte_col = self.conv_gemm_mode() == GemmMode::Fp8;
             let (col_fmt, dy_fmt) = self.bwd_fp8.unwrap_or((Fp8Format::E4M3, Fp8Format::E4M3));
             let amax = if byte_col {
                 Some(self.fp8_amax_slot(&x.buf, x.len())?)

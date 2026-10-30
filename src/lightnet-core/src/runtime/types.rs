@@ -653,6 +653,38 @@ pub fn is_modern_head(kind: &LayerKind) -> bool {
     )
 }
 
+/// True for the heads whose immediately preceding convolution must stay off the
+/// quantised (FP8/FP4) tensor-core convolution path.
+///
+/// The FP8 policy is "every convolution except the one immediately before a
+/// detection or segmentation head", so this predicate is what the conv layer
+/// consults, and what the FP8 policy tests pin.
+pub fn is_quantized_conv_boundary_head(kind: &LayerKind) -> bool {
+    matches!(
+        kind,
+        LayerKind::Yolo(_)
+            | LayerKind::ObbYolo(_)
+            | LayerKind::GaussianYolo(_)
+            | LayerKind::Region(_)
+            | LayerKind::Segmentation(_)
+    ) || is_modern_head(kind)
+}
+
+/// True for a `[convolutional]` layer whose successor is a detection or
+/// segmentation head, i.e. the convolution that must keep f32 conv GEMMs.
+pub fn conv_feeds_detection_head(network: &Network, layer_index: usize) -> bool {
+    if !matches!(
+        network.layers.get(layer_index).map(|layer| &layer.kind),
+        Some(LayerKind::Convolutional(_))
+    ) {
+        return false;
+    }
+    network
+        .layers
+        .get(layer_index + 1)
+        .is_some_and(|next| is_quantized_conv_boundary_head(&next.kind))
+}
+
 /// Sampling coordinates captured by a crop forward pass. Coordinates are
 /// shared by every channel in a batch image, matching Darknet's crop kernel.
 #[derive(Clone, Debug, PartialEq)]

@@ -7,6 +7,22 @@ impl OxideBackend {
         self.gemm_mode
     }
 
+    /// GEMM mode for the convolution call in flight: the configured mode, or
+    /// `Fp32` while the runtime runs the convolution immediately before a
+    /// detection or segmentation head. Other modes (tf32/f16/bf16) are kept, so
+    /// AMP storage still works; only the quantised FP8/FP4 operands are dropped.
+    #[inline]
+    pub(crate) fn conv_gemm_mode(&self) -> GemmMode {
+        match self.gemm_mode {
+            GemmMode::Fp8 | GemmMode::Fp4
+                if self.conv_low_precision_off.load(Ordering::Relaxed) =>
+            {
+                GemmMode::Fp32
+            }
+            mode => mode,
+        }
+    }
+
     /// `C = alpha * op(A) * op(B) + beta * C` with `A` and `B` 16-bit buffers
     /// (`hfmt`): each is quantised straight from its 16-bit storage to `fmt_a` /
     /// `fmt_b` and the result accumulates in f32 into `c`.
@@ -115,7 +131,7 @@ impl OxideBackend {
         c: &mut DeviceBuffer<f32>,
         g: &GemmArgs,
     ) -> Result<(), OxideError> {
-        if self.gemm_mode == GemmMode::Fp8 && !self.amp {
+        if self.conv_gemm_mode() == GemmMode::Fp8 && !self.amp {
             return self.gemm_fp8_weights_a(w, b, c, g, Fp8Format::E4M3, Fp8Format::E4M3);
         }
         self.gemm(&w.buf, b, c, g)

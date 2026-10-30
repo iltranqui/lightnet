@@ -71,10 +71,12 @@ use std::sync::{Arc, Mutex};
 use cuda_core::{CudaContext, CudaStream, DeviceBuffer, DriverError};
 use lightnet_cuda::{
     AdamParams, AdamUpdateItem, BatchNormTrainForward, BilinearGatherGeometry,
-    ElementwiseLaunchConfig, F32ActivationKind, F32ChannelNormalization,
+    ConvPrecision, ElementwiseLaunchConfig, F32ActivationKind, F32ChannelNormalization,
     F32ShortcutWeightNormalization, F32TensorOpsBackend, FoveationFilmGradients, NanInfMode,
     SgdUpdateItem,
 };
+
+use conv2d_backend::ConvPrecisionGuard;
 
 pub use conv::ConvMode;
 pub use fp4::Fp4Packed;
@@ -248,6 +250,9 @@ pub struct OxideBackend {
     /// Test seam: route e4m3 x e4m3 GEMMs through the generic-format kernel;
     /// see [`OxideBackend::set_fp8_generic_kernel`].
     fp8_generic_kernel: AtomicBool,
+    /// Set while the runtime runs the convolution immediately before a detection
+    /// or segmentation head: FP8/FP4 GEMMs drop to f32 for that call only.
+    conv_low_precision_off: AtomicBool,
     /// Zero-length f32 buffer shared by every f16-storage tensor.
     empty_f32: Arc<PooledBuf>,
     /// im2col scratch of the f16 conv path and 1-element dummies for the unused
@@ -792,6 +797,7 @@ impl OxideBackend {
             fp8_quantize_launches: AtomicU64::new(0),
             fp8_amax_passes: AtomicU64::new(0),
             fp8_generic_kernel: AtomicBool::new(false),
+            conv_low_precision_off: AtomicBool::new(false),
             empty_f32,
             half_scratch: Mutex::new(half_scratch),
             half_col: Mutex::new(None),
@@ -941,7 +947,7 @@ impl OxideBackend {
     /// True when AMP storage is on and the GEMM mode is fp8: the conv GEMMs run
     /// fp8 on the 16-bit activations ([`Self::fp8_quantize_half`]).
     pub(crate) fn amp_fp8(&self) -> bool {
-        self.amp && self.gemm_mode == GemmMode::Fp8
+        self.amp && self.conv_gemm_mode() == GemmMode::Fp8
     }
 
 
@@ -1014,23 +1020,23 @@ impl OxideBackend {
             // GEMM seam keeps the 16-bit compute path.
             return self.gemm_f32_operands_as_half(a, b, c, g, self.half_fmt == mixed::HalfFormat::Bf16);
         }
-        if self.gemm_mode == GemmMode::Fp16 {
+        if self.conv_gemm_mode() == GemmMode::Fp16 {
             return self.gemm_f32_operands_as_half(a, b, c, g, false);
         }
-        if self.gemm_mode == GemmMode::Bf16 {
+        if self.conv_gemm_mode() == GemmMode::Bf16 {
             return self.gemm_f32_operands_as_half(a, b, c, g, true);
         }
-        if self.gemm_mode == GemmMode::Fp8 {
+        if self.conv_gemm_mode() == GemmMode::Fp8 {
             return self.gemm_f32_via_fp8(a, b, c, g);
         }
-        if self.gemm_mode == GemmMode::Fp4 {
+        if self.conv_gemm_mode() == GemmMode::Fp4 {
             return self.gemm_f32_via_fp4(a, b, c, g);
         }
         // Split-K: with fewer than `SPLITK_TARGET_BLOCKS` output tiles the GPU is
         // under-filled while each block walks a long K loop (deep, small-spatial
         // convs).  Split K across extra blocks that write dense partial products
         // to a workspace, then reduce them in a fixed order (deterministic).
-        let tf32 = self.gemm_mode.use_tf32(g);
+        let tf32 = self.conv_gemm_mode().use_tf32(g);
         let (bm, bn) = if tf32 {
             (gemm_mma::MMA_BM, gemm_mma::MMA_BN)
         } else {
@@ -3018,6 +3024,117 @@ impl F32TensorOpsBackend for OxideBackend {
             x,
             weights,
             output_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride_x,
+            stride_y,
+            dilation,
+            padding,
+            groups,
+            config,
+        )
+    }
+
+    fn conv2d_f32_with_precision(
+        &self,
+        x: &Self::Tensor,
+        weights: &Self::Tensor,
+        output_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        precision: ConvPrecision,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _guard = ConvPrecisionGuard::new(self, precision);
+        self.conv2d_f32(
+            x,
+            weights,
+            output_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride_x,
+            stride_y,
+            dilation,
+            padding,
+            groups,
+            config,
+        )
+    }
+
+    fn conv2d_backward_input_f32_with_precision(
+        &self,
+        output_grad: &Self::Tensor,
+        weights: &Self::Tensor,
+        input_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        precision: ConvPrecision,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _guard = ConvPrecisionGuard::new(self, precision);
+        self.conv2d_backward_input_f32(
+            output_grad,
+            weights,
+            input_shape,
+            input_channels,
+            input_height,
+            input_width,
+            filters,
+            kernel_size,
+            stride_x,
+            stride_y,
+            dilation,
+            padding,
+            groups,
+            config,
+        )
+    }
+
+    fn conv2d_backward_weights_f32_with_precision(
+        &self,
+        x: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        weight_shape: &[usize],
+        input_channels: usize,
+        input_height: usize,
+        input_width: usize,
+        filters: usize,
+        kernel_size: usize,
+        stride_x: usize,
+        stride_y: usize,
+        dilation: usize,
+        padding: usize,
+        groups: usize,
+        precision: ConvPrecision,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let _guard = ConvPrecisionGuard::new(self, precision);
+        self.conv2d_backward_weights_f32(
+            x,
+            output_grad,
+            weight_shape,
             input_channels,
             input_height,
             input_width,

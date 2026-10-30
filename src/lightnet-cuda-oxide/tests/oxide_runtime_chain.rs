@@ -8555,3 +8555,231 @@ fn native_yolo_loss_matches_hand_derived_single_truth() {
     assert!((metrics[0].total_iou - 1.0).abs() < 1e-5 && metrics[0].count == 1.0 && metrics[0].total_bbox == 1.0);
     assert!((metrics[0].classification_delta_squared - (0.64 + 0.49)).abs() < 1e-4);
 }
+
+/// Classic-YOLO GPU loss against the Rust CPU loss on the same network.
+///
+/// Each case builds a `[convolutional] -> [yolo]` net, runs the CPU forward/loss
+/// and the native Oxide forward/loss with identical parameters, then compares the
+/// head seeds, the scalar loss and the IoU stats. The CPU loss is the reference
+/// here; there is no compiled `raptor-fp4` golden in the repository.
+#[test]
+fn native_yolo_loss_matches_cpu_loss_across_cases() {
+    use lightnet_core::{YoloLabel, compute_yolo_training_loss_with_state};
+
+    struct Case {
+        name: &'static str,
+        yolo_extra: &'static str,
+        labels: Vec<YoloLabel>,
+    }
+    let label = |class_id: usize, x: f32, y: f32, w: f32, h: f32| YoloLabel {
+        class_id,
+        x,
+        y,
+        w,
+        h,
+    };
+    let cases = vec![
+        Case {
+            name: "single truth",
+            yolo_extra: "",
+            labels: vec![label(0, 0.5, 0.5, 0.25, 0.3)],
+        },
+        Case {
+            name: "multi truth in different cells",
+            yolo_extra: "",
+            labels: vec![label(0, 0.2, 0.2, 0.1, 0.1), label(1, 0.8, 0.7, 0.2, 0.15)],
+        },
+        Case {
+            name: "extra anchors via iou_thresh",
+            yolo_extra: "iou_thresh=0.4",
+            labels: vec![label(1, 0.5, 0.5, 0.5, 0.5)],
+        },
+        Case {
+            name: "objectness smoothing",
+            yolo_extra: "objectness_smooth=1",
+            labels: vec![label(0, 0.2, 0.2, 0.1, 0.1), label(1, 0.8, 0.7, 0.2, 0.15)],
+        },
+        Case {
+            name: "new_coords",
+            yolo_extra: "new_coords=1",
+            labels: vec![label(0, 0.45, 0.55, 0.2, 0.25)],
+        },
+        Case {
+            name: "truth_thresh positives",
+            yolo_extra: "truth_thresh=0.2",
+            labels: vec![label(1, 0.3, 0.7, 0.1, 0.1)],
+        },
+        Case {
+            name: "truth collision in one cell",
+            yolo_extra: "",
+            labels: vec![label(0, 0.5, 0.5, 0.3, 0.3), label(1, 0.52, 0.51, 0.28, 0.31)],
+        },
+        Case {
+            name: "max_delta clamp",
+            yolo_extra: "max_delta=0.5",
+            labels: vec![label(0, 0.5, 0.5, 0.25, 0.3)],
+        },
+        Case {
+            name: "delta_normalizer",
+            yolo_extra: "delta_normalizer=0.5",
+            labels: vec![label(0, 0.2, 0.2, 0.1, 0.1), label(1, 0.8, 0.7, 0.2, 0.15)],
+        },
+        Case {
+            name: "scale_x_y",
+            yolo_extra: "scale_x_y=1.2",
+            labels: vec![label(0, 0.5, 0.5, 0.25, 0.3)],
+        },
+        Case {
+            name: "tight ignore_thresh",
+            yolo_extra: "ignore_thresh=0.2",
+            labels: vec![label(0, 0.5, 0.5, 0.25, 0.3)],
+        },
+        Case {
+            name: "cls_normalizer",
+            yolo_extra: "cls_normalizer=2.0",
+            labels: vec![label(1, 0.5, 0.5, 0.25, 0.3)],
+        },
+    ];
+
+    for case in cases {
+        let cfg = format!(
+            "[net]\nbatch=1\nwidth=16\nheight=16\nchannels=1\n\
+             [convolutional]\nfilters=21\nsize=1\nactivation=linear\n\
+             [yolo]\nmask=0,1,2\nanchors=1,2, 3,4, 5,6\nclasses=2\nnum=3\niou_loss=ciou\n{}",
+            case.yolo_extra
+        );
+        let mut cpu = ExecutableNetwork::new(network(&cfg));
+        fill_params(&mut cpu.params);
+        let mut gpu = GpuExecutableNetwork::new(network(&cfg), OxideBackend::new().expect("Oxide backend"));
+        gpu.params = cpu.params.clone();
+        let input = patterned(cpu.network.net.input_shape());
+
+        let cpu_forward = cpu.forward_training(&input).expect("CPU YOLO forward");
+        let gpu_forward = gpu
+            .forward_training_with_state(&input)
+            .expect("native YOLO forward");
+        let host = compute_yolo_training_loss_with_state(
+            &cpu.network,
+            &cpu_forward,
+            std::slice::from_ref(&case.labels),
+            0,
+            None,
+        )
+        .expect("CPU YOLO loss");
+        let native = gpu
+            .compute_yolo_training_loss_gpu(&gpu_forward, std::slice::from_ref(&case.labels))
+            .expect("native YOLO loss")
+            .unwrap_or_else(|| panic!("{}: native loss declined a supported case", case.name));
+
+        assert_eq!(host.layer_output_gradient_seeds.len(), native.device_seeds.len(), "{}: seed count", case.name);
+        for (index, (host_seed, gpu_seed)) in host
+            .layer_output_gradient_seeds
+            .iter()
+            .zip(&native.device_seeds)
+            .enumerate()
+        {
+            match (host_seed, gpu_seed) {
+                (None, None) => {}
+                (Some(host_seed), Some(gpu_seed)) => {
+                    let gpu_host = gpu.backend.download_f32(gpu_seed).expect("download YOLO seed");
+                    close(
+                        &format!("{}: head #{index} seed", case.name),
+                        &host_seed.data,
+                        &gpu_host,
+                        2e-3,
+                    );
+                }
+                _ => panic!("{}: head #{index} seed presence mismatch", case.name),
+            }
+        }
+        close(&format!("{}: loss", case.name), &[host.loss], &[native.loss], 2e-3);
+        close(&format!("{}: avg_iou", case.name), &[host.avg_iou], &[native.avg_iou], 2e-3);
+        assert_eq!(host.box_count, native.box_count, "{}: box count", case.name);
+    }
+}
+
+/// Options the native kernel does not implement must decline, not mis-train.
+#[test]
+fn native_yolo_loss_declines_unsupported_options() {
+    use lightnet_core::YoloLabel;
+    let label = YoloLabel { class_id: 0, x: 0.5, y: 0.5, w: 0.25, h: 0.3 };
+    for extra in [
+        "iou_loss=giou",
+        "iou_loss=ciou\nfocal_loss=1",
+        "iou_loss=ciou\nlabel_smooth_eps=0.1",
+        "iou_loss=ciou\niou_thresh_kind=giou",
+        "iou_loss=ciou\nmax=2000",
+    ] {
+        let cfg = format!(
+            "[net]\nbatch=1\nwidth=16\nheight=16\nchannels=1\n\
+             [convolutional]\nfilters=6\nsize=1\nactivation=linear\n\
+             [yolo]\nmask=0\nanchors=1,2\nclasses=1\nnum=1\n{extra}"
+        );
+        let mut gpu = GpuExecutableNetwork::new(network(&cfg), OxideBackend::new().expect("Oxide backend"));
+        fill_params(&mut gpu.params);
+        let input = patterned(gpu.network.net.input_shape());
+        let forward = gpu
+            .forward_training_with_state(&input)
+            .expect("native YOLO forward");
+        let labels = vec![label.clone()];
+        let declined = gpu
+            .compute_yolo_training_loss_gpu(&forward, std::slice::from_ref(&labels))
+            .unwrap_or_else(|err| panic!("{extra}: unexpected error {err}"));
+        assert!(declined.is_none(), "{extra}: native loss must decline");
+    }
+}
+
+/// FP8 policy: only the convolution immediately before a detection or
+/// segmentation head is held on the f32 path; every other conv still quantises.
+#[test]
+fn fp8_policy_holds_the_head_boundary_conv_on_f32() {
+    use lightnet_cuda_oxide::GemmMode;
+
+    fn first_conv_output(cfg: &str, mode: GemmMode) -> Vec<f32> {
+        use lightnet_cuda_oxide::ConvMode;
+        let mut cpu = ExecutableNetwork::new(network(cfg));
+        fill_params(&mut cpu.params);
+        // Force the GEMM conv path: `Auto` sends these tiny nets to the direct
+        // kernel, which has no quantised variant and would hide the policy.
+        let mut gpu = GpuExecutableNetwork::new(
+            cpu.network.clone(),
+            OxideBackend::new()
+                .expect("Oxide backend")
+                .with_conv_mode(ConvMode::Gemm)
+                .with_gemm_mode(mode),
+        );
+        gpu.params = cpu.params.clone();
+        let input = patterned(cpu.network.net.input_shape());
+        let forward = gpu.forward_training_with_state(&input).expect("GPU forward");
+        gpu.backend
+            .download_f32(&forward.gpu_layer_outputs[0])
+            .expect("download conv output")
+    }
+
+    let yolo_cfg = "[net]\nbatch=1\nwidth=8\nheight=8\nchannels=1\n\
+                    [convolutional]\nfilters=6\nsize=3\nactivation=linear\n\
+                    [yolo]\nmask=0\nanchors=2,3\nclasses=1\nnum=1\niou_loss=ciou\n";
+    let stack_cfg = "[net]\nbatch=1\nwidth=8\nheight=8\nchannels=1\n\
+                     [convolutional]\nfilters=6\nsize=3\nactivation=linear\n\
+                     [convolutional]\nfilters=6\nsize=3\nactivation=linear\n";
+
+    // Conv -> [yolo]: the boundary conv must be bit-identical to the f32 kernel.
+    let fp8_head = first_conv_output(yolo_cfg, GemmMode::Fp8);
+    let f32_head = first_conv_output(yolo_cfg, GemmMode::Fp32);
+    assert_eq!(
+        fp8_head, f32_head,
+        "the convolution before a [yolo] head must run the f32 kernel under FP8"
+    );
+
+    // Conv -> conv: an ordinary convolution keeps the FP8 quantisation.
+    let fp8_body = first_conv_output(stack_cfg, GemmMode::Fp8);
+    let f32_body = first_conv_output(stack_cfg, GemmMode::Fp32);
+    let scale = f32_body.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+    assert!(
+        fp8_body
+            .iter()
+            .zip(&f32_body)
+            .any(|(a, b)| (a - b).abs() > 1e-4 * scale),
+        "an ordinary convolution must keep the FP8 GEMMs"
+    );
+}

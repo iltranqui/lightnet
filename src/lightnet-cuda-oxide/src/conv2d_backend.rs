@@ -1,8 +1,34 @@
 //! Conv2d backend dispatch.
 
-use lightnet_cuda::ElementwiseLaunchConfig;
+use std::sync::atomic::Ordering;
+
+use lightnet_cuda::{ConvPrecision, ElementwiseLaunchConfig};
 
 use crate::{OxideBackend, OxideError, OxideTensorF32};
+
+/// Scopes [`ConvPrecision`] to one conv call: the flag is restored on drop, so
+/// an error inside the call cannot leave the backend on the f32 path.
+pub(crate) struct ConvPrecisionGuard<'a> {
+    backend: &'a OxideBackend,
+    previous: bool,
+}
+
+impl<'a> ConvPrecisionGuard<'a> {
+    pub(crate) fn new(backend: &'a OxideBackend, precision: ConvPrecision) -> Self {
+        let previous = backend
+            .conv_low_precision_off
+            .swap(precision == ConvPrecision::NoLowPrecision, Ordering::Relaxed);
+        Self { backend, previous }
+    }
+}
+
+impl Drop for ConvPrecisionGuard<'_> {
+    fn drop(&mut self) {
+        self.backend
+            .conv_low_precision_off
+            .store(self.previous, Ordering::Relaxed);
+    }
+}
 
 impl OxideBackend {
     pub(crate) fn conv2d_f32_backend(
