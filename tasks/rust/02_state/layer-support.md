@@ -353,6 +353,8 @@ variants or non-layer work.
 | `Yolo3d` | raw forward + label/config helpers + supplied-seed optimizer tests exist; projected math/assignments/loss derivatives, mixed training APIs, decode/evaluator, A2 axis pin, depth/metric consumption do not | `yolo_3d_plan.md` |
 | `DsConv` multi-template extra-array Muon | CPU forward/exact backward and SGD/Adam done iextra offset arrays; matrix visitor is user WIP | `muon_runtime.rs` |
 | `Region` | CPU C++-style flatten/objectness/optional softmax and supplied-seed adjoint are implemented; truth-driven loss/decode remain open | detection-head wave |
+| Conv FP8 boundary | the `[convolutional]` immediately before `yolo`/OBB/Gaussian YOLO/`region`/`segmentation`/modern heads keeps f32 conv GEMMs under `LIGHTNET_OXIDE_GEMM=fp8`/`fp4` (`ConvPrecision::NoLowPrecision`, `runtime::conv_feeds_detection_head`, v0.2.208); AMP storage keeps its 16-bit GEMM. Conv Muon updates remain host-staged | `03_plans/lowprec/fp8_fp4.md` |
+| Classic YOLO GPU loss | native Ciou loss seeds/`avg_iou`/counts match the Rust CPU loss on 12 GPU cases and unsupported options decline (v0.2.208); no device-seed backward parity, no training run, no compiled-C++ golden | `PARITY_RAPTOR.md` |
 | `Detection` | parsed as identity; C++ decode + loss unimplemented in Rust | needs its own plan |
 | `Contrastive` detection branch | needs the yolo head's per-box class ids; `YoloHeadOutput` carries only the raw tensor | blocked on a head-metadata change |
 | CARPN Stage-2 training | `[obb_refine]` inference only; blocks `detector train -map` for CARPN | after `carpn_network_map_plan.md` |
