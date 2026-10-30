@@ -82,6 +82,7 @@ pub(crate) mod muon;
 pub(crate) mod muon_runtime;
 pub mod names;
 pub mod onnx;
+pub mod segmentation_data;
 pub use onnx::{OnnxOptions, export_onnx};
 pub mod obb_geometry;
 pub mod obb_labels;
@@ -157,7 +158,7 @@ pub use names::load_names_file;
 pub use runtime::{
     BackwardResult, BatchNormTrainBuffers, ConnectedTrainBuffers, ConvolutionalTrainBuffers,
     CrnnParams, CrnnTrainBuffers, DeformConvParams, DeformConvTrainBuffers, DsConvParams,
-    DsConvTrainBuffers, ExecutableNetwork, ForwardResult, GpuExecutableNetwork, GpuForwardState,
+    DsConvTrainBuffers, ExecutableNetwork, ForwardResult, GpuExecutableNetwork, GpuForwardState, GpuYoloLoss,
     GpuForwardSummary, HyperbolicFoveationParams, HyperbolicFoveationTrainBuffers,
     KimiKdaTrainBuffers, LayerParams, LayerTrainBuffers, LossScaler, LstmParams, LstmTrainBuffers,
     MambaVisionTrainBuffers, RecurrentForwardCache, ScaleStep, RecursiveBlockForwardCache,

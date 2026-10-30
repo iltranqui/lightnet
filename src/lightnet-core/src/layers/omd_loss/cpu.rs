@@ -1,5 +1,5 @@
 //! `[omd_loss]`: the observable-matrix / metric-geometry auxiliary loss
-//! (Phase 1b of `tasks/rust/layers.md`), ported from
+//! (Phase 1b of `tasks/rust/04_reference/layers.md`), ported from
 //! `Jev_laya:src-lib/omd_loss_layer.cpp` and its cfg parser.
 //!
 //! The layer is a **pass-through** for the forward (`output == input`) and for

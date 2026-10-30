@@ -1350,7 +1350,7 @@ fn softmax_axis_layout_pins_per_batch_contiguous_groups_and_adjoint() {
     let groups = 3;
     let per_batch = shape.element_count();
     let group_size = per_batch / groups;
-    let output = forward_softmax(&input, groups).expect("grouped softmax forward");
+    let output = forward_softmax(&input, groups, false).expect("grouped softmax forward");
 
     // C++ passes n=inputs/groups, groups, group_offset=n, and batch_offset=inputs:
     // every sample is split into contiguous flat groups, not per-channel groups.
@@ -1392,7 +1392,7 @@ fn softmax_axis_layout_pins_per_batch_contiguous_groups_and_adjoint() {
             .collect(),
     )
     .expect("softmax axis seed");
-    let input_gradient = backward_softmax(&output, &seed, groups).expect("softmax adjoint");
+    let input_gradient = backward_softmax(&output, &seed, groups, false).expect("softmax adjoint");
     for batch in 0..shape.batch {
         for group in 0..groups {
             let start = batch * per_batch + group * group_size;
@@ -1411,6 +1411,26 @@ fn softmax_axis_layout_pins_per_batch_contiguous_groups_and_adjoint() {
             }
         }
     }
+}
+
+#[test]
+fn spatial_softmax_normalizes_channels_per_pixel_and_has_correct_adjoint() {
+    let cfg = ConfigFile::parse_str("spatial.cfg", "[net]\nwidth=2\nheight=1\nchannels=2\nbatch=1\n[softmax]\nspatial=1\n").unwrap();
+    let network = Network::from_config(cfg).unwrap();
+    assert!(matches!(network.layers[0].kind, LayerKind::Softmax { spatial: true, .. }));
+    let shape = TensorShape::new(2, 1, 2, 1);
+    let input = Tensor::from_data(shape, vec![0.0, 2.0, 0.0, 0.0]).unwrap();
+    let output = forward_softmax(&input, 1, true).unwrap();
+    assert!((output.data[0] - 0.5).abs() < 1e-6);
+    assert!((output.data[2] - 0.5).abs() < 1e-6);
+    assert!((output.data[1] - 0.8807971).abs() < 1e-6);
+    assert!((output.data[3] - 0.1192029).abs() < 1e-6);
+    let seed = Tensor::from_data(shape, vec![1.0, 1.0, 0.0, 0.0]).unwrap();
+    let grad = backward_softmax(&output, &seed, 1, true).unwrap();
+    assert!((grad.data[0] - 0.25).abs() < 1e-6);
+    assert!((grad.data[2] + 0.25).abs() < 1e-6);
+    assert!((grad.data[1] - 0.1049936).abs() < 1e-6);
+    assert!((grad.data[3] + 0.1049936).abs() < 1e-6);
 }
 
 #[test]

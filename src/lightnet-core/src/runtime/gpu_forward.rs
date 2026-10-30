@@ -951,8 +951,13 @@ where
                 (LayerKind::ChannelShuffle(spec), LayerParams::None) => {
                     self.forward_channel_shuffle_gpu(layer, spec, current_input, launch_config)?
                 }
-                (LayerKind::Softmax { groups }, LayerParams::None) => {
-                    self.forward_softmax_gpu(layer, *groups, current_input, launch_config)?
+                (LayerKind::Softmax { groups, spatial }, LayerParams::None) => {
+                    if *spatial {
+                        self.backend.spatial_softmax_f32(current_input, &tensor_backend_shape(layer.output_shape), launch_config)
+                            .map_err(|err| backend_error("spatial softmax", err))?
+                    } else {
+                        self.forward_softmax_gpu(layer, *groups, current_input, launch_config)?
+                    }
                 }
                 (LayerKind::ScaleChannels(spec), LayerParams::None) => {
                     let (output, activation_input) = self.forward_scale_channels_gpu(

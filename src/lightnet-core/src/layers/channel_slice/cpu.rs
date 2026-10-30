@@ -1,4 +1,4 @@
-//! `[channel_slice]` host math (tasks/rust/layers.md Task 7).
+//! `[channel_slice]` host math (tasks/rust/04_reference/layers.md Task 7).
 //!
 //! Copies channels `[start, end)` of the OUTPUT of the layer named by `from`
 //! (not of the previous layer).

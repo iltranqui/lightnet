@@ -348,25 +348,90 @@ fn swin_resident_deferred_sgd_and_adam_match_cpu() {
 }
 
 #[test]
-fn swin_deferred_sgd_to_muon_requires_synchronization() {
+fn swin_resident_muon_deferred_updates_and_resume_match_cpu() {
+    for &(extra, width, height, channels) in &CASES[..2] {
+        let mut cpu = network(extra, width, height, channels);
+        cpu.network.net.muon = true;
+        cpu.network.net.adam = false;
+        cpu.network.net.decoupled_decay = true;
+        cpu.network.net.decay = 0.03;
+        let input = input_for(width, height, channels, 43);
+        let mut gpu = GpuExecutableNetwork::new(cpu.network.clone(), OxideBackend::new().unwrap());
+        gpu.params = cpu.params.clone();
+        gpu.init_train_buffers_gpu().unwrap();
+        for iteration in 0..2 {
+            let cpu_state = cpu.forward_training(&input).unwrap();
+            let gpu_state = gpu.forward_training_with_state(&input).unwrap();
+            assert!(gpu_state.cpu_forward.swin_caches[0].is_none(), "expected native Swin");
+            let expected = cpu_state.final_output().unwrap();
+            close("Muon forward", &gpu_state.cpu_forward.final_output().unwrap().data,
+                &expected.data, 2e-4);
+            let seeds = [Some(Tensor::from_data(expected.shape, vec![0.01; expected.len()]).unwrap())];
+            let cpu_backward = cpu.backward_accumulate_seeded(&input, &cpu_state, &seeds).unwrap();
+            let gpu_backward = gpu.backward_accumulate_seeded_gpu_with_input_gradient(&gpu_state, &seeds)
+                .unwrap().expect("Swin input gradient");
+            close("Muon input gradient", &gpu_backward.data, &cpu_backward.input_gradient.data, 5e-4);
+            gpu.synchronize_resident_parameter_gradients().unwrap();
+            close("Muon gradients", &swin_updates(&gpu.host_fallback_train_buffers()[0]),
+                &swin_updates(&cpu.train_buffers[0]), 5e-4);
+            cpu.update_weights_muon(0.003, 2).unwrap();
+            let before = swin_blob(&gpu.params[0]);
+            gpu.update_weights_gpu_deferred(0.003, 0.9, 0.03, 2).unwrap();
+            assert_eq!(swin_blob(&gpu.params[0]), before, "deferred update changed host mirror");
+            let output = gpu.forward_compact(&input).unwrap().final_output.unwrap();
+            close("Muon deferred output", &output.data,
+                &cpu.forward(&input).unwrap().final_output().unwrap().data, 5e-4);
+            assert!(gpu.backward_accumulate_seeded_gpu(&gpu_state, &seeds).is_err(),
+                "stale Swin tape accepted after Muon update");
+            if iteration == 0 {
+                let path = std::env::temp_dir().join(format!(
+                    "lightnet-swin-muon-{}-{channels}.dnopt", std::process::id()));
+                let weights_path = path.with_extension("weights");
+                gpu.save_optimizer_state(&path).unwrap();
+                gpu.synchronize_resident_parameter_state().unwrap();
+                save_weights(&gpu.network, &gpu.params, &weights_path, 0).unwrap();
+                let mut restored = GpuExecutableNetwork::new(cpu.network.clone(), OxideBackend::new().unwrap());
+                restored.load_weights_file(&weights_path).unwrap();
+                restored.init_train_buffers_gpu().unwrap();
+                restored.load_optimizer_state(&path).unwrap();
+                std::fs::remove_file(path).unwrap();
+                std::fs::remove_file(weights_path).unwrap();
+                gpu = restored;
+            }
+        }
+        gpu.synchronize_resident_parameter_state().unwrap();
+        close("Muon resumed weights", &swin_blob(&gpu.params[0]), &swin_blob(&cpu.params[0]), 5e-4);
+    }
+}
+
+#[test]
+fn swin_deferred_sgd_to_muon_keeps_resident_weights() {
     let (extra,width,height,channels)=CASES[0];
-    let cpu=network(extra,width,height,channels); let input=input_for(width,height,channels,39);
+    let mut cpu=network(extra,width,height,channels); let input=input_for(width,height,channels,39);
     let mut gpu=GpuExecutableNetwork::new(cpu.network.clone(),OxideBackend::new().unwrap());
     gpu.params=cpu.params.clone(); gpu.init_train_buffers_gpu().unwrap();
+    let cpu_state=cpu.forward_training(&input).unwrap();
     let state=gpu.forward_training_with_state(&input).unwrap();
     let shape=state.cpu_forward.final_output().unwrap().shape;
     let seeds=[Some(Tensor::from_data(shape,vec![0.01;shape.batch*shape.element_count()]).unwrap())];
+    cpu.backward_accumulate_seeded(&input,&cpu_state,&seeds).unwrap();
     gpu.backward_accumulate_seeded_gpu(&state,&seeds).unwrap();
+    cpu.update_weights(0.003,0.9,0.03,2);
+    let initial=swin_blob(&gpu.params[0]);
     gpu.update_weights_gpu_deferred(0.003,0.9,0.03,2).unwrap();
+    cpu.network.net.muon=true; cpu.network.net.adam=false; cpu.network.net.decoupled_decay=true;
     gpu.network.net.muon=true; gpu.network.net.adam=false; gpu.network.net.decoupled_decay=true;
-    assert!(gpu.forward_training_with_state(&input).is_err());
-    assert!(gpu.forward_compact(&input).is_err());
-    assert!(gpu.update_weights_gpu(0.003,0.9,0.03,2).is_err());
-    gpu.synchronize_resident_parameter_state().unwrap();
+    let cpu_state=cpu.forward_training(&input).unwrap();
     let state=gpu.forward_training_with_state(&input).unwrap();
-    gpu.zero_train_buffers_gpu().unwrap();
+    close("switched resident forward", &state.cpu_forward.final_output().unwrap().data,
+        &cpu_state.final_output().unwrap().data, 5e-4);
+    cpu.backward_accumulate_seeded(&input,&cpu_state,&seeds).unwrap();
     gpu.backward_accumulate_seeded_gpu(&state,&seeds).unwrap();
-    gpu.update_weights_gpu(0.003,0.9,0.03,2).unwrap();
+    cpu.update_weights_muon(0.003,2).unwrap();
+    gpu.update_weights_gpu_deferred(0.003,0.9,0.03,2).unwrap();
+    assert_eq!(swin_blob(&gpu.params[0]),initial,"optimizer switch changed host mirror");
+    gpu.synchronize_resident_parameter_state().unwrap();
+    close("switched resident weights",&swin_blob(&gpu.params[0]),&swin_blob(&cpu.params[0]),5e-4);
 }
 
 #[test]
@@ -387,6 +452,7 @@ fn swin_switch_to_muon_preserves_accumulated_resident_gradients() {
     gpu.network.net.adam = false;
     gpu.network.net.decoupled_decay = true;
     gpu.forward_training_with_state(&input).unwrap();
+    gpu.synchronize_resident_parameter_gradients().unwrap();
     close("gradients after switching to Muon", &swin_updates(&gpu.host_fallback_train_buffers()[0]),
         &swin_updates(&cpu.train_buffers[0]), 5e-4);
 }

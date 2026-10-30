@@ -360,6 +360,46 @@ fn jev_ce_native_full_and_compact_forward_match_cpu_for_both_layouts() {
 }
 
 #[test]
+fn classic_yolo_activation_matches_reference_layout() {
+    let backend = OxideBackend::new().expect("Oxide backend");
+    let shape = [1, 7, 1, 2];
+    let values: Vec<f32> = (0..14).map(|i| (i as f32 - 7.0) * 0.1).collect();
+    let input = backend.upload_f32(&shape, &values).unwrap();
+    for new_coords in [false, true] {
+        let output = backend.yolo_activate_f32(&input, &shape, 2, 1.05, new_coords, Default::default()).unwrap();
+        let actual = backend.download_f32(&output).unwrap();
+        let expected: Vec<f32> = values.iter().enumerate().map(|(i, v)| {
+            let entry = (i / 2) % 7;
+            let mut value = *v;
+            if !new_coords && entry != 2 && entry != 3 { value = 1.0 / (1.0 + (-value).exp()); }
+            if entry < 2 { value = value * 1.05 - 0.025; }
+            value
+        }).collect();
+        close("YOLO activation", &expected, &actual, 1e-6);
+    }
+}
+
+#[test]
+fn spatial_softmax_native_backward_matches_channel_jacobian() {
+    let backend = OxideBackend::new().expect("Oxide backend");
+    let shape = [1, 2, 1, 2];
+    let y = [0.5, 0.8807971, 0.5, 0.1192029];
+    let dy = [1.0, 1.0, 0.0, 0.0];
+    let y_gpu = backend.upload_f32(&shape, &y).unwrap();
+    let logits = backend.upload_f32(&shape, &[0.0, 2.0, 0.0, 0.0]).unwrap();
+    let actual = backend.spatial_softmax_f32(&logits, &shape, Default::default()).unwrap();
+    close("spatial softmax forward", &y, &backend.download_f32(&actual).unwrap(), 2e-6);
+    let single_shape = [1, 1, 1, 2];
+    let single = backend.upload_f32(&single_shape, &[0.0, 2.0]).unwrap();
+    let single = backend.spatial_softmax_f32(&single, &single_shape, Default::default()).unwrap();
+    close("single-channel softmax", &[1.0, 1.0], &backend.download_f32(&single).unwrap(), 2e-6);
+    let dy_gpu = backend.upload_f32(&shape, &dy).unwrap();
+    let dx = backend.spatial_softmax_backward_f32(&y_gpu, &dy_gpu, &shape, Default::default()).unwrap();
+    let dx = backend.download_f32(&dx).unwrap();
+    close("spatial softmax backward", &[0.25, 0.1049936, -0.25, -0.1049936], &dx, 2e-6);
+}
+
+#[test]
 fn segmentation_native_full_and_compact_forward_match_cpu() {
     for classes in [1usize, 3] {
         let cfg = format!(
@@ -8470,4 +8510,48 @@ fn dsconv_gpu_muon_two_step_update_matches_cpu() {
             8e-4,
         );
     }
+}
+
+#[test]
+fn spatial_softmax_f16_storage_matches_f32_with_temperature() {
+    let backend = OxideBackend::new().expect("Oxide backend");
+    let shape = [1, 3, 1, 2];
+    let values = [0.5f32, -1.0, 1.5, 0.25, -0.75, 2.0];
+    let input = backend.upload_f32(&shape, &values).unwrap();
+    let half = backend.to_half_storage(&input).unwrap();
+    assert!(half.is_half());
+    let plain = backend.spatial_softmax_f32(&half, &shape, Default::default()).unwrap();
+    assert!(plain.is_half(), "f16 input must stay in f16 storage");
+    let expected = backend.spatial_softmax_f32(&input, &shape, Default::default()).unwrap();
+    close("f16 spatial softmax", &backend.download_f32(&expected).unwrap(), &backend.download_f32(&plain).unwrap(), 2e-3);
+    let temperature = 2.0;
+    let scaled = backend.segmentation_forward_f32(&half, &shape, 3, temperature, Default::default()).unwrap();
+    assert!(scaled.is_half());
+    let reference = backend.segmentation_forward_f32(&input, &shape, 3, temperature, Default::default()).unwrap();
+    close("f16 segmentation softmax T=2", &backend.download_f32(&reference).unwrap(), &backend.download_f32(&scaled).unwrap(), 2e-3);
+}
+
+#[test]
+fn native_yolo_loss_matches_hand_derived_single_truth() {
+    use lightnet_cuda::YoloGpuLossArgs;
+    let backend = OxideBackend::new().expect("Oxide backend");
+    // One 1x1 grid, one anchor, one class: entries tx, ty, tw, th, obj, class.
+    let shape = [1, 6, 1, 1];
+    let output = backend.upload_f32(&shape, &[0.5, 0.5, 0.0, 0.0, 0.2, 0.3]).unwrap();
+    // Truth exactly matches the anchor-sized prediction centered in the cell.
+    let truth = backend.upload_f32(&[1, 5, 1, 1], &[0.5, 0.5, 0.5, 0.5, 0.0]).unwrap();
+    let args = YoloGpuLossArgs {
+        classes: 1, anchors: 1, total_anchors: 1, max_boxes: 1, truth_size: 5, truths: 5,
+        net_width: 10, net_height: 10, ignore_thresh: 0.7, iou_normalizer: 0.07, obj_normalizer: 1.0,
+        max_delta: f32::MAX, new_coords: false, objectness_smooth: false, iou_thresh: 1.0, truth_thresh: 1.0,
+        mask: vec![0], biases: vec![5.0, 5.0],
+    };
+    let (delta, metrics) = backend.yolo_loss_f32(&output, &truth, &shape, &args, Default::default()).unwrap().unwrap();
+    let delta = backend.download_f32(&delta).unwrap();
+    // Prediction equals the truth: IoU 1; objectness and class deltas follow the targets.
+    assert!(delta[..4].iter().all(|v| v.is_finite()));
+    close("YOLO objectness/class delta", &[0.8, 0.7], &delta[4..], 1e-5);
+    assert_eq!(metrics.len(), 1);
+    assert!((metrics[0].total_iou - 1.0).abs() < 1e-5 && metrics[0].count == 1.0 && metrics[0].total_bbox == 1.0);
+    assert!((metrics[0].classification_delta_squared - (0.64 + 0.49)).abs() < 1e-4);
 }

@@ -1,5 +1,5 @@
 //! `[laya_scorer]`: the LAYA decision-model scorer (Phase 1b of
-//! `tasks/rust/layers.md`, unblocked by Open Question 2), ported from
+//! `tasks/rust/04_reference/layers.md`, unblocked by Open Question 2), ported from
 //! `Jev_laya:src-lib/laya_scorer_layer.cpp`.
 //!
 //! A frozen 3-stage MLP applied **independently to each option slot** (no

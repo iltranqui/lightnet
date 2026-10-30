@@ -1,5 +1,5 @@
 //! `[laya_encoder]`: the frozen LAYA ModernBERT-large encoder (Phase 4 of
-//! `tasks/rust/layers.md`), ported from
+//! `tasks/rust/04_reference/layers.md`), ported from
 //! `Jev_laya:src-lib/laya_encoder_layer.cpp`.
 //!
 //! Frozen, CPU forward only (C++ `freeze=1`, backward is a no-op).  A

@@ -1,4 +1,4 @@
-//! `[moe_convolutional]` router maths (Phase 2B of `tasks/rust/layers.md`),
+//! `[moe_convolutional]` router maths (Phase 2B of `tasks/rust/04_reference/layers.md`),
 //! ported from `Jev_laya:src-lib/moe_convolutional_layer.cpp`.
 //!
 //! The layer owns `experts` ordinary Darknet convolutional layers plus a tiny

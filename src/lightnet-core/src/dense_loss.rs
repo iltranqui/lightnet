@@ -1,4 +1,4 @@
-//! Host loss for dense-truth heads (tasks/rust/layers.md Task 10).
+//! Host loss for dense-truth heads (tasks/rust/04_reference/layers.md Task 10).
 
 use crate::error::{Error, Result};
 use crate::model::{LayerKind, Network};

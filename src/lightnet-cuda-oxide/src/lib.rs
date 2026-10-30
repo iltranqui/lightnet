@@ -2174,6 +2174,10 @@ impl F32TensorOpsBackend for OxideBackend {
     type Error = OxideError;
     type Tensor = OxideTensorF32;
 
+    fn tensor_shape(&self, tensor: &OxideTensorF32) -> Option<Vec<usize>> {
+        Some(tensor.shape.clone())
+    }
+
     fn any_non_finite_f32(&self, tensor: &Self::Tensor) -> Result<bool, Self::Error> {
         let input = self.f32v(tensor)?;
         if input.len() == 0 { return Ok(false); }
@@ -4568,6 +4572,20 @@ fn clifford_fourier_backward_f32(&self, input: &Self::Tensor, grad: &Self::Tenso
         self.shortcut_fit_backend_f32(x, batch, output_shape, config)
     }
 
+    fn vit_msa_forward_f32(&self, qkv: &Self::Tensor, batch: usize, tokens: usize,
+        channels: usize, heads: usize, block: usize, topk: usize, config: ElementwiseLaunchConfig,
+    ) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        self.vit_msa_forward_backend_f32(qkv, batch, tokens, channels, heads, block, topk, config)
+    }
+
+    fn vit_msa_backward_f32(&self, qkv: &Self::Tensor, probabilities: &Self::Tensor,
+        active: &Self::Tensor, context: &Self::Tensor, grad: &Self::Tensor,
+        batch: usize, tokens: usize, channels: usize, heads: usize, config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        self.vit_msa_backward_backend_f32(qkv, probabilities, active, context, grad,
+            batch, tokens, channels, heads, config)
+    }
+
     fn flash_attention_forward_f32(
         &self,
         qkv: &Self::Tensor,
@@ -4770,6 +4788,33 @@ fn clifford_fourier_backward_f32(&self, input: &Self::Tensor, grad: &Self::Tenso
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         self.modern_yolo_forward_backend_f32(x, shape, classes, config)
+    }
+
+    fn yolo_activate_f32(
+        &self, x: &Self::Tensor, shape: &[usize], classes: usize,
+        scale_xy: f32, new_coords: bool, config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        self.yolo_activate_backend_f32(x, shape, classes, scale_xy, new_coords, config)
+    }
+
+    fn yolo_loss_f32(
+        &self, output: &Self::Tensor, truth: &Self::Tensor, shape: &[usize],
+        args: &lightnet_cuda::YoloGpuLossArgs, config: ElementwiseLaunchConfig,
+    ) -> Result<Option<(Self::Tensor, Vec<lightnet_cuda::YoloImageMetrics>)>, Self::Error> {
+        self.yolo_loss_backend_f32(output, truth, shape, args, config).map(Some)
+    }
+
+    fn spatial_softmax_f32(
+        &self, input: &Self::Tensor, shape: &[usize], config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        self.spatial_softmax_backend_f32(input, shape, config)
+    }
+
+    fn spatial_softmax_backward_f32(
+        &self, output: &Self::Tensor, output_grad: &Self::Tensor,
+        shape: &[usize], config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        self.spatial_softmax_backend_backward_f32(output, output_grad, shape, config)
     }
 
     fn segmentation_forward_f32(

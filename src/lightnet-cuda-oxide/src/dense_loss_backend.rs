@@ -1,10 +1,92 @@
 //! Dense detection-head forward backend operations.
 
-use lightnet_cuda::ElementwiseLaunchConfig;
+use cuda_core::DeviceBuffer;
+use lightnet_cuda::{ElementwiseLaunchConfig, YoloGpuLossArgs, YoloImageMetrics};
 
 use crate::{launch, launch_err, shape_err, OxideBackend, OxideError, OxideTensorF32};
 
 impl OxideBackend {
+    /// Native classic-YOLO CIoU loss: four kernels (background + threshold positives,
+    /// sequential per-image truth assignment, optional per-cell averaging, reduction).
+    pub(crate) fn yolo_loss_backend_f32(
+        &self, output: &OxideTensorF32, truth: &OxideTensorF32, shape: &[usize],
+        args: &YoloGpuLossArgs, config: ElementwiseLaunchConfig,
+    ) -> Result<(OxideTensorF32, Vec<YoloImageMetrics>), OxideError> {
+        let op = "yolo_loss_f32";
+        let output_f = self.f32v(output)?;
+        let output = &*output_f;
+        let truth_f = self.f32v(truth)?;
+        let truth = &*truth_f;
+        let entries = args.classes + 5;
+        if shape.len() != 4 || shape.contains(&0) || output.shape() != shape || shape[1] != args.anchors * entries
+            || args.anchors == 0 || args.mask.len() != args.anchors
+        {
+            return Err(shape_err(op, format!("incompatible YOLO shape {shape:?}, classes {}, anchors {}", args.classes, args.anchors)));
+        }
+        if args.total_anchors > 32 || args.max_boxes > 1024 || args.biases.len() < 2 * args.total_anchors
+            || args.mask.iter().any(|&m| m >= args.total_anchors) || args.truth_size < 5
+            || args.truths < args.max_boxes * args.truth_size || truth.len() < shape[0] * args.truths
+        {
+            return Err(shape_err(op, "unsupported anchor/box counts or truth layout".into()));
+        }
+        let batches = shape[0];
+        let spatial = shape[2] * shape[3];
+        let outputs = shape[1] * spatial;
+        let dims: Vec<u32> = [
+            shape[3], shape[2], args.anchors, args.total_anchors, args.classes, args.max_boxes, args.truth_size,
+            args.truths, outputs, args.net_width, args.net_height, args.new_coords as usize, args.objectness_smooth as usize,
+        ].iter().map(|&v| v as u32).collect();
+        let params = [args.ignore_thresh, args.iou_normalizer, args.obj_normalizer, args.max_delta, args.iou_thresh, args.truth_thresh];
+        let mask: Vec<u32> = args.mask.iter().map(|&m| m as u32).collect();
+        let dims = DeviceBuffer::<u32>::from_host(&self.stream, &dims)?;
+        let params = DeviceBuffer::<f32>::from_host(&self.stream, &params)?;
+        let mask = DeviceBuffer::<u32>::from_host(&self.stream, &mask)?;
+        let biases = DeviceBuffer::<f32>::from_host(&self.stream, &args.biases)?;
+        let per_image = args.anchors * spatial;
+        let mut delta = self.alloc(batches * outputs)?;
+        let mut flags = self.alloc(batches * per_image)?;
+        let mut metrics = self.alloc(batches * 7)?;
+        // SAFETY: shapes validated above; each kernel's threads own disjoint delta/flag/metric slots, and
+        // the sequential kernels are ordered on one stream.
+        unsafe {
+            self.dense_loss.yolo_loss_background(
+                &self.stream, launch::elementwise(batches * per_image, config),
+                &output.buf, &truth.buf, &mut delta, &mut flags, &dims, &params, &mask, &biases, batches,
+            ).map_err(launch_err)?;
+            self.dense_loss.yolo_loss_positives(
+                &self.stream, launch::elementwise(batches, config),
+                &output.buf, &truth.buf, &mut delta, &mut metrics, &dims, &params, &mask, &biases, batches,
+            ).map_err(launch_err)?;
+            if args.iou_thresh < 1.0 {
+                self.dense_loss.yolo_loss_average(
+                    &self.stream, launch::elementwise(batches * per_image, config), &mut delta, &dims, batches,
+                ).map_err(launch_err)?;
+            }
+            self.dense_loss.yolo_loss_reduce(
+                &self.stream, launch::elementwise(batches, config), &delta, &flags, &mut metrics, &dims, batches,
+            ).map_err(launch_err)?;
+        }
+        let records = metrics.to_host_vec(&self.stream)?;
+        let per_image_metrics = records.chunks_exact(7).map(YoloImageMetrics::from_record).collect();
+        Ok((OxideTensorF32::new(delta, shape), per_image_metrics))
+    }
+
+    pub(crate) fn yolo_activate_backend_f32(
+        &self, x: &OxideTensorF32, shape: &[usize], classes: usize,
+        scale_xy: f32, new_coords: bool, config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let x_f = self.f32v(x)?;
+        let x = &*x_f;
+        let op = "yolo_activate_f32";
+        let entries = classes.checked_add(5).ok_or_else(|| shape_err(op, "entry count overflow".into()))?;
+        if shape.len() != 4 || shape.contains(&0) || shape.iter().product::<usize>() != x.len() || x.shape() != shape || shape[1] % entries != 0 {
+            return Err(shape_err(op, format!("incompatible YOLO shape {shape:?}, classes {classes}")));
+        }
+        let mut output = self.alloc_uninit(x.len())?;
+        // SAFETY: shape validation bounds input and output; one thread per element.
+        unsafe { self.dense_loss.yolo_activate(&self.stream, launch::elementwise(x.len(), config), &x.buf, &mut output, shape[2] * shape[3], entries, scale_xy, new_coords) }.map_err(launch_err)?;
+        Ok(OxideTensorF32::new(output, shape))
+    }
     pub(crate) fn centernet_forward_backend_f32(
         &self,
         x: &OxideTensorF32,
@@ -101,6 +183,10 @@ impl OxideBackend {
         temperature: f32,
         config: ElementwiseLaunchConfig,
     ) -> Result<OxideTensorF32, OxideError> {
+        if x.is_half() && shape.len() == 4 && shape[1] == classes && classes > 1 {
+            let out = self.spatial_softmax_f16(&self.as_half(x)?, shape, temperature, config)?;
+            return Ok(self.wrap_half(out));
+        }
         let x_f = self.f32v(x)?;
         let x = &*x_f;
         let op = "segmentation_forward_f32";

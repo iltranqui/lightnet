@@ -7,6 +7,10 @@ impl F32TensorOpsBackend for CutileBackend {
     type Error = CutileBackendError;
     type Tensor = CutileTensorF32;
 
+    fn tensor_shape(&self, tensor: &CutileTensorF32) -> Option<Vec<usize>> {
+        Some(tensor.shape().iter().map(|&d| d as usize).collect())
+    }
+
     fn upload_f32(&self, shape: &[usize], host: &[f32]) -> Result<Self::Tensor, Self::Error> {
         CutileBackend::upload_f32(self, shape, host)
     }

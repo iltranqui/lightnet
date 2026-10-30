@@ -1,4 +1,4 @@
-//! `maxpool_depth` host math (tasks/rust/layers.md Task 4).
+//! `maxpool_depth` host math (tasks/rust/04_reference/layers.md Task 4).
 //!
 //! C++ `maxpool_depth=1`: output channel `g` is the max over input channels
 //! `g, g + out_c, g + 2*out_c, ...` at the same pixel; spatial size is unchanged.

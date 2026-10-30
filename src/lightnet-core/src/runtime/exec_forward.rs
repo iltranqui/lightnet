@@ -168,8 +168,8 @@ impl ExecutableNetwork {
                     current_input.expect("upsample input"),
                     layer.output_shape,
                 )?,
-                (LayerKind::Softmax { groups }, LayerParams::None) => {
-                    forward_softmax(current_input.expect("softmax input"), *groups)?
+                (LayerKind::Softmax { groups, spatial }, LayerParams::None) => {
+                    forward_softmax(current_input.expect("softmax input"), *groups, *spatial)?
                 }
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::ObbYolo(_), LayerParams::None)
@@ -913,8 +913,8 @@ impl ExecutableNetwork {
                 | (LayerKind::Detection(_), LayerParams::None)
                 | (LayerKind::Cost { .. }, LayerParams::None)
                 | (LayerKind::Regression(_), LayerParams::None) => (current_input.clone(), None),
-                (LayerKind::Softmax { groups }, LayerParams::None) => {
-                    (forward_softmax(current_input, *groups)?, None)
+                (LayerKind::Softmax { groups, spatial }, LayerParams::None) => {
+                    (forward_softmax(current_input, *groups, *spatial)?, None)
                 }
                 (
                     LayerKind::Dropout {

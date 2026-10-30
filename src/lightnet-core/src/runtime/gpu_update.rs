@@ -1028,12 +1028,6 @@ where
             self.retire_resident_parameter_banks()?;
         }
         if self.network.net.muon {
-            // Preserve accumulated resident gradients before entering host-staged Muon.
-            for index in 0..self.network.layers.len() {
-                if matches!(self.network.layers[index].kind, LayerKind::Swin(_)) {
-                    self.retire_swin_bank_for_muon(index)?;
-                }
-            }
             return self.update_weights_gpu_muon(lr, decay, batch, sync_host_weights);
         }
         let config = ElementwiseLaunchConfig::default();

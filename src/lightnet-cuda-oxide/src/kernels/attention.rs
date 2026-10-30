@@ -6,6 +6,108 @@ use cuda_device::{DisjointSlice, cuda_module, kernel, thread};
 pub mod kernels {
     use super::*;
 
+    /// ViT MSA scores in `[batch, heads, query, key]` order. The activity
+    /// flag records the score-clamp derivative before selecting blocks.
+    #[kernel]
+    pub fn vit_msa_scores(qkv: &[f32], mut scores: DisjointSlice<f32>,
+        mut active: DisjointSlice<f32>, tokens: usize, channels: usize, heads: usize) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= scores.len() { return; }
+        let key = i % tokens;
+        let query = (i / tokens) % tokens;
+        let head = (i / (tokens * tokens)) % heads;
+        let batch = i / (tokens * tokens * heads);
+        let dim = channels / heads;
+        let qbase = (batch * tokens + query) * 3 * channels + head * dim;
+        let kbase = (batch * tokens + key) * 3 * channels + channels + head * dim;
+        let mut dot = 0.0f32;
+        for d in 0..dim {
+            let q = qkv[qbase + d];
+            let k = qkv[kbase + d];
+            let q = if q.is_finite() { q.max(-128.0).min(128.0) } else { 0.0 };
+            let k = if k.is_finite() { k.max(-128.0).min(128.0) } else { 0.0 };
+            dot += q * k;
+        }
+        let raw = dot / (dim as f32).sqrt();
+        let score = if raw.is_nan() { 0.0 } else { raw.max(-10.0).min(10.0) };
+        if let Some(dst) = scores.get_mut(idx) { *dst = score; }
+        if let Some(dst) = active.get_mut(thread::index_1d()) {
+            *dst = if raw.is_finite() && raw.abs() < 10.0 { 1.0 } else { 0.0 };
+        }
+    }
+
+    /// Each thread owns one output channel and gathers the selected values.
+    #[kernel]
+    pub fn vit_msa_context(qkv: &[f32], probabilities: &[f32],
+        mut context: DisjointSlice<f32>, tokens: usize, channels: usize, heads: usize) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= context.len() { return; }
+        let channel = i % channels;
+        let query = (i / channels) % tokens;
+        let batch = i / (channels * tokens);
+        let head = channel / (channels / heads);
+        let row = ((batch * heads + head) * tokens + query) * tokens;
+        let mut value = 0.0f32;
+        for key in 0..tokens {
+            value += probabilities[row + key] * qkv[(batch * tokens + key) * 3 * channels + 2 * channels + channel];
+        }
+        if let Some(dst) = context.get_mut(idx) { *dst = value; }
+    }
+
+    /// Gather dQ, dK and dV in the original fused per-token QKV order.
+    #[kernel]
+    pub fn vit_msa_backward(qkv: &[f32], probabilities: &[f32], active: &[f32],
+        context: &[f32], grad: &[f32], mut dqkv: DisjointSlice<f32>,
+        tokens: usize, channels: usize, heads: usize) {
+        let idx = thread::index_1d();
+        let i = idx.get();
+        if i >= dqkv.len() { return; }
+        let part = (i % (3 * channels)) / channels;
+        let channel = i % channels;
+        let token = (i / (3 * channels)) % tokens;
+        let batch = i / (3 * channels * tokens);
+        let dim = channels / heads;
+        let head = channel / dim;
+        let head_start = head * dim;
+        let mut result = 0.0f32;
+        if part == 2 {
+            for query in 0..tokens {
+                let row = ((batch * heads + head) * tokens + query) * tokens;
+                result += probabilities[row + token] * grad[(batch * tokens + query) * channels + channel];
+            }
+        } else {
+            let raw = qkv[i];
+            if raw.is_finite() && raw.abs() < 128.0 {
+                for other in 0..tokens {
+                    let (query, key) = if part == 0 { (token, other) } else { (other, token) };
+                    let row = ((batch * heads + head) * tokens + query) * tokens;
+                    if active[row + key] == 0.0 { continue; }
+                    let mut dp = 0.0f32;
+                    let mut dot = 0.0f32;
+                    for d in 0..dim {
+                        let ch = head_start + d;
+                        let dy = grad[(batch * tokens + query) * channels + ch];
+                        let v = qkv[(batch * tokens + key) * 3 * channels + 2 * channels + ch];
+                        dp += dy * v;
+                        dot += dy * context[(batch * tokens + query) * channels + ch];
+                    }
+                    let ds = probabilities[row + key] * (dp - dot);
+                    if ds == 0.0 { continue; }
+                    let offset = if part == 0 { channels } else { 0 };
+                    let other_token = if part == 0 { key } else { query };
+                    let other_raw = qkv[(batch * tokens + other_token) * 3 * channels + offset + channel];
+                    let other_value = if other_raw.is_finite() {
+                        other_raw.max(-128.0).min(128.0)
+                    } else { 0.0 };
+                    result += ds * other_value / (dim as f32).sqrt();
+                }
+            }
+        }
+        if let Some(dst) = dqkv.get_mut(idx) { *dst = result; }
+    }
+
     /// One query row per thread. Online max/sum and the value accumulator keep
     /// the attention workspace linear in sequence length; the host rejects
     /// head dimensions above the fixed local accumulator size.

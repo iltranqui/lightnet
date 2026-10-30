@@ -583,6 +583,32 @@ fn gpu_yolo_loss_backward_matches_cpu_train_buffers() {
 }
 
 #[test]
+fn gpu_device_seeds_match_host_seeds_with_loss_scaling() {
+    let cfg = ConfigFile::parse_str("inline.cfg", "[net]\nbatch=1\nwidth=2\nheight=1\nchannels=1\nloss_scale=8\n[convolutional]\nfilters=1\nsize=1\nactivation=linear\n").unwrap();
+    let network = Network::from_config(cfg).unwrap();
+    let mut host = GpuExecutableNetwork::new(network.clone(), FakeBackend);
+    let mut device = GpuExecutableNetwork::new(network, FakeBackend);
+    device.params = host.params.clone();
+    let input = Tensor::from_data(host.network.net.input_shape(), vec![1.0, 2.0]).unwrap();
+    let host_forward = host.forward_training_device(&input).unwrap();
+    let device_forward = device.forward_training_device(&input).unwrap();
+    assert!(device.backward_accumulate_device_seeded_gpu(&device_forward, &[]).is_err());
+    let shape = host.network.layers[0].output_shape;
+    let seed = Tensor::from_data(shape, vec![0.25, -0.5]).unwrap();
+    let device_seed = device.backend().upload_f32(&tensor_backend_shape(shape), &seed.data).unwrap();
+    host.backward_accumulate_seeded_gpu(&host_forward, &[Some(seed)]).unwrap();
+    let wrong = device.backend().upload_f32(&[1, 1, 1, 3], &[0.0; 3]).unwrap();
+    assert!(device.backward_accumulate_device_seeded_gpu(&device_forward, &[Some(wrong)]).is_err());
+    device.backward_accumulate_device_seeded_gpu(&device_forward, &[Some(device_seed)]).unwrap();
+    let host_buffers = host.device_train_buffers.borrow();
+    let device_buffers = device.device_train_buffers.borrow();
+    let host_conv = host_buffers[0].as_ref().unwrap();
+    let device_conv = device_buffers[0].as_ref().unwrap();
+    assert_eq!(host_conv.bias_updates.data, device_conv.bias_updates.data);
+    assert_eq!(host_conv.weight_updates.data, device_conv.weight_updates.data);
+}
+
+#[test]
 fn gpu_avgpool_backward_feeds_previous_convolution() {
     let cfg = ConfigFile::parse_str(
         "inline.cfg",
@@ -2551,4 +2577,22 @@ fn cpu_laya_act_head_backward_scatters_dcls_into_the_head_source() {
             "column 1 must stay zero"
         );
     }
+}
+
+#[test]
+fn gpu_yolo_loss_falls_back_when_backend_has_no_native_loss() {
+    let cfg = ConfigFile::parse_str(
+        "inline.cfg",
+        "[net]\nbatch=1\nwidth=2\nheight=2\nchannels=1\n[convolutional]\nfilters=6\nsize=1\nactivation=linear\n[yolo]\nmask=0\nanchors=2,3\nclasses=1\nnum=1\niou_loss=ciou\n",
+    )
+    .unwrap();
+    let network = Network::from_config(cfg).unwrap();
+    let gpu = GpuExecutableNetwork::new(network, FakeBackend);
+    let input = Tensor::from_data(gpu.network.net.input_shape(), vec![0.5; 4]).unwrap();
+    let forward = gpu.forward_training_device(&input).unwrap();
+    let label = crate::train::YoloLabel { class_id: 0, x: 0.5, y: 0.5, w: 0.3, h: 0.3 };
+    // FakeBackend keeps the default `yolo_loss_f32` (`None`), so the caller must use the host loss.
+    assert!(gpu.compute_yolo_training_loss_gpu(&forward, &[vec![label.clone()]]).unwrap().is_none());
+    // A label batch of the wrong size is an error, not a silent fallback.
+    assert!(gpu.compute_yolo_training_loss_gpu(&forward, &[]).is_err());
 }

@@ -19,7 +19,7 @@
 //!
 //! Rounding is round-to-nearest with ties to the even code (matching
 //! `fp4sim_encode_nearest`), non-finite inputs are ignored by amax, NaN encodes
-//! as `+6` and +-Inf saturates.  `tasks/rust/fp8_fp4.md` Phase C step 7.
+//! as `+6` and +-Inf saturates.  `tasks/rust/03_plans/lowprec/fp8_fp4.md` Phase C step 7.
 
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicU32};
 use cuda_device::{DisjointSlice, cuda_module, device, kernel, thread};

@@ -404,7 +404,7 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("GPU Logistic compact forward", err))?,
-                (LayerKind::Softmax { groups }, LayerParams::None) => self
+                (LayerKind::Softmax { groups, spatial: false }, LayerParams::None) => self
                     .backend
                     .softmax_f32(
                         current_input.expect("Softmax requires current input"),
@@ -413,6 +413,10 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("GPU Softmax compact forward", err))?,
+                (LayerKind::Softmax { spatial: true, .. }, LayerParams::None) => {
+                    self.backend.spatial_softmax_f32(current_input.expect("softmax input"), &tensor_backend_shape(layer.output_shape), launch_config)
+                        .map_err(|err| backend_error("GPU spatial softmax compact forward", err))?
+                }
                 (LayerKind::Yolo(_), LayerParams::None)
                 | (LayerKind::ObbYolo(_), LayerParams::None)
                 | (LayerKind::GaussianYolo(_), LayerParams::None)

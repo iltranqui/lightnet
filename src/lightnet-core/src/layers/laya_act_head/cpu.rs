@@ -1,5 +1,5 @@
 //! `[laya_act_head]`: the LAYA act/escalate head (Phase 1b of
-//! `tasks/rust/layers.md`), ported from
+//! `tasks/rust/04_reference/layers.md`), ported from
 //! `Jev_laya:src-lib/laya_act_head_layer.cpp`.
 //!
 //! A small frozen head that turns the scorer's option distribution into a

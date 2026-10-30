@@ -1,4 +1,4 @@
-//! Scalar activations missing from the original Rust set (see tasks/rust/layers.md Task 1).
+//! Scalar activations missing from the original Rust set (see tasks/rust/04_reference/layers.md Task 1).
 
 // C++ literals are f32 (`0.797885f`, `0.035677f`); the derivative below is the exact
 // derivative of THIS forward, so it uses the same constants.

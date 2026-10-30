@@ -12,7 +12,26 @@ pub(crate) fn softmax_group_size(shape: TensorShape, groups: usize) -> Result<us
     Ok(per_batch / groups)
 }
 
-pub(super) fn forward_softmax(input: &Tensor, groups: usize) -> Result<Tensor> {
+pub(super) fn forward_softmax(input: &Tensor, groups: usize, spatial: bool) -> Result<Tensor> {
+    if spatial {
+        let plane = input.shape.width * input.shape.height;
+        let channels = input.shape.channels;
+        let mut output = Tensor::zeros(input.shape);
+        for b in 0..input.shape.batch {
+            for p in 0..plane {
+                let base = b * channels * plane + p;
+                let max = (0..channels).map(|c| input.data[base + c * plane]).fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0;
+                for c in 0..channels {
+                    let i = base + c * plane;
+                    output.data[i] = (input.data[i] - max).exp();
+                    sum += output.data[i];
+                }
+                for c in 0..channels { output.data[base + c * plane] /= sum; }
+            }
+        }
+        return Ok(output);
+    }
     let groups = groups.max(1);
     let per_batch = input.shape.element_count();
     if !per_batch.is_multiple_of(groups) {
@@ -823,12 +842,25 @@ pub(super) fn raw_connected_output(
     output
 }
 
-pub(super) fn backward_softmax(output: &Tensor, output_gradient: &Tensor, groups: usize) -> Result<Tensor> {
+pub(super) fn backward_softmax(output: &Tensor, output_gradient: &Tensor, groups: usize, spatial: bool) -> Result<Tensor> {
     if output.shape != output_gradient.shape {
         return Err(Error::InvalidConfig(format!(
             "softmax backward gradient shape mismatch: expected {}, got {}",
             output.shape, output_gradient.shape
         )));
+    }
+    if spatial {
+        let plane = output.shape.width * output.shape.height;
+        let channels = output.shape.channels;
+        let mut input_grad = Tensor::zeros(output.shape);
+        for b in 0..output.shape.batch {
+            for p in 0..plane {
+                let base = b * channels * plane + p;
+                let dot: f32 = (0..channels).map(|c| { let i = base + c * plane; output.data[i] * output_gradient.data[i] }).sum();
+                for c in 0..channels { let i = base + c * plane; input_grad.data[i] = output.data[i] * (output_gradient.data[i] - dot); }
+            }
+        }
+        return Ok(input_grad);
     }
     let groups = groups.max(1);
     let per_batch = output.shape.element_count();

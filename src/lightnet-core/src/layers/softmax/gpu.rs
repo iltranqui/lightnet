@@ -35,6 +35,7 @@ where
         &self,
         layer: &Layer,
         groups: &usize,
+        spatial: bool,
         forward: &GpuForwardState<B::Tensor>,
         grad: B::Tensor,
         config: ElementwiseLaunchConfig,
@@ -48,6 +49,9 @@ where
         })?;
         let input_grad = if GradMode::from_env() == GradMode::Cpp {
             grad.clone()
+        } else if spatial {
+            self.backend.spatial_softmax_backward_f32(output, &grad, &tensor_backend_shape(layer.output_shape), config)
+                .map_err(|err| backend_error("GPU spatial softmax backward", err))?
         } else {
             self.backend
                 .softmax_backward_f32(

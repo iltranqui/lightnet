@@ -1,5 +1,5 @@
 //! `[contrastive]`: the supervised-contrastive head, classifier branch (deferred
-//! item (c) of `tasks/rust/layers.md` Phase 1b), ported from
+//! item (c) of `tasks/rust/04_reference/layers.md` Phase 1b), ported from
 //! `Jev_laya:src-lib/softmax_layer.cpp::forward_contrastive_layer` and the
 //! `P_constrastive` / `grad_contrastive_loss_positive` /
 //! `grad_contrastive_loss_negative` helpers in `src-lib/blas.cpp`.

@@ -1876,7 +1876,7 @@ impl ExecutableNetwork {
                         &mut layer_output_gradients,
                     )?;
                 }
-                (LayerKind::Softmax { groups }, LayerParams::None) => {
+                (LayerKind::Softmax { groups, spatial }, LayerParams::None) => {
                     let output = forward.layer_outputs.get(layer.index).ok_or_else(|| {
                         Error::InvalidConfig(format!(
                             "missing softmax output for layer #{}",
@@ -1887,7 +1887,7 @@ impl ExecutableNetwork {
                         // C++ passes dy straight through (cost layer folds the Jacobian in).
                         grad.clone()
                     } else {
-                        backward_softmax(output, &grad, *groups)?
+                        backward_softmax(output, &grad, *groups, *spatial)?
                     };
                     accumulate_previous_gradient(
                         layer.index,

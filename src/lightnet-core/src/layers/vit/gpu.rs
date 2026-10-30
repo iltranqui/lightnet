@@ -1,4 +1,4 @@
-//! Native f32 composition for `[vit]` (no MSA, no VC attention): inference
+//! Native f32 composition for `[vit]` (including MSA, no VC attention): inference
 //! forward, a training forward that keeps its intermediates on the device, and
 //! the native backward that consumes them. Native SGD/Adam retain parameters,
 //! gradients and moments in resident banks. Muon retains the hybrid path.
@@ -43,8 +43,7 @@ pub(crate) fn device_activation(activation: &Activation) -> Option<F32Activation
 /// Whether the native path covers this geometry. The same gate selects the
 /// native training forward and backward, so the two always agree.
 pub(crate) fn supported(g: &VitGeometry) -> bool {
-    g.msa.is_none()
-        && !g.vc_attention
+    !g.vc_attention
         && g.heads > 0
         && g.hidden % g.heads == 0
         && g.hidden / g.heads <= 128
@@ -55,6 +54,12 @@ pub(crate) fn supported(g: &VitGeometry) -> bool {
 /// native backward, plus the weight uploads it reuses. Attention keeps the
 /// raw fused QKV, the context and the row log-sum-exp, so the backward
 /// recomputes probabilities instead of storing a `tokens x tokens` matrix.
+#[derive(Clone, Debug)]
+enum AttentionTape<T> {
+    Flash(T),
+    Sparse { probabilities: T, active: T },
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct DeviceCache<T> {
     resident_mhc: Option<T>,
@@ -68,7 +73,7 @@ pub(crate) struct DeviceCache<T> {
     ln1: T,
     qkv: T,
     context: T,
-    lse: T,
+    attention: AttentionTape<T>,
     projection: T,
     res1: T,
     ln2: T,
@@ -220,6 +225,12 @@ where
         .map_err(|e| backend_error("GPU vit positions", e))?;
     let ln1 = norm("ln1", &tokens, &ln1_gamma, &ln1_beta)?;
     let qkv = lin("qkv", &ln1, &qkv_weight, &qkv_bias, hidden, 3 * hidden)?;
+    let (context, attention) = if let Some((block, topk)) = g.msa {
+        let (context, probabilities, active) = backend
+            .vit_msa_forward_f32(&qkv, g.batch, tokens_per_sample, hidden, g.heads, block, topk, config)
+            .map_err(|e| backend_error("GPU vit sparse attention", e))?;
+        (context, AttentionTape::Sparse { probabilities, active })
+    } else {
     let (context, lse) = backend
         .flash_attention_forward_f32(
             &qkv,
@@ -231,6 +242,8 @@ where
             g.heads,
         )
         .map_err(|e| backend_error("GPU vit attention", e))?;
+    (context, AttentionTape::Flash(lse))
+    };
     let projection = lin("wo", &context, &wo, &wo_bias, hidden, hidden)?;
     let res1 = if let Some(p) = resident {
         backend.vit_resident_mhc_forward_f32(&tokens,&projection,&p[15],0,FEATURE_CLIP,config)
@@ -271,7 +284,7 @@ where
         ln1,
         qkv,
         context,
-        lse,
+        attention,
         projection,
         res1,
         ln2,
@@ -335,8 +348,9 @@ where
                 coupled_decay: slot != 15 && active,
                 moment_slot: active.then_some(ResidentMomentSlot::ChildWeights(slot)), active });
         }
-        // ViT Muon's two-stage clipping and fallback policy remain hybrid.
-        let resident = self.resident_parameter_path_enabled() && !self.network.net.muon;
+        // Resident Muon uses the same f32 master bank and serialized ranges;
+        // only the optimizer boundary differs from SGD/Adam.
+        let resident = self.resident_parameter_path_enabled();
         let (parameters,generation) = if resident {
             let (p,generation)=self.resident_parameter_slices(layer.index,&weights.to_blob(),layout,&ranges,config)?;
             (Some(p),Some(generation))
@@ -531,19 +545,25 @@ where
         let (d_context, d_wo, d_wo_bias) = be
             .connected_backward_f32(&cache.context, &cache.wo, &d_projection, rows, hidden, hidden, config)
             .map_err(err("wo"))?;
-        let d_qkv = be
+        let d_qkv = match &cache.attention {
+            AttentionTape::Sparse { probabilities, active } => be
+                .vit_msa_backward_f32(&cache.qkv, probabilities, active, &cache.context,
+                    &d_context, g.batch, tokens_per_sample, hidden, g.heads, config)
+                .map_err(err("sparse attention"))?,
+            AttentionTape::Flash(lse) => be
             .flash_attention_backward_f32(
                 &cache.qkv,
                 &cache.context,
                 &d_context,
-                &cache.lse,
+                lse,
                 &[g.batch, tokens_per_sample, 3 * hidden],
                 g.batch,
                 tokens_per_sample,
                 hidden,
                 g.heads,
             )
-            .map_err(err("attention"))?;
+            .map_err(err("attention"))?,
+        };
         let (d_ln1, d_qkv_weight, d_qkv_bias) = be
             .connected_backward_f32(&cache.ln1, &cache.qkv_weight, &d_qkv, rows, hidden, 3 * hidden, config)
             .map_err(err("qkv"))?;

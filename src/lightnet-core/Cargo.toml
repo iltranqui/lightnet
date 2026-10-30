@@ -14,3 +14,4 @@ image = "0.25.10"
 imageproc = "0.26.1"
 mozjpeg = { version = "0.10", default-features = false }
 rayon = "1"
+half.workspace = true

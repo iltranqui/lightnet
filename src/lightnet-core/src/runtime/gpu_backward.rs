@@ -62,6 +62,67 @@ where
             return self
                 .backward_accumulate_seeded_gpu_cpu_fallback(forward, layer_output_gradient_seeds);
         }
+        let mut device_seeds = Vec::with_capacity(layer_output_gradient_seeds.len());
+        for seed in layer_output_gradient_seeds {
+            device_seeds.push(match seed {
+                Some(seed) => Some(self.backend.upload_f32(&tensor_backend_shape(seed.shape), &seed.data)
+                    .map_err(|err| backend_error("upload GPU backward seed", err))?),
+                None => None,
+            });
+        }
+        self.backward_accumulate_device_unscaled(forward, &device_seeds)
+    }
+
+    /// Accumulate gradients from seeds already resident on the device.
+    /// A seed must have the shape of its corresponding layer output.
+    pub fn backward_accumulate_device_seeded_gpu(
+        &mut self,
+        forward: &GpuForwardState<B::Tensor>,
+        seeds: &[Option<B::Tensor>],
+    ) -> Result<()> {
+        if seeds.len() != self.network.layers.len() {
+            return Err(Error::InvalidConfig(format!("GPU backward seed count mismatch: expected {}, got {}", self.network.layers.len(), seeds.len())));
+        }
+        if self.requires_cpu_backward_fallback() || has_host_only_deform(&self.network) {
+            return Err(Error::InvalidConfig("device-seeded backward does not support host-only layers".into()));
+        }
+        for (index, seed) in seeds.iter().enumerate() {
+            let Some(shape) = seed.as_ref().and_then(|seed| self.backend.tensor_shape(seed)) else {
+                continue;
+            };
+            let expected = tensor_backend_shape(self.network.layers[index].output_shape);
+            if shape != expected {
+                return Err(Error::InvalidConfig(format!(
+                    "GPU backward seed shape mismatch at layer {index}: got {shape:?}, expected {expected:?}"
+                )));
+            }
+        }
+        let scale = self.network.net.loss_scale;
+        if scale == 1.0 || !(scale > 0.0 && scale.is_finite()) {
+            return self.backward_accumulate_device_unscaled(forward, seeds);
+        }
+        let config = ElementwiseLaunchConfig::default();
+        let mut scaled = Vec::with_capacity(seeds.len());
+        for (index, seed) in seeds.iter().enumerate() {
+            scaled.push(match seed {
+                Some(seed) => {
+                    let zero = self.backend.zeros_f32(&tensor_backend_shape(self.network.layers[index].output_shape))
+                        .map_err(|err| backend_error("allocate scaled GPU seed", err))?;
+                    Some(self.backend.saxpy_f32(scale, seed, &zero, config)
+                        .map_err(|err| backend_error("scale GPU backward seed", err))?)
+                }
+                None => None,
+            });
+        }
+        self.backward_accumulate_device_unscaled(forward, &scaled)
+    }
+
+    fn backward_accumulate_device_unscaled(
+        &mut self,
+        forward: &GpuForwardState<B::Tensor>,
+        device_seeds: &[Option<B::Tensor>],
+    ) -> Result<()> {
+        reject_gpu_stage1_cpu_layers(&self.network, "backward")?;
         let train_buffers_uninitialized = {
             let conv = self.device_train_buffers.borrow();
             let moe = self.device_moe_train_buffers.borrow();
@@ -81,17 +142,7 @@ where
         }
 
         let config = ElementwiseLaunchConfig::default();
-        let mut layer_output_gradients: Vec<Option<B::Tensor>> =
-            vec![None; self.network.layers.len()];
-        for (layer_index, seed) in layer_output_gradient_seeds.iter().enumerate() {
-            if let Some(seed) = seed {
-                layer_output_gradients[layer_index] = Some(
-                    self.backend
-                        .upload_f32(&tensor_backend_shape(seed.shape), &seed.data)
-                        .map_err(|err| backend_error("upload GPU backward seed", err))?,
-                );
-            }
-        }
+        let mut layer_output_gradients = device_seeds.to_vec();
         let mut foveation_hf_auxiliary_gradients: Vec<Option<Vec<f32>>> =
             vec![None; self.network.layers.len()];
 
@@ -265,10 +316,11 @@ where
                         &mut layer_output_gradients,
                     )?;
                 }
-                (LayerKind::Softmax { groups }, Some(LayerParams::None)) => {
+                (LayerKind::Softmax { groups, spatial }, Some(LayerParams::None)) => {
                     self.backward_softmax_gpu(
                         layer,
                         groups,
+                        *spatial,
                         forward,
                         grad,
                         config,

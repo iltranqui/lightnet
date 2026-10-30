@@ -240,3 +240,113 @@ fn yolo_3d_math_activation_reports_forward_and_seed_overflow() {
         .is_err()
     );
 }
+
+fn loss_fixture(options: &str) -> (Yolo3dSpec, Tensor, crate::cuboid_labels::Yolo3dTruthBatch) {
+    let shape = TensorShape::new(1, 1, 9, 1);
+    let cfg = ConfigFile::parse_str("loss.cfg", &format!("[yolo_3d]\nclasses=1\nkeypoints=1\nnum=1\nmask=0\nanchors=1,1\nmax=1\niou_loss=mse\n{options}")).unwrap();
+    let spec = Yolo3dSpec::from_section(&cfg.sections[0], shape).unwrap();
+    let mut row = vec![0.0; 14];
+    row[0..5].copy_from_slice(&[0.5, 0.5, 0.5, 0.5, 0.0]);
+    (
+        spec,
+        Tensor::zeros(shape),
+        crate::cuboid_labels::Yolo3dTruthBatch {
+            truths: row,
+            truth_size: 14,
+            max_boxes: 1,
+            batch: 1,
+            counts: vec![1],
+            mixed: false,
+        },
+    )
+}
+
+#[test]
+fn yolo_3d_projected_loss_hand_computed() {
+    let (s, raw, truth) = loss_fixture("");
+    let r = yolo_3d_projected_loss(&s, &raw, &truth, 2, 2, crate::runtime::GradMode::Analytical)
+        .unwrap();
+    assert!((r.box_loss - 0.0).abs() < 1e-6);
+    assert!((r.objectness_loss - 0.125 * s.obj_normalizer).abs() < 1e-6);
+    assert!((r.class_loss - 0.125).abs() < 1e-6);
+    assert!((r.seeds.data[4] - 0.125 * s.obj_normalizer).abs() < 1e-6);
+}
+
+#[test]
+fn yolo_3d_ignore_threshold_masks_objectness_hand_case() {
+    let (mut s, raw, truth) = loss_fixture("");
+    s.mask = vec![0];
+    s.num = 2;
+    s.anchors = vec![1.0, 1.0, 2.0, 2.0];
+    let mut truth = truth;
+    truth.truths[2] = 1.0;
+    truth.truths[3] = 1.0;
+    s.ignore_thresh = 0.2;
+    let r = yolo_3d_projected_loss(&s, &raw, &truth, 2, 2, crate::runtime::GradMode::Analytical)
+        .unwrap();
+    assert_eq!(r.objectness_loss, 0.0);
+    assert_eq!(r.seeds.data[4], 0.0);
+}
+
+#[test]
+fn yolo_3d_cpp_mode_reproduces_source_deltas() {
+    // depth_3d yolo_3d.cpp:430-446, 546-566, 1236-1249; hand calculated, no C++ golden.
+    let (s, mut raw, truth) = loss_fixture("");
+    raw.data[0] = 3.0_f32.ln();
+    raw.data[2] = 0.2;
+    let r = yolo_3d_projected_loss(&s, &raw, &truth, 2, 2, crate::runtime::GradMode::Cpp).unwrap();
+    assert!((r.seeds.data[0] - (1.75 * s.iou_normalizer * -0.25)).abs() < 1e-6);
+    assert!((r.seeds.data[2] - (1.75 * s.iou_normalizer * -0.2)).abs() < 1e-6);
+    assert!((r.seeds.data[4] - 0.5 * s.obj_normalizer).abs() < 1e-6);
+    assert!((r.seeds.data[5] - 0.5).abs() < 1e-6);
+}
+
+#[test]
+fn yolo_3d_projected_seed_matches_finite_difference() {
+    let (s, mut raw, truth) = loss_fixture("");
+    raw.data[0] = 0.2;
+    raw.data[2] = 0.1;
+    raw.data[4] = 0.3;
+    raw.data[5] = -0.2;
+    let r = yolo_3d_projected_loss(&s, &raw, &truth, 2, 2, crate::runtime::GradMode::Analytical)
+        .unwrap();
+    for i in 0..raw.data.len() {
+        let mut p = raw.clone();
+        let mut m = raw.clone();
+        p.data[i] += 0.001;
+        m.data[i] -= 0.001;
+        let f = |t: &Tensor| {
+            yolo_3d_projected_loss(&s, t, &truth, 2, 2, crate::runtime::GradMode::Analytical)
+                .unwrap()
+                .loss()
+        };
+        let fd = (f(&p) - f(&m)) / 0.002;
+        assert!(
+            (fd + r.seeds.data[i]).abs() < 0.0001,
+            "{i}: {fd} {}",
+            r.seeds.data[i]
+        );
+    }
+}
+
+#[test]
+fn yolo_3d_projected_loss_rejects_invalid_and_unsupported_inputs() {
+    let (mut s, raw, mut truth) = loss_fixture("");
+    truth.truths.pop();
+    assert!(
+        yolo_3d_projected_loss(&s, &raw, &truth, 2, 2, crate::runtime::GradMode::Analytical)
+            .is_err()
+    );
+    truth.truths.push(0.0);
+    s.focal_loss = true;
+    assert!(
+        yolo_3d_projected_loss(&s, &raw, &truth, 2, 2, crate::runtime::GradMode::Analytical)
+            .is_err()
+    );
+    s.focal_loss = false;
+    s.iou_loss = crate::model::YoloIouLoss::Giou;
+    assert!(
+        yolo_3d_projected_loss(&s, &raw, &truth, 2, 2, crate::runtime::GradMode::Analytical)
+            .is_err()
+    );
+}

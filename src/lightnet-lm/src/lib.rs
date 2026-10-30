@@ -1,5 +1,5 @@
 //! Decoder-only language model: tokenizer, CPU reference ops, training and
-//! KV-cache inference.  See `tasks/rust/plan_llm_decoder.md`.
+//! KV-cache inference.  See `tasks/rust/03_plans/llm/plan_llm_decoder.md`.
 //!
 //! The crate is independent of the detector graph in `lightnet-core`, so it
 //! carries its own error type and a small `.cfg` reader (settled in Task 1).

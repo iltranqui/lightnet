@@ -563,7 +563,7 @@ where
                         )
                         .map_err(|err| backend_error("f16 channel_slice", err))?
                 }
-                (LayerKind::Softmax { groups }, LayerParams::None) => self
+                (LayerKind::Softmax { groups, spatial: false }, LayerParams::None) => self
                     .backend
                     .softmax_f16(
                         current_input.expect("softmax requires current input"),
@@ -572,6 +572,7 @@ where
                         launch_config,
                     )
                     .map_err(|err| backend_error("f16 softmax", err))?,
+                (LayerKind::Softmax { spatial: true, .. }, LayerParams::None) => return Err(Error::UnsupportedLayer { layer_index: layer.index, name: "f16 spatial softmax".into() }),
                 (LayerKind::JevCe(spec), LayerParams::None) => {
                     let per_sample =
                         layer.input_shape.element_count() / layer.input_shape.batch.max(1);

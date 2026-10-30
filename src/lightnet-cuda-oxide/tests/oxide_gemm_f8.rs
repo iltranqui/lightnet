@@ -6,7 +6,7 @@
 //!    (16x32) and B (32x8) fragments with the layout documented in
 //!    `kernels/gemm_f8.rs`, uploads them, and compares the 16x8 f32 result
 //!    with a CPU product of the matrices those fragments represent.  This is
-//!    the mandatory smoke test of `tasks/rust/fp8_fp4.md` step 1: the FP8 mma
+//!    the mandatory smoke test of `tasks/rust/03_plans/lowprec/fp8_fp4.md` step 1: the FP8 mma
 //!    family is declared `sm_89+` but its runtime support was unverified, so
 //!    the layout has to be pinned on the real GPU rather than assumed.
 //! 2. `quantize_*`: the device quantiser against the host reference in
@@ -503,7 +503,7 @@ fn gemm_fp8_matches_the_f32_reference_on_unquantised_inputs() {
 // Layout sweep
 // ---------------------------------------------------------------------------
 //
-// `tasks/rust/fp8_fp4.md` step 1 makes pinning the fragment layout on the real
+// `tasks/rust/03_plans/lowprec/fp8_fp4.md` step 1 makes pinning the fragment layout on the real
 // GPU mandatory: the FP8 `mma` family is declared `sm_89+` but its runtime
 // support is `unexecuted` in `intrinsics/overlay/register_mma_fp8.toml`. Rather
 // than trust the documentation, `fragment_layout_sweep` runs the raw mma once

@@ -1,5 +1,5 @@
 //! `[centernet]`: the CenterNet-style anchor-free detection head (Phase 2A of
-//! `tasks/rust/layers.md`), ported from `Jev_laya:src-lib/centernet_layer.cpp`.
+//! `tasks/rust/04_reference/layers.md`), ported from `Jev_laya:src-lib/centernet_layer.cpp`.
 //!
 //! No weights and no kernels, like the other modern heads.
 //!

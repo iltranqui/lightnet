@@ -1,4 +1,4 @@
-//! jev_ce softmax + soft-target cross-entropy (tasks/rust/layers.md Task 11).
+//! jev_ce softmax + soft-target cross-entropy (tasks/rust/04_reference/layers.md Task 11).
 
 use crate::model::JevCeSpec;
 

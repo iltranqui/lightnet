@@ -1,6 +1,6 @@
 # lightnet-lm
 
-Decoder-only LLM training and inference (pre-RMSNorm causal GQA, RoPE, SwiGLU, tied head). v0.1.042 implements CPU Tasks 1-7, covered by 52 passing `lm_` tests plus 4 CLI parser tests. The plan is `tasks/rust/plan_llm_decoder.md`.
+Decoder-only LLM training and inference (pre-RMSNorm causal GQA, RoPE, SwiGLU, tied head). v0.1.042 implements CPU Tasks 1-7, covered by 52 passing `lm_` tests plus 4 CLI parser tests. The plan is `tasks/rust/03_plans/llm/plan_llm_decoder.md`.
 
 ## Table of Contents
 

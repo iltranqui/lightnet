@@ -1,4 +1,4 @@
-//! `[channel_shuffle]` host math (tasks/rust/layers.md Task 8).
+//! `[channel_shuffle]` host math (tasks/rust/04_reference/layers.md Task 8).
 //!
 //! With `rows = groups`, `cols = c / groups`: `out_channel[j*rows + i] =
 //! in_channel[i*cols + j]`. Backward is the same permutation with `rows`/`cols`

@@ -2,7 +2,7 @@
 //! its input gradient, plus the row-softmax backward.
 //!
 //! These are the Phase 3A prerequisite building blocks (see
-//! `tasks/rust/layers.md`): every ported transformer layer - `vit`, `swin`,
+//! `tasks/rust/04_reference/layers.md`): every ported transformer layer - `vit`, `swin`,
 //! `tucker_attention`, `mambavision`, `kimi_kda`, `minimax_sparse_attention` and
 //! the LAYA encoder/head - normalises a `rows x cols` slab and needs its input
 //! gradient, so the op is exercised against the host reference directly rather

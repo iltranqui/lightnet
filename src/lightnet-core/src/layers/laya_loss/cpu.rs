@@ -1,5 +1,5 @@
 //! `[laya_loss]`: the LAYA masked soft-target loss over the scorer's K option
-//! logits (Phase 1b of `tasks/rust/layers.md`), ported from
+//! logits (Phase 1b of `tasks/rust/04_reference/layers.md`), ported from
 //! `Jev_laya:src-lib/laya_loss_layer.cpp`.
 //!
 //! Two modes:

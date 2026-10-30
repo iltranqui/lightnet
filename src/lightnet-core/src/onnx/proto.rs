@@ -61,6 +61,7 @@ impl Msg {
 }
 
 const FLOAT: i64 = 1;
+const FLOAT16: i64 = 10;
 const INT64: i64 = 7;
 
 pub(crate) fn tensor_f32(name: &str, dims: &[i64], data: &[f32]) -> Msg {
@@ -73,6 +74,14 @@ pub(crate) fn tensor_f32(name: &str, dims: &[i64], data: &[f32]) -> Msg {
         .int(2, FLOAT)
         .string(8, name)
         .bytes(9, &raw);
+    m
+}
+
+pub(crate) fn tensor_f16(name: &str, dims: &[i64], data: &[f32]) -> Msg {
+    let mut raw = Vec::with_capacity(data.len() * 2);
+    for value in data { raw.extend_from_slice(&half::f16::from_f32(*value).to_bits().to_le_bytes()); }
+    let mut m = Msg::new();
+    m.packed_ints(1, dims).int(2, FLOAT16).string(8, name).bytes(9, &raw);
     m
 }
 
@@ -139,7 +148,12 @@ pub(crate) enum Dim {
     Param(&'static str),
 }
 
+#[cfg(test)]
 pub(crate) fn value_info(name: &str, dims: &[Dim]) -> Msg {
+    value_info_typed(name, dims, false)
+}
+
+pub(crate) fn value_info_typed(name: &str, dims: &[Dim], fp16: bool) -> Msg {
     let mut shape = Msg::new();
     for d in dims {
         let mut dim = Msg::new();
@@ -150,7 +164,7 @@ pub(crate) fn value_info(name: &str, dims: &[Dim]) -> Msg {
         shape.msg(1, &dim);
     }
     let mut tensor = Msg::new();
-    tensor.int(1, FLOAT).msg(2, &shape);
+    tensor.int(1, if fp16 { FLOAT16 } else { FLOAT }).msg(2, &shape);
     let mut ty = Msg::new();
     ty.msg(1, &tensor);
     let mut m = Msg::new();

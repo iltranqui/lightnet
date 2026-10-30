@@ -1,4 +1,4 @@
-//! Weighted `[shortcut]` (tasks/rust/layers.md Task 6).
+//! Weighted `[shortcut]` (tasks/rust/04_reference/layers.md Task 6).
 
 use crate::model::ShortcutWeightsNorm;
 

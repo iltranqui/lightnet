@@ -1,5 +1,5 @@
 //! `[segmentation]`: per-pixel semantic segmentation, CPU reference (Phase 1b of
-//! `tasks/rust/layers.md`).
+//! `tasks/rust/04_reference/layers.md`).
 //!
 //! Ported from `v6-dev-seg:src-seg/segmentation_layer.cpp`,
 //! `seg_gate.cpp` and the `logistic_x_ent_cpu` / `softmax_x_ent_cpu` kernels in

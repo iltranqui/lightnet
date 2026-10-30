@@ -846,6 +846,10 @@ impl F32TensorOpsBackend for FakeBackend {
     type Error = String;
     type Tensor = FakeTensor;
 
+    fn tensor_shape(&self, tensor: &FakeTensor) -> Option<Vec<usize>> {
+        Some(tensor.shape.clone())
+    }
+
     fn upload_f32(
         &self,
         shape: &[usize],

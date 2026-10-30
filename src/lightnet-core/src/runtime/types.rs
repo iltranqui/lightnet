@@ -136,7 +136,7 @@ pub struct LocalParams {
     pub weights: Vec<f32>,
 }
 
-/// Weighted `[shortcut]` parameters (tasks/rust/layers.md Task 6).
+/// Weighted `[shortcut]` parameters (tasks/rust/04_reference/layers.md Task 6).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShortcutParams {
     pub weights: Vec<f32>,

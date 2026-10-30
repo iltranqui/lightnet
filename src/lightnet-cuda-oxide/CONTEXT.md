@@ -29,4 +29,4 @@ Native GPU path for layers, written as `#[kernel]` functions compiled by the ven
 - Build and test only through `./tools/test_oxide.sh`. `cargo oxide` does not work from this directory.
 - Tests run with `--test-threads=1` (one CUDA context, large buffers).
 - Max 4 build threads, prefer `-j 1` or `-j 2`; codegen is memory heavy.
-- FP8 and FP4 work is planned in `tasks/rust/fp8_fp4.md`.
+- FP8 and FP4 work is planned in `tasks/rust/03_plans/lowprec/fp8_fp4.md`.

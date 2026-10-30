@@ -1,5 +1,5 @@
 //! `[laya_marker_gather]`: the LAYA decision-model per-option gather (Phase 1b
-//! of `tasks/rust/layers.md`, unblocked by Open Question 2), ported from
+//! of `tasks/rust/04_reference/layers.md`, unblocked by Open Question 2), ported from
 //! `Jev_laya:src-lib/laya_marker_gather_layer.cpp`.
 //!
 //! The layer has no weights.  It reads two inputs, route-style:

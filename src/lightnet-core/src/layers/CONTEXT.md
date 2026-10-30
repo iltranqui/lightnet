@@ -39,11 +39,11 @@ src/lightnet-cuda-oxide/tests/oxide_<layer>.rs   CPU-versus-GPU parity for that 
 | Backend op | `lightnet-cuda/src/lib.rs` (trait with host default), `lightnet-cuda-oxide/src/lib.rs` (device method) | one method per new kernel |
 | Kernel | `lightnet-cuda-oxide/src/kernels/<layer>.rs` | `pub mod <layer>;` in `kernels/mod.rs` |
 | Parity test | `lightnet-cuda-oxide/tests/oxide_<layer>.rs` | compares device forward, backward and update with the CPU result |
-| Layer map row | `tasks/rust/layer-map.md` | add the row when a directory or file appears |
+| Layer map row | `tasks/rust/02_state/layer-map.md` | add the row when a directory or file appears |
 
 ## Recipe: add or finish a layer
 
-1. Read the layer's row in `tasks/rust/layer-support.md` and its `cpu.rs`. The device arm must be the exact derivative of that forward.
+1. Read the layer's row in `tasks/rust/02_state/layer-support.md` and its `cpu.rs`. The device arm must be the exact derivative of that forward.
 2. Write `gpu.rs` with `forward_<layer>_gpu`, `backward_<layer>_gpu` and, only if the layer is on the f16 inference list, `forward_<layer>_compact_gpu`. Follow `dsconv/gpu.rs` or `deform_conv/gpu.rs` for style.
 3. Add each missing kernel to `kernels/<layer>.rs`, with a backend method and a host default in the trait.
 4. Wire the arms and the cache field as in the table above.
@@ -73,6 +73,6 @@ cargo xtask oxide --test oxide_<layer>
 
 ## Where to look next
 
-- Per-layer files and tests: `tasks/rust/layer-map.md`.
-- Per-layer CPU/GPU/f16/axis status: `tasks/rust/layer-support.md`.
+- Per-layer files and tests: `tasks/rust/02_state/layer-map.md`.
+- Per-layer CPU/GPU/f16/axis status: `tasks/rust/02_state/layer-support.md`.
 - What is open: `tasks/rust/AGENTS.md` (Layout Move Queue, Open Work).

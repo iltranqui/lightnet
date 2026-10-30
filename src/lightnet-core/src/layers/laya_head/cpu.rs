@@ -1,5 +1,5 @@
 //! `[laya_head]`: the frozen LAYA decision head (Phase 4 of
-//! `tasks/rust/layers.md`), ported from `Jev_laya:src-lib/laya_head_layer.cpp`.
+//! `tasks/rust/04_reference/layers.md`), ported from `Jev_laya:src-lib/laya_head_layer.cpp`.
 //!
 //! Two plain pre-norm `nn.TransformerEncoderLayer`s (norm_first=True) over the
 //! encoder's hidden states, after adding a per-question-type embedding:

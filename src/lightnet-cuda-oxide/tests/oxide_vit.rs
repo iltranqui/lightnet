@@ -348,6 +348,7 @@ fn train_check(extra: &str, width: usize, height: usize) {
 
     let cpu_forward = cpu.forward_training(&input).unwrap();
     let gpu_state = gpu.forward_training_with_state(&input).unwrap();
+    assert!(gpu_state.cpu_forward.vit_caches[0].is_none(), "{extra}: expected native ViT training");
     let expected = cpu_forward.final_output().unwrap().clone();
     let actual = gpu_state.cpu_forward.final_output().unwrap().clone();
     close(&format!("{extra} forward"), &actual.data, &expected.data, 2e-4);
@@ -396,7 +397,50 @@ fn vit_native_training_backward_and_update_match_cpu() {
 }
 
 #[test]
-fn vit_gpu_muon_hybrid_backward_and_adamw_update_match_cpu() {
+fn vit_sparse_msa_native_training_matches_cpu() {
+    train_check("patch_size=1\nmsa=1\nmsa_block=2\nmsa_topk=2\nactivation=gelu", 5, 1);
+}
+
+#[test]
+fn vit_sparse_msa_ties_clamps_and_backward_match_reference() {
+    let be = OxideBackend::new().unwrap();
+    let (batch, tokens, channels, heads) = (1, 5, 4, 2);
+    let mut qkv = vec![0.0f32; batch * tokens * 3 * channels];
+    for token in 0..tokens { for channel in 0..channels {
+        qkv[token * 3 * channels + 2 * channels + channel] = (token * channels + channel) as f32 * 0.1;
+    }}
+    let input = be.upload_f32(&[batch, tokens, 3 * channels], &qkv).unwrap();
+    let (_, p, _) = be.vit_msa_forward_f32(&input, batch, tokens, channels, heads, 2, 2, cfg()).unwrap();
+    let p = be.download_f32(&p).unwrap();
+    close("tied blocks choose lower index", &p[..tokens], &[0.25, 0.25, 0.25, 0.25, 0.0], 1e-6);
+
+    let mut rng = Rng(77);
+    qkv = rng.vec(qkv.len());
+    qkv[0] = 128.0;
+    qkv[1] = f32::NAN;
+    qkv[3 * channels + channels] = 128.0;
+    let seed = rng.vec(batch * tokens * channels);
+    for &(block, topk) in &[(1, 2), (2, 2), (2, 9)] {
+        let (expected, probabilities, activity) = lightnet_cuda::host_ops::vit_msa::forward(
+            &qkv, batch, tokens, channels, heads, block, topk);
+        let expected_grad = lightnet_cuda::host_ops::vit_msa::backward(
+            &qkv, &probabilities, &activity, &expected, &seed, batch, tokens, channels, heads);
+        let input = be.upload_f32(&[batch, tokens, 3 * channels], &qkv).unwrap();
+        let grad = be.upload_f32(&[batch, tokens, channels], &seed).unwrap();
+        let (context, p, active) = be.vit_msa_forward_f32(
+            &input, batch, tokens, channels, heads, block, topk, cfg()).unwrap();
+        close("MSA probabilities", &be.download_f32(&p).unwrap(), &probabilities, 2e-5);
+        close("MSA score activity", &be.download_f32(&active).unwrap(), &activity, 0.0);
+        close("MSA context", &be.download_f32(&context).unwrap(), &expected, 2e-5);
+        let actual_grad = be.vit_msa_backward_f32(&input, &p, &active, &context, &grad,
+            batch, tokens, channels, heads, cfg()).unwrap();
+        close("MSA fused gradient", &be.download_f32(&actual_grad).unwrap(), &expected_grad, 2e-5);
+        assert_eq!(be.download_f32(&actual_grad).unwrap()[0], 0.0, "Q clamp boundary");
+    }
+}
+
+#[test]
+fn vit_gpu_resident_muon_backward_and_adamw_update_match_cpu() {
     let mut cpu = network("patch_size=1\nflash_attention=1", 3, 2);
     cpu.network.net.muon = true;
     cpu.network.net.adam = false;
@@ -426,6 +470,7 @@ fn vit_gpu_muon_hybrid_backward_and_adamw_update_match_cpu() {
         .unwrap()
         .expect("native ViT Muon input gradient");
     close("ViT Muon input gradient", &gpu_input.data, &cpu_backward.input_gradient.data, 5e-4);
+    gpu.synchronize_resident_parameter_gradients().unwrap();
     close(
         "ViT Muon staged gradients",
         &vit_updates(&gpu.host_fallback_train_buffers()[0]),
@@ -434,9 +479,17 @@ fn vit_gpu_muon_hybrid_backward_and_adamw_update_match_cpu() {
     );
 
     cpu.update_weights_muon(0.003, 1).unwrap();
-    gpu.update_weights_gpu(0.003, 0.9, 0.02, 1).unwrap();
+    let host_before_deferred_update = vit_blob(&gpu.params[0]);
+    gpu.update_weights_gpu_deferred(0.003, 0.9, 0.02, 1).unwrap();
+    assert_eq!(vit_blob(&gpu.params[0]), host_before_deferred_update,
+        "deferred resident ViT Muon update changed the host mirror");
+    let resident_output = gpu.forward_compact(&input).unwrap().final_output.unwrap();
+    let cpu_forward_after_update = cpu.forward(&input).unwrap();
+    let cpu_output = cpu_forward_after_update.final_output().unwrap();
+    close("deferred resident ViT Muon output", &resident_output.data, &cpu_output.data, 5e-4);
+    gpu.synchronize_resident_parameter_state().unwrap();
     close(
-        "ViT Muon and AdamW parameters",
+        "resident ViT Muon and AdamW parameters",
         &vit_blob(&gpu.params[0]),
         &vit_blob(&cpu.params[0]),
         5e-4,

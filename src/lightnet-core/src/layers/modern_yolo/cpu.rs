@@ -1,4 +1,4 @@
-//! `[yolox]`: the anchor-free detection head (Phase 2A of `tasks/rust/layers.md`),
+//! `[yolox]`: the anchor-free detection head (Phase 2A of `tasks/rust/04_reference/layers.md`),
 //! ported from `Jev_laya:src-lib/modern_yolo_layer.cpp` and
 //! `yolox_layer.cpp`, with the cfg keys from
 //! `darknet_cfg.cpp::parse_yolox_section`.

@@ -51,14 +51,30 @@ struct ExportOnnxArgs {
     weights: String,
     out: PathBuf,
     fuse: bool,
+    nhwc: bool,
+    segmentation_activation: bool,
+    fp16: bool,
+    decode: bool,
 }
 
 fn parse_export_onnx_args(args: Vec<String>) -> Result<ExportOnnxArgs, String> {
     let mut positional = Vec::new();
     let mut fuse = true;
+    let mut nhwc = false;
+    let mut segmentation_activation = true;
+    let mut fp16 = false;
+    let mut decode = false;
     for arg in args {
         match arg.as_str() {
             "--no-fuse" | "-dontfuse" => fuse = false,
+            "--nhwc" | "-nhwc" => nhwc = true,
+            "--nchw" | "-nchw" => nhwc = false,
+            "--noactivation" | "-noactivation" => segmentation_activation = false,
+            "--activation" | "-activation" => segmentation_activation = true,
+            "--fp16" | "-fp16" => fp16 = true,
+            "--fp32" | "-fp32" => fp16 = false,
+            "--decode" | "-decode" | "-boxes" => decode = true,
+            "--raw" | "-raw" | "-noboxes" => decode = false,
             other if other.starts_with('-') => {
                 return Err(format!("unknown export-onnx flag: {other}"));
             }
@@ -82,6 +98,10 @@ fn parse_export_onnx_args(args: Vec<String>) -> Result<ExportOnnxArgs, String> {
         weights,
         out,
         fuse,
+        nhwc,
+        segmentation_activation,
+        fp16,
+        decode,
     })
 }
 
@@ -449,6 +469,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &executable.params,
                 &lightnet_core::OnnxOptions {
                     fuse_batch_norm: parsed.fuse,
+                    nhwc: parsed.nhwc,
+                    segmentation_activation: parsed.segmentation_activation,
+                    fp16: parsed.fp16,
+                    decode_detections: parsed.decode,
                 },
             )?;
             fs::write(&parsed.out, &bytes)?;
@@ -3128,20 +3152,36 @@ fn run_detector_train_gpu(
                 phase_ms[1] += start.elapsed().as_secs_f64() * 1000.0;
             }
             let start = profile.as_ref().map(|_| Instant::now());
-            let yolo = compute_yolo_training_loss_with_state(
-                &executable.network,
-                &forward.cpu_forward,
-                &batch.labels,
-                batch_num,
-                Some(&mut yolo_state),
-            )?;
+            // LIGHTNET_YOLO_GPU=1 opts into the native CIoU loss with device-resident
+            // seeds; unsupported configurations fall back to the host loss.
+            let gpu_yolo = if std::env::var("LIGHTNET_YOLO_GPU").is_ok_and(|v| v != "0") {
+                executable.compute_yolo_training_loss_gpu(&forward, &batch.labels)?
+            } else {
+                None
+            };
+            let host_yolo = if gpu_yolo.is_none() {
+                Some(compute_yolo_training_loss_with_state(
+                    &executable.network,
+                    &forward.cpu_forward,
+                    &batch.labels,
+                    batch_num,
+                    Some(&mut yolo_state),
+                )?)
+            } else {
+                None
+            };
             if let Some(start) = start {
                 phase_ms[2] += start.elapsed().as_secs_f64() * 1000.0;
             }
-            iter_loss += yolo.loss;
             let start = profile.as_ref().map(|_| Instant::now());
-            executable
-                .backward_accumulate_seeded_gpu(&forward, &yolo.layer_output_gradient_seeds)?;
+            if let Some(gpu) = &gpu_yolo {
+                iter_loss += gpu.loss;
+                executable.backward_accumulate_device_seeded_gpu(&forward, &gpu.device_seeds)?;
+            } else if let Some(yolo) = &host_yolo {
+                iter_loss += yolo.loss;
+                executable
+                    .backward_accumulate_seeded_gpu(&forward, &yolo.layer_output_gradient_seeds)?;
+            }
             if let Some(start) = start {
                 // Backward (including seed H2D) and deferred update are asynchronous:
                 // synchronize only in profiling mode so host timings include GPU execution.
@@ -3649,7 +3689,7 @@ fn print_usage() {
     println!(
         "  detect-image <cfg> <weights> <names> <image> [thresh] [nms] [resize|letterbox|resize-exact]"
     );
-    println!("  export-onnx <cfg> <weights> [out.onnx] [--no-fuse]");
+    println!("  export-onnx <cfg> <weights> [out.onnx] [--no-fuse] [-fp32|-fp16] [-nchw|-nhwc] [-activation|-noactivation]");
     println!("  lm tokenizer --documents <tsv> --out <bpe> [--vocab N] [--latin-fold]");
     println!(
         "  lm shards --documents <tsv> --tokenizer <bpe> --out <dir> [--split NAME] [--shard-tokens N]"
@@ -3776,6 +3816,9 @@ mod tests {
     #[test]
     fn export_onnx_args_parse_defaults_and_flags() {
         let a = parse_export_onnx_args(vec!["m.cfg".into(), "m.weights".into()]).unwrap();
+        assert!(!a.nhwc && a.segmentation_activation);
+        let layout = parse_export_onnx_args(vec!["m.cfg".into(), "m.weights".into(), "-nhwc".into(), "-noactivation".into(), "-fp16".into()]).unwrap();
+        assert!(layout.nhwc && !layout.segmentation_activation && layout.fp16);
         assert_eq!(a.out, std::path::PathBuf::from("m.onnx"));
         assert!(a.fuse);
         let b = parse_export_onnx_args(vec![

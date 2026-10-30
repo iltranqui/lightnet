@@ -363,23 +363,6 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
         Ok(())
     }
 
-    /// Hand a clean Swin bank's accumulated gradients to the host optimizer.
-    pub(crate) fn retire_swin_bank_for_muon(&self, index: usize) -> Result<()> {
-        let mut banks = self.resident_parameter_banks.borrow_mut();
-        let Some(Some(state)) = banks.get(index) else { return Ok(()); };
-        if state.dirty {
-            return Err(Error::InvalidConfig("synchronize resident Swin state before switching to Muon".into()));
-        }
-        let values = self.backend.download_f32(&state.updates)
-            .map_err(|e| backend_error("download Swin gradients before Muon", e))?;
-        let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
-        let buffer = buffers.get_mut(index)
-            .ok_or_else(|| Error::InvalidConfig("resident host accumulator index".into()))?;
-        set_host_updates(buffer, &values)?;
-        banks[index] = None;
-        Ok(())
-    }
-
     pub(super) fn materialize_resident_optimizer_states(&self,states:&mut[Option<HostAdamLayerState>])->Result<()> {
         let banks=self.resident_parameter_banks.borrow();
         for (index,state) in banks.iter().enumerate() {
@@ -473,6 +456,22 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
             let views = serialized_mixer_muon_layout(&layer.kind,layer.input_shape,&self.params[index])?;
             let dpt_policy = matches!(layer.kind, LayerKind::DptHead(_));
             let total = old.snapshot.len();
+            let vit_policy = matches!(layer.kind, LayerKind::Vit(_));
+            let swin_policy = matches!(layer.kind, LayerKind::Swin(_));
+            let updates = if let LayerKind::Vit(spec) = &layer.kind {
+                let excluded = if spec.learned_pos_embed {
+                    0..0
+                } else {
+                    old.layout.get(14).ok_or_else(|| Error::InvalidConfig(
+                        "resident ViT positional range is missing".into()))?.range.clone()
+                };
+                be.vit_prepare_updates_f32(&old.updates, excluded.start, excluded.end, 5.0, config)
+                    .map_err(err)?
+            } else if swin_policy {
+                be.vit_prepare_updates_f32(&old.updates, 0, 0, 5.0, config).map_err(err)?
+            } else {
+                old.updates.clone()
+            };
             let slice = |tensor: &B::Tensor, range: Range<usize>| -> Result<B::Tensor> {
                 be.route_concat_f32(&[tensor],&[range.start],&[range.len()],&[total],
                     &[1,range.len(),1,1],1,config).map_err(err)
@@ -502,14 +501,15 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
             if next.muon_matrices.iter().map(|(v,_)|v).ne(views.iter()) {
                 return Err(Error::InvalidConfig("resident Muon matrix layout changed".into()));
             }
-            if be.any_non_finite_f32(&old.weights).map_err(err)? || be.any_non_finite_f32(&old.updates).map_err(err)? {
+            if be.any_non_finite_f32(&old.weights).map_err(err)?
+                || (!(vit_policy || swin_policy) && be.any_non_finite_f32(&old.updates).map_err(err)?) {
                 return Err(Error::InvalidConfig("resident Muon parameters/gradients must be finite".into()));
             }
             let layer_adam=AdamParams { lr:adam.lr*layer.train.learning_rate_scale,..*adam };
             // The CPU stages matrix directions, zeros their Adam gradients,
             // then advances AdamW for the whole layer. Existing matrix Adam
             // moments must still decay/advance, including resumed sidecars.
-            let effective=be.vector_mul_f32(&old.updates,next.muon_adam_mask.as_ref()
+            let effective=be.vector_mul_f32(&updates,next.muon_adam_mask.as_ref()
                 .ok_or_else(||Error::InvalidConfig("missing resident Muon Adam mask".into()))?,&[total],config).map_err(err)?;
             let moments=match &old.moments {
                 Some(pair)=>pair.clone(),
@@ -519,12 +519,35 @@ impl<B> GpuExecutableNetwork<B> where B: F32TensorOpsBackend, B::Error: std::fmt
                 &AdamParams{decay:0.0,..layer_adam},config).map_err(err)?;
             let masked=be.vector_mul_f32(&old.weights,&old.decay_mask,&[total],config).map_err(err)?;
             let base=be.saxpy_f32(-layer_adam.lr*layer_adam.decay,&masked,&base,config).map_err(err)?;
+            let base=if vit_policy {
+                let range=old.layout.get(15).ok_or_else(||Error::InvalidConfig(
+                    "resident ViT mHC range is missing".into()))?.range.clone();
+                if range.end!=total { return Err(Error::InvalidConfig("resident ViT mHC range is not the serialized suffix".into())); }
+                let mhc_weights=slice(&old.weights,range.clone())?;
+                let mhc_updates=slice(&updates,range.clone())?;
+                let mhc_m=slice(&moments.0,range.clone())?;
+                let mhc_v=slice(&moments.1,range.clone())?;
+                let (mhc,_,_)=be.adam_update_f32(&mhc_weights,&mhc_updates,&mhc_m,&mhc_v,
+                    &AdamParams{lr:layer_adam.lr*0.1,decay:0.0,..layer_adam},config).map_err(err)?;
+                let mhc=be.constrain_f32(&mhc,&[range.len()],8.0,config).map_err(err)?;
+                let prefix=slice(&base,0..range.start)?;
+                be.route_concat_f32(&[&prefix,&mhc],&[0,0],
+                    &[range.start,range.len()],&[range.start,range.len()],&[1,total,1,1],1,config).map_err(err)?
+            } else if swin_policy {
+                let range = old.layout.last().ok_or_else(|| Error::InvalidConfig(
+                    "resident Swin mHC range is missing".into()))?.range.clone();
+                if range.end != total { return Err(Error::InvalidConfig("resident Swin mHC range is not the serialized suffix".into())); }
+                let mhc = be.vit_clamp_feature_f32(&slice(&base, range.clone())?, 8.0, config).map_err(err)?;
+                let prefix = slice(&base, 0..range.start)?;
+                be.route_concat_f32(&[&prefix, &mhc], &[0, 0],
+                    &[range.start, range.len()], &[range.start, range.len()], &[1, total, 1, 1], 1, config).map_err(err)?
+            } else { base };
             let mut pieces=Vec::with_capacity(2*views.len()+1);
             let mut cursor=0;
             for (view,momentum) in &mut next.muon_matrices {
                 let shape=[view.rows,view.cols];
-                let updates=slice(&old.updates,view.range.clone())?;
-                let (next_momentum,lookahead)=be.muon_momentum_lookahead_f32(&updates,momentum,&shape,
+                let matrix_updates=slice(&updates,view.range.clone())?;
+                let (next_momentum,lookahead)=be.muon_momentum_lookahead_f32(&matrix_updates,momentum,&shape,
                     adam.batch,loss_scale,self.network.net.muon_momentum).map_err(err)?;
                 if be.any_non_finite_f32(&next_momentum).map_err(err)? || be.any_non_finite_f32(&lookahead).map_err(err)? {
                     return Err(Error::InvalidConfig("resident Muon momentum became nonfinite".into()));

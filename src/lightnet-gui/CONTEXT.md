@@ -27,4 +27,4 @@ Presentation layer only. File semantics live in `lightnet-gui-project`; model in
 
 - Opt-in: build with `-p lightnet-gui`; not in `default-members` because it pulls egui and eframe.
 - Keep logic that can be tested without a window in `lightnet-gui-project`.
-- Plan: `tasks/rust/gui_plan.md` (partly implemented).
+- Plan: `tasks/rust/03_plans/misc/gui_plan.md` (partly implemented).

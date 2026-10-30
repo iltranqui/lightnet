@@ -294,6 +294,58 @@ fn moe_router_gates_host(
 // geometry at the call site. Grouping those values into opaque descriptors
 // would make the backend API less explicit and would hide layout mistakes.
 #[allow(clippy::too_many_arguments)]
+
+/// Options of the native classic-YOLO CIoU loss (mirrors `YoloKernelArgs` of the reference).
+#[derive(Clone, Debug, Default)]
+pub struct YoloGpuLossArgs {
+    pub classes: usize,
+    /// Anchors of this head (`mask.len()`).
+    pub anchors: usize,
+    pub total_anchors: usize,
+    pub max_boxes: usize,
+    pub truth_size: usize,
+    pub truths: usize,
+    pub net_width: usize,
+    pub net_height: usize,
+    pub ignore_thresh: f32,
+    pub iou_normalizer: f32,
+    pub obj_normalizer: f32,
+    pub max_delta: f32,
+    pub new_coords: bool,
+    pub objectness_smooth: bool,
+    pub iou_thresh: f32,
+    pub truth_thresh: f32,
+    pub mask: Vec<usize>,
+    pub biases: Vec<f32>,
+}
+
+/// Per-image loss sums returned by the native YOLO loss.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct YoloImageMetrics {
+    pub total_iou: f32,
+    pub total_iou_loss: f32,
+    pub delta_squared: f32,
+    pub classification_delta_squared: f32,
+    pub count: f32,
+    pub total_bbox: f32,
+    pub rewritten_bbox: f32,
+}
+
+impl YoloImageMetrics {
+    /// Reads the 7-float device record layout.
+    pub fn from_record(record: &[f32]) -> Self {
+        Self {
+            total_iou: record[0],
+            total_iou_loss: record[1],
+            delta_squared: record[2],
+            classification_delta_squared: record[3],
+            count: record[4],
+            total_bbox: record[5],
+            rewritten_bbox: record[6],
+        }
+    }
+}
+
 pub trait F32TensorOpsBackend {
     type Error;
     type Tensor: Clone;
@@ -301,6 +353,11 @@ pub trait F32TensorOpsBackend {
     fn upload_f32(&self, shape: &[usize], host: &[f32]) -> Result<Self::Tensor, Self::Error>;
     fn zeros_f32(&self, shape: &[usize]) -> Result<Self::Tensor, Self::Error>;
     fn download_f32(&self, tensor: &Self::Tensor) -> Result<Vec<f32>, Self::Error>;
+    /// Logical shape of a device tensor without a download; `None` when the backend
+    /// cannot report it, in which case shape contracts are not checked.
+    fn tensor_shape(&self, _tensor: &Self::Tensor) -> Option<Vec<usize>> {
+        None
+    }
     /// True if any element of `x` is NaN or infinite.  The default downloads
     /// and scans on the host; backends may override with a device reduction.
     fn any_non_finite_f32(&self, x: &Self::Tensor) -> Result<bool, Self::Error> {
@@ -3909,7 +3966,7 @@ pub trait F32TensorOpsBackend {
     /// `gamma` and `beta` may be `None` for the bias-free variant that
     /// ModernBERT's `attn_norm` / `mlp_norm` and every `[laya_*]` LayerNorm use.
     /// `shape` is the output tensor's shape.  Shared building block for the
-    /// transformer family (see `tasks/rust/layers.md` Phase 3A prerequisite).
+    /// transformer family (see `tasks/rust/04_reference/layers.md` Phase 3A prerequisite).
     fn layernorm_forward_f32(
         &self,
         x: &Self::Tensor,
@@ -3965,6 +4022,29 @@ pub trait F32TensorOpsBackend {
             &host_ops::layernorm_backward(&dy, &host, rows, cols, g.as_deref(), eps),
         )
     }
+    /// ViT block-sparse attention for fused per-token QKV. The returned
+    /// probabilities and score activity are the forward-owned backward tape.
+    fn vit_msa_forward_f32(&self, qkv: &Self::Tensor, batch: usize, tokens: usize,
+        channels: usize, heads: usize, block: usize, topk: usize,
+        _config: ElementwiseLaunchConfig) -> Result<(Self::Tensor, Self::Tensor, Self::Tensor), Self::Error> {
+        let qkv = self.download_f32(qkv)?;
+        let (context, probabilities, active) = host_ops::vit_msa::forward(
+            &qkv, batch, tokens, channels, heads, block, topk);
+        Ok((self.upload_f32(&[batch, tokens, channels], &context)?,
+            self.upload_f32(&[batch, heads, tokens, tokens], &probabilities)?,
+            self.upload_f32(&[batch, heads, tokens, tokens], &active)?))
+    }
+
+    fn vit_msa_backward_f32(&self, qkv: &Self::Tensor, probabilities: &Self::Tensor,
+        active: &Self::Tensor, context: &Self::Tensor, grad: &Self::Tensor,
+        batch: usize, tokens: usize, channels: usize, heads: usize,
+        _config: ElementwiseLaunchConfig) -> Result<Self::Tensor, Self::Error> {
+        let result = host_ops::vit_msa::backward(&self.download_f32(qkv)?,
+            &self.download_f32(probabilities)?, &self.download_f32(active)?,
+            &self.download_f32(context)?, &self.download_f32(grad)?, batch, tokens, channels, heads);
+        self.upload_f32(&[batch, tokens, 3 * channels], &result)
+    }
+
     /// Online-softmax attention for fused QKV `[batch, tokens, 3*channels]`.
     /// Returns context `[batch, tokens, channels]` and natural-log LSE
     /// `[batch, heads, tokens]`; the reference implementation uses linear
@@ -4500,6 +4580,45 @@ pub trait F32TensorOpsBackend {
         let dy = self.download_f32(output_grad)?;
         self.upload_f32(shape, &host_ops::softmax_backward(&y, &dy, group_size))
     }
+    /// Per-pixel channel softmax on NCHW tensors.
+    fn spatial_softmax_f32(
+        &self, x: &Self::Tensor, shape: &[usize], _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let input = self.download_f32(x)?;
+        let (batch, channels, plane) = (shape[0], shape[1], shape[2] * shape[3]);
+        let mut output = vec![0.0; input.len()];
+        for b in 0..batch {
+            for p in 0..plane {
+                let base = b * channels * plane + p;
+                let max = (0..channels).map(|c| input[base + c * plane]).fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0;
+                for c in 0..channels { let i = base + c * plane; output[i] = (input[i] - max).exp(); sum += output[i]; }
+                for c in 0..channels { output[base + c * plane] /= sum; }
+            }
+        }
+        self.upload_f32(shape, &output)
+    }
+    /// Per-pixel channel softmax adjoint on NCHW tensors.
+    fn spatial_softmax_backward_f32(
+        &self,
+        output: &Self::Tensor,
+        output_grad: &Self::Tensor,
+        shape: &[usize],
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let y = self.download_f32(output)?;
+        let dy = self.download_f32(output_grad)?;
+        let (batch, channels, plane) = (shape[0], shape[1], shape[2] * shape[3]);
+        let mut dx = vec![0.0; y.len()];
+        for b in 0..batch {
+            for p in 0..plane {
+                let base = b * channels * plane + p;
+                let dot: f32 = (0..channels).map(|c| { let i = base + c * plane; y[i] * dy[i] }).sum();
+                for c in 0..channels { let i = base + c * plane; dx[i] = y[i] * (dy[i] - dot); }
+            }
+        }
+        self.upload_f32(shape, &dx)
+    }
     /// CenterNet forward: apply sigmoid to the first `classes` NCHW channels,
     /// preserve regression channels, then zero non-finite values. The default
     /// is a host reference; native backends should keep this pass on-device.
@@ -4560,6 +4679,31 @@ pub trait F32TensorOpsBackend {
                     output[index] = value;
                 }
             }
+        }
+        self.upload_f32(shape, &output)
+    }
+    /// Native classic-YOLO CIoU loss on an activated head. Returns the delta tensor and
+    /// per-image metrics, or `None` when the backend has no native loss (callers fall back
+    /// to the host loss).
+    fn yolo_loss_f32(
+        &self, _output: &Self::Tensor, _truth: &Self::Tensor, _shape: &[usize],
+        _args: &YoloGpuLossArgs, _config: ElementwiseLaunchConfig,
+    ) -> Result<Option<(Self::Tensor, Vec<YoloImageMetrics>)>, Self::Error> {
+        Ok(None)
+    }
+    /// Classic YOLO head activation, using anchor-major NCHW entries.
+    fn yolo_activate_f32(
+        &self, x: &Self::Tensor, shape: &[usize], classes: usize,
+        scale_xy: f32, new_coords: bool, _config: ElementwiseLaunchConfig,
+    ) -> Result<Self::Tensor, Self::Error> {
+        let input = self.download_f32(x)?;
+        let plane = shape[2] * shape[3];
+        let entries = classes + 5;
+        let mut output = input;
+        for (index, value) in output.iter_mut().enumerate() {
+            let entry = (index / plane) % entries;
+            if !new_coords && entry != 2 && entry != 3 { *value = 1.0 / (1.0 + (-*value).exp()); }
+            if entry < 2 { *value = *value * scale_xy - 0.5 * (scale_xy - 1.0); }
         }
         self.upload_f32(shape, &output)
     }

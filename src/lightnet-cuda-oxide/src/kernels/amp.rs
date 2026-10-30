@@ -79,6 +79,64 @@ pub mod kernels {
         }
     }
 
+
+    /// Spatial softmax over channels on f16 storage: one thread per pixel, f32
+    /// accumulation, `temperature` divides the logits (1.0 is the plain softmax).
+    #[kernel]
+    pub fn amp_spatial_softmax_forward(
+        x: &[u16], mut out: DisjointSlice<u16>, channels: usize, spatial: usize, temperature: f32, fmt: u32,
+    ) {
+        let pixel = thread::index_1d().get();
+        if pixel >= out.len() / channels { return; }
+        let base = (pixel / spatial) * channels * spatial + pixel % spatial;
+        let mut max = f32::NEG_INFINITY;
+        let mut c = 0;
+        while c < channels {
+            let v = half_bits_to_f32(x[base + c * spatial], fmt) / temperature;
+            if v > max { max = v; }
+            c += 1;
+        }
+        let mut sum = 0.0f32;
+        c = 0;
+        while c < channels {
+            sum += (half_bits_to_f32(x[base + c * spatial], fmt) / temperature - max).exp();
+            c += 1;
+        }
+        c = 0;
+        while c < channels {
+            let i = base + c * spatial;
+            let p = (half_bits_to_f32(x[i], fmt) / temperature - max).exp() / sum;
+            // SAFETY: each pixel thread owns its channel-strided output slots.
+            unsafe { *out.as_mut_ptr().add(i) = f32_to_half_bits(p, fmt); }
+            c += 1;
+        }
+    }
+
+    /// Backward of `amp_spatial_softmax_forward` given the f16 probabilities `y`.
+    #[kernel]
+    pub fn amp_spatial_softmax_backward(
+        y: &[u16], dy: &[u16], mut dx: DisjointSlice<u16>, channels: usize, spatial: usize, temperature: f32, fmt: u32,
+    ) {
+        let pixel = thread::index_1d().get();
+        if pixel >= dx.len() / channels { return; }
+        let base = (pixel / spatial) * channels * spatial + pixel % spatial;
+        let mut dot = 0.0f32;
+        let mut c = 0;
+        while c < channels {
+            let i = base + c * spatial;
+            dot += half_bits_to_f32(y[i], fmt) * half_bits_to_f32(dy[i], fmt);
+            c += 1;
+        }
+        c = 0;
+        while c < channels {
+            let i = base + c * spatial;
+            let g = half_bits_to_f32(y[i], fmt) * (half_bits_to_f32(dy[i], fmt) - dot) / temperature;
+            // SAFETY: each pixel thread owns its channel-strided output slots.
+            unsafe { *dx.as_mut_ptr().add(i) = f32_to_half_bits(g, fmt); }
+            c += 1;
+        }
+    }
+
     #[kernel]
     pub fn amp_activation(x: &[u16], mut out: DisjointSlice<u16>, kind: u32, fmt: u32) {
         let idx = thread::index_1d();

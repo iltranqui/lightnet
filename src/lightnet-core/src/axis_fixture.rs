@@ -4,7 +4,7 @@
 //! extent, `batch > 1`, and a value that identifies which `(n, c, h, w)` it
 //! came from. Tests that predate this module hand-roll those loops, which
 //! makes "distinct" mean something slightly different in each one. New pins
-//! should use these helpers; see `tasks/rust/axis-coverage.md`.
+//! should use these helpers; see `tasks/rust/02_state/axis-coverage.md`.
 //!
 //! A pin built on these fixtures is still **hand-derived from source, no
 //! compiled-C++ golden**. The sentinel only makes a wrong axis visible; it is

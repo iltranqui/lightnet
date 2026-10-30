@@ -419,7 +419,7 @@ pub struct ConvolutionalSpec {
     pub activation: Activation,
 }
 
-/// `[moe_convolutional]` (Phase 2B of `tasks/rust/layers.md`), ported from
+/// `[moe_convolutional]` (Phase 2B of `tasks/rust/04_reference/layers.md`), ported from
 /// `Jev_laya:src-lib/moe_convolutional_layer.cpp`.
 ///
 /// The layer owns `experts` ordinary convolutional layers - `expert` carries each
@@ -915,7 +915,7 @@ pub struct KimiKdaSpec {
     pub activation: Activation,
 }
 
-/// `[yolox]`: the anchor-free detection head (Phase 2A of `tasks/rust/layers.md`),
+/// `[yolox]`: the anchor-free detection head (Phase 2A of `tasks/rust/04_reference/layers.md`),
 /// ported from `Jev_laya:src-lib/darknet_cfg.cpp::parse_yolox_section`.  The
 /// layer has no weights and no kernels; see
 /// `src/lightnet-core/src/modern_yolo.rs` for the decode, SimOTA assignment and
@@ -945,7 +945,7 @@ pub struct ModernYoloSpec {
 }
 
 /// `[contrastive]`: the supervised-contrastive head, classifier branch
-/// (deferred item (c) of `tasks/rust/layers.md` Phase 1b), ported from
+/// (deferred item (c) of `tasks/rust/04_reference/layers.md` Phase 1b), ported from
 /// `Jev_laya:src-lib/darknet_cfg.cpp::parse_contrastive_section`.  `yolo_layer`
 /// selects the detection branch, which this port does not implement.
 #[derive(Clone, Debug, PartialEq)]
@@ -963,7 +963,7 @@ pub struct ContrastiveSpec {
     pub contrastive_neg_max: usize,
 }
 
-/// `[centernet]` (Phase 2A of `tasks/rust/layers.md`), ported from
+/// `[centernet]` (Phase 2A of `tasks/rust/04_reference/layers.md`), ported from
 /// `Jev_laya:src-lib/darknet_cfg.cpp::parse_centernet_section`.  No weights and no
 /// kernels; see `src/lightnet-core/src/centernet.rs` for the maths.
 #[derive(Clone, Debug, PartialEq)]
@@ -1023,7 +1023,7 @@ impl ModernYoloSpec {
     }
 }
 
-/// `[omd_loss]` (Phase 1b of `tasks/rust/layers.md`), ported from
+/// `[omd_loss]` (Phase 1b of `tasks/rust/04_reference/layers.md`), ported from
 /// `Jev_laya:src-lib/darknet_cfg.cpp::parse_omd_loss_section`.  The layer is a
 /// pass-through with no weights; every key below is the C++ one, including its
 /// alias spellings.
@@ -1062,7 +1062,7 @@ pub struct OmdLossSpec {
     pub show_details: bool,
 }
 
-/// `[segmentation]` (Phase 1b of `tasks/rust/layers.md`), ported from
+/// `[segmentation]` (Phase 1b of `tasks/rust/04_reference/layers.md`), ported from
 /// `v6-dev-seg:src-lib/darknet_cfg.cpp::parse_segmentation_section`.  The layer
 /// has no weights and passes its shape through unchanged.
 #[derive(Clone, Debug, PartialEq)]
@@ -1605,6 +1605,7 @@ pub enum LayerKind {
     ChannelShuffle(ChannelShuffleSpec),
     Softmax {
         groups: usize,
+        spatial: bool,
     },
     Cost {
         kind: String,
@@ -1792,7 +1793,7 @@ impl LayerKind {
 /// Every variant must record one: a named `*axis_layout*` test, an explicit
 /// open gap with an owner, or a note that the layer has no C++ counterpart.
 /// The [`LayerKind::axis_pin`] match is exhaustive, so adding a variant fails
-/// the build until it is classified here and in `tasks/rust/axis-coverage.md`.
+/// the build until it is classified here and in `tasks/rust/02_state/axis-coverage.md`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AxisPin {
     /// A named `*axis_layout*` test pins this layer's axes.
@@ -1826,7 +1827,7 @@ impl AxisPin {
 /// One axis decision per [`LayerKind`] variant, in declaration order, plus the
 /// trailing `Unsupported` variant.
 ///
-/// Keep this in sync with `tasks/rust/axis-coverage.md`; that file owns the
+/// Keep this in sync with `tasks/rust/02_state/axis-coverage.md`; that file owns the
 /// evidence, this table is what the test checks.
 pub const AXIS_PINS: &[AxisPin] = &[
     AxisPin::Open("Tier 1: nested-body geometry and per-pass lattice"),
@@ -4485,6 +4486,7 @@ fn parse_layer_kind(
         }),
         "soft" | "softmax" => LayerKind::Softmax {
             groups: section.get_usize("groups", 1)?,
+            spatial: section.get_bool_int("spatial", false)?,
         },
         "cost" => LayerKind::Cost {
             kind: section.get_str("type", "sse"),
@@ -11625,7 +11627,7 @@ output=2
         // build until AXIS_PINS has an entry for it. This test checks the table
         // itself: every pinned entry names a real `*axis_layout*` test, every
         // open/rust-only entry states an owner or reason, and the counts match
-        // `tasks/rust/axis-coverage.md`.
+        // `tasks/rust/02_state/axis-coverage.md`.
         assert_eq!(
             AXIS_PINS.len(),
             66,

@@ -114,6 +114,78 @@ pub(crate) fn serialized_mixer_muon_layout(
             }
             cursor
         }
+        (LayerKind::Swin(s), LayerParams::Swin(p)) => {
+            let hidden = checked_product(&[s.filters, s.ffn_ratio], "Swin FFN")?;
+            let qkv_rows = checked_product(&[3, input.channels], "Swin QKV rows")?;
+            let projection = p.res_proj.is_some();
+            p.to_blob().map_err(Error::InvalidConfig)?;
+            let mut cursor = 0usize;
+            for (slot, part) in p.serialized_parts().into_iter().enumerate() {
+                let dims = match slot {
+                    0 => Some((qkv_rows, input.channels)),
+                    2 => Some((s.filters, input.channels)),
+                    8 => Some((hidden, s.filters)),
+                    10 => Some((s.filters, hidden)),
+                    12 if projection => Some((s.filters, input.channels)),
+                    _ => None,
+                };
+                if let Some((rows, cols)) = dims {
+                    if part.len() != checked_product(&[rows, cols], "Swin resident matrix")? {
+                        return Err(Error::InvalidConfig("resident Swin Muon matrix length mismatch".into()));
+                    }
+                    push(cursor, rows, cols)?;
+                }
+                cursor = cursor.checked_add(part.len())
+                    .ok_or_else(|| Error::InvalidConfig("Swin resident blob size overflow".into()))?;
+            }
+            if cursor != p.to_blob().map_err(Error::InvalidConfig)?.len() {
+                return Err(Error::InvalidConfig("resident Swin Muon serialized length mismatch".into()));
+            }
+            cursor
+        }
+        (LayerKind::Vit(s), LayerParams::Vit(p)) => {
+            let patch_cols = checked_product(
+                &[input.channels, s.patch_size, s.patch_size],
+                "ViT patch projection",
+            )?;
+            let dimensions = [
+                Some((s.dim, patch_cols)), // patch_embed
+                None,                      // patch_bias
+                None,                      // qkv_bias
+                None,                      // ln1_gamma
+                None,                      // ln1_beta
+                Some((checked_product(&[3, s.dim], "ViT QKV rows")?, s.dim)),
+                Some((s.dim, s.dim)),      // wo
+                None,                      // wo_bias
+                None,                      // ln2_gamma
+                None,                      // ln2_beta
+                Some((s.mlp_dim, s.dim)),   // ffn_w1
+                None,                      // ffn_b1
+                Some((s.dim, s.mlp_dim)),   // ffn_w2
+                None,                      // ffn_b2
+                None,                      // pos_embed
+                None,                      // mHC parameters are not Muon matrices
+            ];
+            let mut cursor = 0usize;
+            for (part, dims) in p.serialized_parts().into_iter().zip(dimensions) {
+                if let Some((rows, cols)) = dims {
+                    let expected = checked_product(&[rows, cols], "ViT resident matrix")?;
+                    if part.len() != expected {
+                        return Err(Error::InvalidConfig(format!(
+                            "resident ViT Muon matrix has {} values, expected {expected} for {rows}x{cols}",
+                            part.len()
+                        )));
+                    }
+                    push(cursor, rows, cols)?;
+                }
+                cursor = cursor.checked_add(part.len())
+                    .ok_or_else(|| Error::InvalidConfig("ViT resident blob size overflow".into()))?;
+            }
+            if cursor != p.to_blob().len() {
+                return Err(Error::InvalidConfig("resident ViT Muon serialized length mismatch".into()));
+            }
+            cursor
+        }
         (LayerKind::DptHead(s), LayerParams::DptHead(p)) => {
             let geometry = s.geometry(input);
             let layout = crate::dpt_head::dpt_head_weight_layout(geometry)?;

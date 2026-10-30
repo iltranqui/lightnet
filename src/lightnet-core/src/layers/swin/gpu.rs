@@ -415,9 +415,6 @@ where
     pub(crate) fn forward_swin_native_gpu(&self, layer: &Layer, g: &SwinGeometry,
         weights: &super::SwinWeights, input: &B::Tensor, config: ElementwiseLaunchConfig,
         training: bool) -> Result<(B::Tensor,Option<DeviceCache<B::Tensor>>)> {
-        if self.network.net.muon {
-            self.retire_swin_bank_for_muon(layer.index)?;
-        }
         let mut cursor=0; let mut ranges=Vec::new(); let mut layout=Vec::new();
         let projection=weights.res_proj.is_some();
         for (slot,part) in weights.serialized_parts().iter().enumerate() {
@@ -427,7 +424,7 @@ where
                 moment_slot:Some(ResidentMomentSlot::ChildWeights(slot)),active:true });
         }
         let blob=weights.to_blob().map_err(Error::InvalidConfig)?;
-        let (parameters,generation)=if self.resident_parameter_path_enabled() && !self.network.net.muon {
+        let (parameters,generation)=if self.resident_parameter_path_enabled() {
             let (p,g)=self.resident_parameter_slices(layer.index,&blob,layout,&ranges,config)?;
             (Some(p),Some(g))
         } else {(None,None)};

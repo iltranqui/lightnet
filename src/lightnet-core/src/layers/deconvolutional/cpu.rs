@@ -1,4 +1,4 @@
-//! Transposed convolution host math (tasks/rust/layers.md Task 9).
+//! Transposed convolution host math (tasks/rust/04_reference/layers.md Task 9).
 
 use crate::model::TensorShape;
 use crate::runtime::Tensor;

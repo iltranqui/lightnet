@@ -84,7 +84,7 @@ fn gemm_bench_lego() {
     run(&LEGO, "lego");
 }
 
-/// `tasks/rust/fp8_fp4.md` Phase D: the f32 / tf32 / f16 / fp8 / fp4 table.
+/// `tasks/rust/03_plans/lowprec/fp8_fp4.md` Phase D: the f32 / tf32 / f16 / fp8 / fp4 table.
 /// End-to-end through the GEMM seam, so the fp8 and fp4 columns include their
 /// quantisation (the FP4 column additionally includes the host transpose and
 /// host round trip of the packed path - it is an emulation, not a kernel).

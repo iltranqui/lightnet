@@ -27,5 +27,5 @@ The seam between `lightnet-core` and concrete GPU backends. Defines operation tr
 ## Constraints
 
 - Must stay buildable on CPU-only machines.
-- A host-fallback layer still needs a CPU-parity test before it counts as GPU-complete (`tasks/rust/gpu_layers_plan.md`).
+- A host-fallback layer still needs a CPU-parity test before it counts as GPU-complete (`tasks/rust/03_plans/gpu/gpu_layers_plan.md`).
 - Open question: keep exact-erf math here and in `lightnet-core` in sync (both use `float_erf`).
