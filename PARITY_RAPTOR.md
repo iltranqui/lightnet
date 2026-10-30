@@ -2,6 +2,8 @@
 
 Last updated: 2026-10-30. This is an **unfinished implementation handoff**, not a parity claim. Nothing in this document has been built, tested, or run on the GPU unless it says so explicitly.
 
+Build status at this revision: `cargo xtask check` and `cargo xtask gpu-check` are clean, the named host and Oxide checks pass (see [Results, 2026-10-30](#results-2026-10-30)), and the native YOLO loss kernels are accepted by Oxide codegen. That is a build and smoke-level result only: no Darknet reference comparison, no per-conv FP8 policy, no training run.
+
 ## Table of Contents
 
 - [Objective and reference](#objective-and-reference)
@@ -47,20 +49,23 @@ Model parsing and validation own configuration semantics. Head kernels own activ
 
 ### Git state
 
-- Work is committed on branch `wip-gpu-parity`, based on `0362beaa` (remote `origin/main`). `4406741` holds the 80 `src/` files. `f1f15d0` and `ed7fcae` follow. `a51d56c` removes the legacy `[detection]` layer. All of it is WIP and has not been built or tested.
+- Work is committed on branch `wip-gpu-parity`, based on `0362beaa` (remote `origin/main`). `4406741` holds the 80 `src/` files. `f1f15d0` and `ed7fcae` follow. `a51d56c` removes the legacy `[detection]` layer. `1a18f24` adds the classic `[yolo]` parity fixes (`mask` default, `max` cap, `x == 0` truth stop, rejection of unhandled keys). HEAD is `1a18f24`.
+- Working tree: `Cargo.lock` and this file are modified and uncommitted; not part of the ported work. The eight untracked drafts listed under "Not started" are still untracked and unbuilt.
 - `refs/heads/main` was missing commit `dcbd197a5da7a09db8f3cd887842e6f050ff3fd0`, a zero-byte loose file whose content is unrecoverable. It now points to `0362beaa` (remote `origin/main`), by user choice. HEAD is `wip-gpu-parity`.
 - Thirteen zero-byte loose object files were moved, not deleted, to `.git/corrupt-empty-objects/`. Five of the moved objects are blobs that dangling trees reference. None are reachable from HEAD (`git rev-list --objects HEAD` runs without errors).
 - The index cache-tree still references missing object `8f5064135548b63d658603b1ba5d8b28e388dae1`. This is a cache only.
 - The sixty files outside `src/` (docs, `tasks/`, `CLAUDE.md`, `CONTEXT.md` files) that had been staged are committed in `ed7fcae`. Nothing is staged. This resolves the earlier decision. `Cargo.lock` has an uncommitted modification that is not part of this work.
 
-### Implemented, not yet built or tested
+### Implemented, build-checked, not parity-verified
 
-- **Device-seed shape check.** `F32TensorOpsBackend::tensor_shape()` defaults to `None`. Oxide, cuTile and the FakeBackend override it. `backward_accumulate_device_seeded_gpu` in `runtime/gpu_backward.rs` rejects a seed whose shape is not `[batch, c, h, w]` of its layer. The wrong-shape assertion was added to `gpu_device_seeds_match_host_seeds_with_loss_scaling` in `runtime/tests/tests_04.rs`. The earlier FakeBackend pass predates this assertion and must be rerun.
-- **Native FP16 spatial softmax.** `amp_spatial_softmax_forward` and `amp_spatial_softmax_backward` in `lightnet-cuda-oxide/src/kernels/amp.rs` keep f16 storage with f32 math. `spatial_softmax_f32` and its backward in `softmax_backend.rs` dispatch to them for half-storage input. The multiclass segmentation forward in `dense_loss_backend.rs` uses them and honours `temperature`. Test: `spatial_softmax_f16_storage_matches_f32_with_temperature` in `tests/oxide_runtime_chain.rs`. The test assumes `to_half_storage` works on a default `OxideBackend`, which may need AMP enabled.
+Built on 2026-10-30: `cargo xtask check` and `cargo xtask gpu-check` both pass, and the four Oxide checks named below run on the RTX 4060 (SM 89). "Checked" means the code compiles and its focused test passes; it does not mean the numbers were compared with Darknet.
+
+- **Device-seed shape check.** `F32TensorOpsBackend::tensor_shape()` defaults to `None`. Oxide, cuTile and the FakeBackend override it. `backward_accumulate_device_seeded_gpu` in `runtime/gpu_backward.rs` rejects a seed whose shape is not `[batch, c, h, w]` of its layer. The wrong-shape assertion was added to `gpu_device_seeds_match_host_seeds_with_loss_scaling` in `runtime/tests/tests_04.rs`. Rerun on 2026-10-30 with the assertion in place: `gpu_device_seeds_match_host_seeds_with_loss_scaling` passes.
+- **Native FP16 spatial softmax.** `amp_spatial_softmax_forward` and `amp_spatial_softmax_backward` in `lightnet-cuda-oxide/src/kernels/amp.rs` keep f16 storage with f32 math. `spatial_softmax_f32` and its backward in `softmax_backend.rs` dispatch to them for half-storage input. The multiclass segmentation forward in `dense_loss_backend.rs` uses them and honours `temperature`. Test: `spatial_softmax_f16_storage_matches_f32_with_temperature` in `tests/oxide_runtime_chain.rs`. Open question resolved 2026-10-30: the test passes on a default `OxideBackend` with no AMP environment set.
 - **Softmax temperature.** Segmentation temperature is applied in the native f32 path, the f16 path, and the ONNX graph (`Div` before `Softmax`). The plain `[softmax]` layer has no temperature in the reference (fixed at 1), so none is added there.
 - **Decoded YOLO ONNX output.** `OnnxOptions::decode_detections` (default `false`, so raw heads remain the default) decodes every YOLO head in the graph into `boxes` `[batch, N, 1, 4]` (normalized x1, y1, x2, y2) and `confs` `[batch, N, classes]` (objectness × class). It mirrors the reference `darknet_onnx.cpp` math, including `scale_x_y`, `new_coords`, and skipping sigmoid when the previous layer is logistic. NMS stays with the application. CLI flags: `-decode` (alias `-boxes`) and `-raw` (alias `-noboxes`). Test: `decoded_detection_export_replaces_raw_heads_with_boxes_and_confs` in `onnx/export.rs`. No numerical comparison against the reference has been done.
 - **Classic YOLO GPU loss.**
-  - Kernels: `yolo_loss_background`, `yolo_loss_positives`, `yolo_loss_average` and `yolo_loss_reduce` in `lightnet-cuda-oxide/src/kernels/dense_loss.rs`. They port `yolo_loss_kernel` from `raptor-fp4` `src-lib/yolo_layer.cu`. The positives kernel runs one thread per image and does not use atomics. Known risk: Oxide codegen may reject raw-pointer device helpers, tuple returns, `&mut [f32; 4]` arguments, or `f32::atan2`.
+  - Kernels: `yolo_loss_background`, `yolo_loss_positives`, `yolo_loss_average` and `yolo_loss_reduce` in `lightnet-cuda-oxide/src/kernels/dense_loss.rs`. They port `yolo_loss_kernel` from `raptor-fp4` `src-lib/yolo_layer.cu`. The positives kernel runs one thread per image and does not use atomics. The recorded codegen risk (raw-pointer device helpers, tuple returns, `&mut [f32; 4]` arguments, `f32::atan2`) did not materialise: `lightnet-cuda-oxide` compiles and `native_yolo_loss_matches_hand_derived_single_truth` runs the kernels on the GPU.
   - Backend: `YoloGpuLossArgs`, `YoloImageMetrics` and `F32TensorOpsBackend::yolo_loss_f32` in `lightnet-cuda/src/lib.rs`. The default returns `Ok(None)`. Oxide overrides it through `yolo_loss_backend_f32`.
   - Runtime: `compute_yolo_training_loss_gpu` in `runtime/gpu_yolo_loss.rs`. It activates each raw head once with `yolo_activate_f32`, returns device seeds, and applies `delta_normalizer` to the propagated seed only. It returns `Ok(None)` for unsupported configurations: non-CIoU loss, `iou_thresh_kind` other than IoU, focal loss, label smoothing, class multipliers or map, more than 32 anchors, more than 1024 boxes, adversarial, equidistant points, bad-label rejection, OBB, and Gaussian YOLO.
   - CLI: `run_detector_train` uses the GPU loss when `LIGHTNET_YOLO_GPU` is set and not `0`. Otherwise, or when the GPU loss declines, it uses the host loss with `backward_accumulate_seeded_gpu`. The GPU path uses `backward_accumulate_device_seeded_gpu`.
@@ -86,7 +91,7 @@ Model parsing and validation own configuration semantics. Head kernels own activ
 ### Not started
 
 - Region truth loss and decode, modern-head (YOLOX, PP-YOLOE, YOLO-NAS) losses and decode, and CenterNet GPU paths. `tasks/rust/02_state/layer-support.md` reports some of these as incomplete or host-owned. Verify live source before acting on that table.
-- Subagent drafts, **uncommitted and unwired**, not built: `layers/modern_yolo/{yolox,ppyoloe,yolonas}_train.rs`, `layers/centernet/train.rs`, and `lightnet-cuda-oxide/src/kernels/{yolox,ppyoloe,yolonas,centernet}_train.rs`. `yolox_train.rs` has a syntax error at line 184. Their assignment logic differs from the existing `modern_yolo/cpu.rs` (`assign_tal_like`, YOLOX centre-only geometry, SIMOTA top-k, L1 and class-term gaps). Undecided: fix `cpu.rs` or replace it with these files.
+- Subagent drafts, **uncommitted and unwired**, not built: `layers/modern_yolo/{yolox,ppyoloe,yolonas}_train.rs`, `layers/centernet/train.rs`, and `lightnet-cuda-oxide/src/kernels/{yolox,ppyoloe,yolonas,centernet}_train.rs`. Re-checked 2026-10-30: none of the eight is declared in any `mod.rs`, so `cargo check`/`cargo xtask gpu-check` do not see them; a standalone `rustc` parse of `yolox_train.rs` still fails at line 184 (`truth.w * l.w as f32 < min_object_cells` parses `<` as generic arguments, needs parentheses). Their assignment logic differs from the existing `modern_yolo/cpu.rs` (`assign_tal_like`, YOLOX centre-only geometry, SIMOTA top-k, L1 and class-term gaps). Undecided: fix `cpu.rs` or replace it with these files. `train.rs` has no dispatch for `Region`, `Yolox`, `Ppyoloe`, `Yolonas` or `CenterNet`, so training those heads is rejected today, matching `tasks/rust/02_state/layer-support.md`.
 - Legacy `[detection]` layer: removed in `a51d56c`. It was an identity passthrough, and no shipped cfg uses it. Not built or tested.
 - Per-layer FP8 policy and the FP32 head boundary.
 - Short LegoGears, `semantic_binary` and `semantic_multi` smoke tests, and the native-vs-native FP8 and ONNX FP32/FP16 comparisons.
@@ -94,16 +99,16 @@ Model parsing and validation own configuration semantics. Head kernels own activ
 ## Detection implementation sequence
 
 1. Read `src-lib/yolo_layer.cu`, `yolo_layer.cpp`, `activation_kernels.cu`, and `src-test/test_yolo_layer_cuda.cpp` from `raptor-fp4`; compare each head, loader, decoder, loss option and test with current Rust. Record specific gaps and identify which supported cfg options are currently discarded by parsing. **Status: not done.**
-2. Validate device-resident seeded backward: exact seed shapes (**implemented, unverified**), loss scaling, forward-state lifetime, fallback behavior, and parity with the host-seed path on the real Oxide backend. **Status: partial.**
-3. Classic YOLO GPU activation, assignment, loss and metrics. **Status: implemented, unverified.** Still to verify: parity with the Rust CPU loss on multi-truth, extra-anchor, objectness-smoothing, `new_coords`, truth-threshold and collision cases, plus the reference-rejected options.
-4. Connect head activation and loss to `GpuForwardState` and the device-seed backward path. **Status: implemented as opt-in (`LIGHTNET_YOLO_GPU`), unverified.** Still to verify: no double activation, forward-state lifetime, and mixed-precision loss scaling in the real training loop.
+2. Validate device-resident seeded backward: exact seed shapes (**implemented, host test passes with the shape assertion**), loss scaling, forward-state lifetime, fallback behavior, and parity with the host-seed path on the real Oxide backend. **Status: partial. Device-seed shape and fallback are covered on host only; no Oxide run compares the device-seed path with the host-seed path.**
+3. Classic YOLO GPU activation, assignment, loss and metrics. **Status: implemented; activation and the single-truth hand-derived loss pass on the RTX 4060.** Still to verify: parity with the Rust CPU loss on multi-truth, extra-anchor, objectness-smoothing, `new_coords`, truth-threshold and collision cases, plus the reference-rejected options.
+4. Connect head activation and loss to `GpuForwardState` and the device-seed backward path. **Status: implemented as opt-in (`LIGHTNET_YOLO_GPU`); only the host fallback test has run.** Still to verify: no double activation, forward-state lifetime, and mixed-precision loss scaling in the real training loop.
 5. Other detection gaps (Region, modern heads, CenterNet). **Status: not started.** Do not imply that the classic YOLO kernel completes all detection heads.
-6. Per-layer FP8 policy and FP32 head boundary, then a short LegoGears training and inference smoke test. **Status: not started.** Do not claim FP8 coverage or performance from an FP32-only test. Training runs are limited to the user's authorized short smoke tests; choose a small, explicit iteration count and document it.
-7. Decoded detection ONNX output, FP16/FP32 and layout coverage, and comparisons on the three acceptance datasets. **Status: decoded output implemented, unverified; comparisons not started.** Follow user priority if they redirect work.
+6. Per-layer FP8 policy and FP32 head boundary, then a short LegoGears training and inference smoke test. **Status: not started.** No per-conv FP8 policy or FP32 head boundary exists in the runtime. `-fp8` (`tools/train_legogears_oxide.sh`) sets the global `LIGHTNET_OXIDE_GEMM`, so the conv before a head also runs FP8. No smoke run has been done. Do not claim FP8 coverage or performance from an FP32-only test. Training runs are limited to the user's authorized short smoke tests; choose a small, explicit iteration count and document it.
+7. Decoded detection ONNX output, FP16/FP32 and layout coverage, and comparisons on the three acceptance datasets. **Status: decoded output implemented; 5 host tests pass (FP32/FP16 × NCHW/NHWC, checking names, dtypes and shapes only). No numerical comparison: `tools/onnx_check.py` compares raw heads only, and the three datasets have not been run.** Follow user priority if they redirect work.
 
 ## Verification and commands
 
-Run builds and checks serially, with at most two jobs, GPU tests with one test thread, and a soft `MemoryHigh=3G`. Never use a hard RAM cap. Use `cargo xtask` where it covers the command. The Oxide backend requires `tools/test_oxide.sh`. Do not treat an interrupted command as a pass. No command in this list has been run against the current working state.
+Run builds and checks serially, with at most two jobs, GPU tests with one test thread, and a soft `MemoryHigh=3G`. Never use a hard RAM cap. Use `cargo xtask` where it covers the command. The Oxide backend requires `tools/test_oxide.sh`. Do not treat an interrupted command as a pass. Every command in this list was run against this working tree on 2026-10-30 with `JOBS=4 MEM=4G` (inside the usual `systemd-run --user` memory scope); results are recorded below.
 
 ```sh
 JOBS=2 MEM=3G cargo xtask check
@@ -116,6 +121,22 @@ cargo xtask oxide --test oxide_runtime_chain -- native_yolo_loss_matches_hand_de
 cargo xtask oxide --test oxide_runtime_chain -- spatial_softmax_f16_storage_matches_f32_with_temperature
 git diff --check
 ```
+
+### Results, 2026-10-30
+
+| Command | Result |
+|---|---|
+| `cargo xtask check` | pass; only the pre-existing `swin/gpu.rs` dead-code warnings |
+| `cargo xtask gpu-check` | pass; plus one pre-existing unused-import warning in `lightnet-cuda-oxide/src/mambavision.rs` |
+| `test gpu_device_seeds_match_host_seeds_with_loss_scaling` | 1 passed |
+| `test gpu_yolo_loss_falls_back_when_backend_has_no_native_loss` | 1 passed |
+| `test decoded_detection_export` | 5 passed (FP32/FP16 × NCHW/NHWC, names/dtypes/shapes only) |
+| `test yolo` | 124 passed in `lightnet-core`, 2 in `lightnet-cli` |
+| oxide `oxide_runtime_chain -- yolo` | 3 passed: `classic_yolo_activation_matches_reference_layout`, `modern_yolo_native_full_and_compact_forward_match_cpu`, `native_yolo_loss_matches_hand_derived_single_truth` |
+| oxide `spatial_softmax_f16_storage_matches_f32_with_temperature` | 1 passed |
+| `git diff --check` | clean |
+
+What these results do **not** cover: the GPU box delta (only objectness and class deltas are asserted), multi-truth / extra-anchor / objectness-smoothing / `new_coords` GPU parity, the real training loop, ONNX numbers against native output, FP8, and any compiled `raptor-fp4` golden. No golden data exists in the repo, so every numeric check here is against Rust CPU or hand-derived values.
 
 Decided by user (layer interview):
 
@@ -134,10 +155,10 @@ Decided by user (second interview):
 
 Decided by user (interview on the convolutional layer, plus the earlier questions):
 
-- **Convolutional, BN on GPU**: enable batch-norm convolution training natively, so BN convolutions no longer get rejected on the Muon path. Scope: the detection acceptance configs.
-- **FP8 eligibility**: every convolution except the one immediately before a detection or segmentation head, which stays FP32.
-- **Optimizer boundary**: convolution gradients must update natively on device before any smoke test. Host download at the optimizer boundary is not acceptable.
+- **Convolutional, BN on GPU**: enable batch-norm convolution training natively, so BN convolutions no longer get rejected on the Muon path. Scope: the detection acceptance configs. **Status: not started.** `gpu_update.rs:549` still rejects BN convolution gradients on the Muon path.
+- **FP8 eligibility**: every convolution except the one immediately before a detection or segmentation head, which stays FP32. **Status: not started.** No per-conv eligibility code exists.
+- **Optimizer boundary**: convolution gradients must update natively on device before any smoke test. Host download at the optimizer boundary is not acceptable. **Status: not met.** `gpu_update.rs:461` says standard convolution updates use host-staged gradients.
 - **Ordering**: FP8 policy comes after the detection heads. Native vs ONNX comparisons come after all code is done.
 - **Staged files outside `src/`**: resolved. They are committed in `ed7fcae`.
 
-Next: build and run the commands above, fix Oxide codegen issues in the new YOLO kernels, then add device-seed GPU parity tests against the host seed path and the reference baseline (extra anchors, objectness smoothing, `new_coords`, truth-threshold positives, combined options, collisions, and invalid-option rejection). Test assignment, deltas and metrics against Rust CPU and, where practical, a compiled `raptor-fp4` golden. Run a short real-data smoke test only once the end-to-end path is wired. Do not transfer earlier test results to new changes.
+Next: the build step and the Oxide codegen step from the previous handoff are done (see [Results, 2026-10-30](#results-2026-10-30)). What remains first is device-seed GPU parity against the host seed path, and classic-YOLO case coverage on the GPU against Rust CPU (extra anchors, objectness smoothing, `new_coords`, truth-threshold positives, combined options, collisions, box deltas, and invalid-option rejection). Test assignment, deltas and metrics against Rust CPU and, where practical, a compiled `raptor-fp4` golden. Run a short real-data smoke test only once the end-to-end path is wired. Do not transfer earlier test results to new changes.
