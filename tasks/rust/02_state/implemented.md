@@ -1,0 +1,2853 @@
+# Implemented — `tasks/rust`
+
+**Purpose.** Single consolidated inventory of everything delivered so far under
+`tasks/rust`. The plan files now keep only *open* work and point here instead
+of repeating the completed prose.
+
+**Reading the evidence.** Entries cite the strongest evidence available:
+test names/counts, commit hashes, and file paths. `C++ dump parity: NOT RUN`
+means no C++ build of the owning branch exists in this environment (see
+`STATUS.md` "Known evidence gaps"), so the port is by-construction plus
+CPU/GPU/finite-difference checks, not a byte dump against C++.
+
+Facts here are condensed from the former "Done" bodies of `todo.md`,
+`STATUS.md`, `layers.md`, and `fp8_fp4.md`. When a detail matters, the source
+file is named inline.
+
+---
+
+## Table of Contents
+
+- [1. Workspace, build, tooling](#1-workspace-build-tooling)
+- [2. `cuda-oxide` GPU backend (P0–P9)](#2-cuda-oxide-gpu-backend-p0p9)
+  - [P0–P1 — scaffold and elementwise](#p0p1--scaffold-and-elementwise)
+  - [P2 — Convolution](#p2--convolution)
+  - [P2b — Tensor-core GEMM](#p2b--tensor-core-gemm)
+  - [P3 — Pooling / resample / route](#p3--pooling--resample--route)
+  - [P3b — YOLO head elementwise](#p3b--yolo-head-elementwise)
+  - [P4 — CLI + end to end](#p4--cli--end-to-end)
+  - [P5 — CPU-fallback gaps](#p5--cpu-fallback-gaps)
+  - [P6 — FP16 (inference)](#p6--fp16-inference)
+  - [P7 — Benchmarks](#p7--benchmarks)
+  - [P8 — GPU training](#p8--gpu-training)
+  - [P9 — Training loop + data pipeline](#p9--training-loop--data-pipeline)
+- [3. FP8 / FP4 (`fp8_fp4.md`)](#3-fp8--fp4-fp8_fp4md)
+- [4. Layer port — Phase 0 (Tier 0 + Tier 1)](#4-layer-port--phase-0-tier-0--tier-1)
+- [5. Layer port — Phase 1b](#5-layer-port--phase-1b)
+- [6. Layer port — Phase 2A (anchor-free heads) — COMPLETE](#6-layer-port--phase-2a-anchor-free-heads--complete)
+- [7. Layer port — Phase 2B (partial: MoE + EML math)](#7-layer-port--phase-2b-partial-moe--eml-math)
+- [8. Layer port — Phase 3A shared primitives (prerequisite set)](#8-layer-port--phase-3a-shared-primitives-prerequisite-set)
+  - [`[vit]` reference layer path (Phase 3A)](#vit-reference-layer-path-phase-3a)
+  - [`[tucker_attention]` reference layer path (Phase 3A)](#tucker_attention-reference-layer-path-phase-3a)
+  - [`[mambavision]` reference layer path (Phase 3A)](#mambavision-reference-layer-path-phase-3a)
+  - [`[kimi_kda]` reference layer path (Phase 3A)](#kimi_kda-reference-layer-path-phase-3a)
+- [9. Inference parity — LegoGears_v2 (the final target)](#9-inference-parity--legogears_v2-the-final-target)
+- [10. Data augmentation (`augmentation-audit.md`)](#10-data-augmentation-augmentation-auditmd)
+- [11. Housekeeping](#11-housekeeping)
+- [12. Gradient-shortcut audit (`LIGHTNET_GRAD_MODE`)](#12-gradient-shortcut-audit-darknet_grad_mode)
+- [13. OBB CPU training gaps (plan-open-items Waves 0–1)](#13-obb-cpu-training-gaps-plan-open-items-waves-01)
+- [14. ONNX export](#14-onnx-export)
+- [15. CARPN sample-level polygon mAP dispatch](#15-carpn-sample-level-polygon-map-dispatch)
+- [16. CARPN CPU network inference and direct mAP](#16-carpn-cpu-network-inference-and-direct-map)
+- [17. DCNv4 CPU reference and GPU f32 host fallback](#17-dcnv4-cpu-reference-and-gpu-f32-host-fallback)
+- [18. DCNv1 and DCNv2 CPU reference and GPU f32 host fallback](#18-dcnv1-and-dcnv2-cpu-reference-and-gpu-f32-host-fallback)
+- [19. DSConv single-template Stage-1 CPU reference](#19-dsconv-single-template-stage-1-cpu-reference)
+- [20. Graph-convolution Stage-1 CPU reference](#20-graph-convolution-stage-1-cpu-reference)
+- [21. WMHF Stage-1 CPU reference](#21-wmhf-stage-1-cpu-reference)
+- [22. CPU Muon hybrid optimizer](#22-cpu-muon-hybrid-optimizer)
+- [23. Clifford Stage-1 CPU reference](#23-clifford-stage-1-cpu-reference)
+- [24. Recursive-block Stage-1 CPU reference](#24-recursive-block-stage-1-cpu-reference)
+- [25. Hyperbolic-foveation Stage-1 CPU reference](#25-hyperbolic-foveation-stage-1-cpu-reference)
+- [26. Foveation FiLM Stage-1 CPU reference](#26-foveation-film-stage-1-cpu-reference)
+- [27. Depth-Anything Stage-1 CPU reference](#27-depth-anything-stage-1-cpu-reference)
+- [28. Stage-1 axis/layout audit (bounded A1 list)](#28-stage-1-axislayout-audit-bounded-a1-list)
+- [29. Stage-1 axis/layout audit of already-ported layers](#29-stage-1-axislayout-audit-of-already-ported-layers)
+- [30. DPT-head Stage-1 CPU reference](#30-dpt-head-stage-1-cpu-reference)
+- [38. YOLO-3D configuration preparation (not a layer port)](#38-yolo-3d-configuration-preparation-not-a-layer-port)
+- [39. Cuboid labels and deterministic truth helpers](#39-cuboid-labels-and-deterministic-truth-helpers)
+- [40. YOLO-3D raw CPU runtime and fail-closed consumers](#40-yolo-3d-raw-cpu-runtime-and-fail-closed-consumers)
+- [41. Native f32 LAYA marker gather](#41-native-f32-laya-marker-gather)
+- [42. Native f16 marker-gather inference](#42-native-f16-marker-gather-inference)
+- [43. Native detached act-head feature primitive](#43-native-detached-act-head-feature-primitive)
+- [44. Native exact-erf GELU primitives](#44-native-exact-erf-gelu-primitives)
+- [45. Native act-head f32 forward composition](#45-native-act-head-f32-forward-composition)
+- [46. Standalone native act-head gradient math](#46-standalone-native-act-head-gradient-math)
+- [47. Native `[deform_conv]` forward and backward](#47-native-deform_conv-forward-and-backward)
+- [48. DCNv4 native aggregation primitives (offsets given)](#48-dcnv4-native-aggregation-primitives-offsets-given)
+- [49. Native DCNv4 projection and backward composition](#49-native-dcnv4-projection-and-backward-composition)
+- [50. Bounded DCNv4 native runtime forward/backward](#50-bounded-dcnv4-native-runtime-forwardbackward)
+- [51. Native DCNv4 rolling-stat BN](#51-native-dcnv4-rolling-stat-bn)
+- [52. Native DCNv4 channel-normalization activations](#52-native-dcnv4-channel-normalization-activations)
+- [53. Extend native DCNv4 kernel bound to 7x7](#53-extend-native-dcnv4-kernel-bound-to-7x7)
+- [54. DCNv4 7x7 runtime optimizer parity](#54-dcnv4-7x7-runtime-optimizer-parity)
+- [55. Extend native DCNv4 runtime through 9x9](#55-extend-native-dcnv4-runtime-through-9x9)
+- [56. Extend native DCNv4 runtime through 11x11](#56-extend-native-dcnv4-runtime-through-11x11)
+- [57. Extend native DCNv4 runtime through 13x13](#57-extend-native-dcnv4-runtime-through-13x13)
+- [58. Retain native DCNv4 forward cache for backward](#58-retain-native-dcnv4-forward-cache-for-backward)
+- [59. Native DCNv4 gradient accumulation](#59-native-dcnv4-gradient-accumulation)
+- [60. Native act-head CLS adjoint scatter](#60-native-act-head-cls-adjoint-scatter)
+- [61. Native DCNv4 SGD optimizer update](#61-native-dcnv4-sgd-optimizer-update)
+- [62. Native DCNv4 Adam optimizer update](#62-native-dcnv4-adam-optimizer-update)
+- [63. Native Revleaky activation mapping](#63-native-revleaky-activation-mapping)
+- [64. Extend native DCNv4 through 15x15](#64-extend-native-dcnv4-through-15x15)
+- [65. Retain native DCNv4 Adam moments on device](#65-retain-native-dcnv4-adam-moments-on-device)
+- [66. Reuse DCNv4 projection weights from forward during backward](#66-reuse-dcnv4-projection-weights-from-forward-during-backward)
+- [67. Retain native DCNv4 parameters across forwards and updates](#67-retain-native-dcnv4-parameters-across-forwards-and-updates)
+- [68. Native GPU Muon orthogonalization primitive](#68-native-gpu-muon-orthogonalization-primitive)
+- [69. Connected-layer GPU Muon runtime slice](#69-connected-layer-gpu-muon-runtime-slice)
+- [70. Native locally connected layer](#70-native-locally-connected-layer)
+- [71. GPU Muon RNN matrices](#71-gpu-muon-rnn-matrices)
+- [72. GPU Muon LSTM matrices](#72-gpu-muon-lstm-matrices)
+- [73. Native GPU SAM forward and backward](#73-native-gpu-sam-forward-and-backward)
+- [74. Hybrid GPU Muon for convolution matrices](#74-hybrid-gpu-muon-for-convolution-matrices)
+- [75. Hybrid GPU Muon for non-BN EML branches](#75-hybrid-gpu-muon-for-non-bn-eml-branches)
+- [76. Hybrid GPU Muon for non-BN MoE](#76-hybrid-gpu-muon-for-non-bn-moe)
+- [77. Hybrid GPU Muon for non-BN DCNv4 offset projection](#77-hybrid-gpu-muon-for-non-bn-dcnv4-offset-projection)
+- [78. Hybrid GPU Muon for non-BN deform_conv](#78-hybrid-gpu-muon-for-non-bn-deform_conv)
+- [79. Native Oxide GraphConv uniform aggregation primitives](#79-native-oxide-graphconv-uniform-aggregation-primitives)
+- [80. GraphConv aggregation coordinate-overflow guards](#80-graphconv-aggregation-coordinate-overflow-guards)
+- [81. Native GPU GraphConv uniform runtime path](#81-native-gpu-graphconv-uniform-runtime-path)
+- [82. GraphConv learned-edge masked-softmax host contract](#82-graphconv-learned-edge-masked-softmax-host-contract)
+- [83. Native GraphConv learned-edge forward primitive](#83-native-graphconv-learned-edge-forward-primitive)
+- [84. Native GraphConv learned-edge adjoints](#84-native-graphconv-learned-edge-adjoints)
+- [85. GraphConv learned-edge runtime path](#85-graphconv-learned-edge-runtime-path)
+- [86. GraphConv center-reference gather primitive](#86-graphconv-center-reference-gather-primitive)
+- [87. GraphConv self-projection runtime path](#87-graphconv-self-projection-runtime-path)
+- [88. Compact GraphConv inference](#88-compact-graphconv-inference)
+- [89. Compact GraphConv batch-normalization inference](#89-compact-graphconv-batch-normalization-inference)
+- [90. Full GraphConv batch-normalization inference](#90-full-graphconv-batch-normalization-inference)
+- [91. Hybrid GPU Muon for non-BN GraphConv matrices](#91-hybrid-gpu-muon-for-non-bn-graphconv-matrices)
+- [92. GraphConv GPU Muon DNOPT6 sidecar resume](#92-graphconv-gpu-muon-dnopt6-sidecar-resume)
+- [93. GraphConv GPU Muon update gate](#93-graphconv-gpu-muon-update-gate)
+- [94. Grouped GraphConv GPU Muon parity](#94-grouped-graphconv-gpu-muon-parity)
+- [95. GraphConv BN GPU Muon through CPU fallback](#95-graphconv-bn-gpu-muon-through-cpu-fallback)
+- [96. Native GraphConv BN training](#96-native-graphconv-bn-training)
+- [97. Standalone BatchNorm native GPU training](#97-standalone-batchnorm-native-gpu-training)
+- [98. Native Crop training geometry](#98-native-crop-training-geometry)
+- [99. DCNv4 mixed-network backward validation](#99-dcnv4-mixed-network-backward-validation)
+- [100. Explicit GPU rejection for GRU training](#100-explicit-gpu-rejection-for-gru-training)
+- [101. Region CPU forward and axis pin](#101-region-cpu-forward-and-axis-pin)
+- [102. Native GRU GPU inference](#102-native-gru-gpu-inference)
+- [103. Native RNN rolling-stat BN inference](#103-native-rnn-rolling-stat-bn-inference)
+- [104. Native LSTM rolling-stat BN inference](#104-native-lstm-rolling-stat-bn-inference)
+- [105. Native RNN rolling-stat BN training](#105-native-rnn-rolling-stat-bn-training)
+- [106. Native LSTM rolling-stat BN training](#106-native-lstm-rolling-stat-bn-training)
+- [107. Native CRNN rolling-stat BN training](#107-native-crnn-rolling-stat-bn-training)
+- [108. Hybrid GPU Muon for CRNN matrices](#108-hybrid-gpu-muon-for-crnn-matrices)
+- [109. Native GPU maxpool_depth](#109-native-gpu-maxpool_depth)
+- [110. MaxPool axis/layout contract pin](#110-maxpool-axislayout-contract-pin)
+- [111. AvgPool axis/layout contract pin](#111-avgpool-axislayout-contract-pin)
+- [112. LocalAvgPool axis/layout contract pin](#112-localavgpool-axislayout-contract-pin)
+- [113. Native f16 maxpool_depth inference](#113-native-f16-maxpool_depth-inference)
+- [114. Connected axis/layout contract pin](#114-connected-axislayout-contract-pin)
+- [115. Native f16 SAM inference](#115-native-f16-sam-inference)
+- [116. Native f16 channel shuffle inference](#116-native-f16-channel-shuffle-inference)
+- [117. Native f16 reorg inference](#117-native-f16-reorg-inference)
+- [118. Native f32 Region GPU execution](#118-native-f32-region-gpu-execution)
+- [119. Native f16 Region inference](#119-native-f16-region-inference)
+- [120. Native f16 softmax inference](#120-native-f16-softmax-inference)
+- [121. Native f16 channel-slice inference](#121-native-f16-channel-slice-inference)
+- [122. Native f16 scale-channels inference](#122-native-f16-scale-channels-inference)
+- [123. Native f16 dropout inference](#123-native-f16-dropout-inference)
+- [124. Native f16 channel-normalization inference](#124-native-f16-channel-normalization-inference)
+- [125. Native f16 connected inference](#125-native-f16-connected-inference)
+- [126. Native f16 Cost identity and full ResNet101 coverage](#126-native-f16-cost-identity-and-full-resnet101-coverage)
+- [127. Native f16 Detection and Regression identity paths](#127-native-f16-detection-and-regression-identity-paths)
+- [128. Native connected-layer BN GPU backward](#128-native-connected-layer-bn-gpu-backward)
+- [129. Connected BN GPU backward activation parity](#129-connected-bn-gpu-backward-activation-parity)
+- [130. Connected BN GPU backward SGD/Adam parity](#130-connected-bn-gpu-backward-sgdadam-parity)
+- [131. Route source/group axis pin](#131-route-sourcegroup-axis-pin)
+- [132. Upsample axis pin and ragged reverse extent](#132-upsample-axis-pin-and-ragged-reverse-extent)
+- [133. Reorg forward axis pin and reverse-source finding](#133-reorg-forward-axis-pin-and-reverse-source-finding)
+- [134. ChannelShuffle axis pin](#134-channelshuffle-axis-pin)
+- [135. Softmax grouped-reduction axis pin](#135-softmax-grouped-reduction-axis-pin)
+- [136. Dropout element-mask layout evidence and DropBlock finding](#136-dropout-element-mask-layout-evidence-and-dropblock-finding)
+- [137. ScaleChannels source and broadcast-axis pin](#137-scalechannels-source-and-broadcast-axis-pin)
+- [138. SAM elementwise axis pin](#138-sam-elementwise-axis-pin)
+- [139. Extend native DCNv4 through 17x17](#139-extend-native-dcnv4-through-17x17)
+- [140. Extend native DCNv4 through 19x19](#140-extend-native-dcnv4-through-19x19)
+- [141. Extend native DCNv4 through 21x21](#141-extend-native-dcnv4-through-21x21)
+- [142. Extend native DCNv4 through 23x23](#142-extend-native-dcnv4-through-23x23)
+- [143. Extend native DCNv4 through 25x25](#143-extend-native-dcnv4-through-25x25)
+- [144. Extend native DCNv4 through 27x27](#144-extend-native-dcnv4-through-27x27)
+- [145. Extend native DCNv4 through 29x29](#145-extend-native-dcnv4-through-29x29)
+- [146. Extend native DCNv4 through 31x31](#146-extend-native-dcnv4-through-31x31)
+- [147. Native GPU Crop RGB-shift augmentation](#147-native-gpu-crop-rgb-shift-augmentation)
+- [148. Native GPU Crop HSV saturation/exposure](#148-native-gpu-crop-hsv-saturationexposure)
+- [149. Extend DCNv4 Adam runtime parity through 17x17](#149-extend-dcnv4-adam-runtime-parity-through-17x17)
+- [150. Extend DCNv4 Adam runtime parity through 19x19](#150-extend-dcnv4-adam-runtime-parity-through-19x19)
+- [151. Extend DCNv4 Adam runtime parity through 21x21](#151-extend-dcnv4-adam-runtime-parity-through-21x21)
+- [152. Extend DCNv4 Adam runtime parity through 23x23](#152-extend-dcnv4-adam-runtime-parity-through-23x23)
+- [153. Extend DCNv4 BN Adam runtime parity through 17x17](#153-extend-dcnv4-bn-adam-runtime-parity-through-17x17)
+- [154. Extend DCNv4 BN Adam runtime parity through 19x19](#154-extend-dcnv4-bn-adam-runtime-parity-through-19x19)
+- [155. Crop batch/spatial axis contract](#155-crop-batchspatial-axis-contract)
+- [156. FoveationFilm axis/layout pin](#156-foveationfilm-axislayout-pin)
+- [157. Native FoveationFilm affine GPU primitive](#157-native-foveationfilm-affine-gpu-primitive)
+- [158. Native FoveationFilm full forward primitive](#158-native-foveationfilm-full-forward-primitive)
+- [159. Native FoveationFilm full adjoint primitive](#159-native-foveationfilm-full-adjoint-primitive)
+- [160. FoveationFilm runtime native forward](#160-foveationfilm-runtime-native-forward)
+- [161. FoveationFilm projection-adjoint finite differences](#161-foveationfilm-projection-adjoint-finite-differences)
+- [162. FoveationFilm native runtime backward](#162-foveationfilm-native-runtime-backward)
+- [163. FoveationFilm/HF SGD and Adam runtime updates](#163-foveationfilmhf-sgd-and-adam-runtime-updates)
+- [164. FoveationFilm/HF two-step GPU runtime parity](#164-foveationfilmhf-two-step-gpu-runtime-parity)
+- [165. FoveationFilm actual-Oxide SGD gate](#165-foveationfilm-actual-oxide-sgd-gate)
+- [166. FoveationFilm actual-Oxide Adam burn-in gate](#166-foveationfilm-actual-oxide-adam-burn-in-gate)
+- [167. FoveationFilm actual-Oxide train-only-BN gate](#167-foveationfilm-actual-oxide-train-only-bn-gate)
+- [168. FoveationFilm actual-Oxide train-buffer parity](#168-foveationfilm-actual-oxide-train-buffer-parity)
+- [169. Native HyperbolicFoveation bilinear warp](#169-native-hyperbolicfoveation-bilinear-warp)
+- [170. Native isotropic fixed-point HF grid](#170-native-isotropic-fixed-point-hf-grid)
+- [171. Native HF predictor MLP for fixed-point isotropic mode](#171-native-hf-predictor-mlp-for-fixed-point-isotropic-mode)
+- [172. Native isotropic Newton HF grid](#172-native-isotropic-newton-hf-grid)
+- [173. Native anisotropic HF predictor and inverse grids](#173-native-anisotropic-hf-predictor-and-inverse-grids)
+- [174. Learned anisotropic Newton Adam runtime parity](#174-learned-anisotropic-newton-adam-runtime-parity)
+- [175. Native HF warp adjoints](#175-native-hf-warp-adjoints)
+- [176. Native HF grid-adjoint consumption](#176-native-hf-grid-adjoint-consumption)
+- [177. Direct HF runtime input-gradient parity](#177-direct-hf-runtime-input-gradient-parity)
+- [178. Native HF predictor backward](#178-native-hf-predictor-backward)
+- [179. HF predictor adjoint finite differences](#179-hf-predictor-adjoint-finite-differences)
+- [180. Native HF fixed-point parameter adjoint](#180-native-hf-fixed-point-parameter-adjoint)
+- [181. Native HF Newton parameter adjoint](#181-native-hf-newton-parameter-adjoint)
+- [182. GPU Muon for HF/FiLM matrices](#182-gpu-muon-for-hffilm-matrices)
+- [183. HF/FiLM GPU Muon update gate](#183-hffilm-gpu-muon-update-gate)
+- [184. HF/FiLM GPU Muon sidecar resume](#184-hffilm-gpu-muon-sidecar-resume)
+- [185. HyperbolicFoveation axis/layout pin](#185-hyperbolicfoveation-axislayout-pin)
+- [186. HF axis fixture matches OpenCV interpolation taps](#186-hf-axis-fixture-matches-opencv-interpolation-taps)
+- [187. Logistic NCHW/batch axis pin](#187-logistic-nchwbatch-axis-pin)
+- [188. Compact f16 Logistic inference](#188-compact-f16-logistic-inference)
+- [189. Logistic f16 direct CPU-reference parity](#189-logistic-f16-direct-cpu-reference-parity)
+- [190. OMD loss compact f16 inference pass-through](#190-omd-loss-compact-f16-inference-pass-through)
+- [191. JevCe group-major compact f16 inference](#191-jevce-group-major-compact-f16-inference)
+- [192. JevCe channel-major compact f16 inference](#192-jevce-channel-major-compact-f16-inference)
+- [193. LAYA act-head compact f16 inference](#193-laya-act-head-compact-f16-inference)
+- [194. LayaHead masked attention primitive](#194-layahead-masked-attention-primitive)
+- [195. LayaHead native f32 forward](#195-layahead-native-f32-forward)
+- [196. LayaScorer native f32 forward](#196-layascorer-native-f32-forward)
+- [197. LayaScorer native f32 input adjoint](#197-layascorer-native-f32-input-adjoint)
+- [198. LayaEncoder native f32 inference](#198-layaencoder-native-f32-inference)
+- [199. Dilated DeformConv native predictors and runtime coverage](#199-dilated-deformconv-native-predictors-and-runtime-coverage)
+- [200. DSConv native f32 runtime integration](#200-dsconv-native-f32-runtime-integration)
+- [201. DSConv hybrid GPU Muon](#201-dsconv-hybrid-gpu-muon)
+- [202. DSConv C++-source axis/layout pin](#202-dsconv-c-source-axislayout-pin)
+- [203. DeformConv C++-source axis/layout pin](#203-deformconv-c-source-axislayout-pin)
+- [204. GraphConv C++-source axis/layout pin](#204-graphconv-c-source-axislayout-pin)
+- [205. WMHF C++-source axis/layout pin](#205-wmhf-c-source-axislayout-pin)
+- [206. Clifford C++-source axis/layout pin](#206-clifford-c-source-axislayout-pin)
+- [207. Native Oxide WMHF Haar DWT primitive](#207-native-oxide-wmhf-haar-dwt-primitive)
+- [208. Native Oxide WMHF four-direction scan forward](#208-native-oxide-wmhf-four-direction-scan-forward)
+- [209. Native Oxide WMHF high-frequency branch](#209-native-oxide-wmhf-high-frequency-branch)
+- [210. DepthAnything axis pin and explicit GPU rejection](#210-depthanything-axis-pin-and-explicit-gpu-rejection)
+- [211. Native Oxide WMHF scan backward](#211-native-oxide-wmhf-scan-backward)
+- [212. Generic backend contracts for WMHF primitives](#212-generic-backend-contracts-for-wmhf-primitives)
+- [213. WMHF scan-forward sequence ownership](#213-wmhf-scan-forward-sequence-ownership)
+- [214. WMHF scan-backward sequence ownership](#214-wmhf-scan-backward-sequence-ownership)
+- [215. WMHF gated fusion primitive](#215-wmhf-gated-fusion-primitive)
+- [216. WMHF channel-split primitive](#216-wmhf-channel-split-primitive)
+- [217. WMHF local-branch concatenation primitive](#217-wmhf-local-branch-concatenation-primitive)
+- [218. RNN C++-source axis pin](#218-rnn-c-source-axis-pin)
+- [219. LSTM C++-source axis pin](#219-lstm-c-source-axis-pin)
+- [220. CRNN C++-source axis pin](#220-crnn-c-source-axis-pin)
+- [221. Contrastive C++-source axis pin](#221-contrastive-c-source-axis-pin)
+- [222. JevCe C++-source axis pin](#222-jevce-c-source-axis-pin)
+- [223. OmdLoss C++-source axis pin](#223-omdloss-c-source-axis-pin)
+- [224. Native CenterNet GPU forward](#224-native-centernet-gpu-forward)
+- [225. Native modern-YOLO GPU activation forward](#225-native-modern-yolo-gpu-activation-forward)
+- [226. Native Segmentation GPU activation forward](#226-native-segmentation-gpu-activation-forward)
+- [227. Native JevCe GPU softmax forward](#227-native-jevce-gpu-softmax-forward)
+- [228. Native LayaLoss GPU softmax forward](#228-native-layaloss-gpu-softmax-forward)
+- [229. Native compact identity heads](#229-native-compact-identity-heads)
+- [230. Native compact Logistic and Softmax](#230-native-compact-logistic-and-softmax)
+- [231. Native compact Reorg and channel routing](#231-native-compact-reorg-and-channel-routing)
+- [232. Native compact ScaleChannels](#232-native-compact-scalechannels)
+- [233. Dynamic mixed-precision loss scaler](#233-dynamic-mixed-precision-loss-scaler)
+- [234. CLI loss-scale option and LossScaler integration](#234-cli-loss-scale-option-and-lossscaler-integration)
+- [235. FP16 overflow detection for convolution and BN gradients](#235-fp16-overflow-detection-for-convolution-and-bn-gradients)
+- [236. xtask fp16 enables dynamic loss scaling](#236-xtask-fp16-enables-dynamic-loss-scaling)
+- [237. xtask precision environment clippy cleanup](#237-xtask-precision-environment-clippy-cleanup)
+- [31. C++ enum boundary config regression](#31-c-enum-boundary-config-regression)
+- [32. Axis-coverage gate and shared NCHW fixtures](#32-axis-coverage-gate-and-shared-nchw-fixtures)
+- [33. Convolutional axis pins and the dilation contract](#33-convolutional-axis-pins-and-the-dilation-contract)
+- [34. GPU convolution extent parity](#34-gpu-convolution-extent-parity)
+- [35. Annotation GUI (`lightnet-gui`)](#35-annotation-gui-lightnet-gui)
+- [36. Annotation GUI plan implementation](#36-annotation-gui-plan-implementation)
+- [37. DarkMark hotkey parity and model discovery](#37-darkmark-hotkey-parity-and-model-discovery)
+- [253. CPU language-model Phase 1 (plan_llm_decoder Tasks 1-7)](#253-cpu-language-model-phase-1-plan_llm_decoder-tasks-1-7)
+- [254. fp16 convergence verdict (plan_fp16 Task 5)](#254-fp16-convergence-verdict-plan_fp16-task-5)
+- [255. FP8 delayed-history pool-incarnation fix](#255-fp8-delayed-history-pool-incarnation-fix)
+- [256. Stable FP8 delayed-history site keys](#256-stable-fp8-delayed-history-site-keys)
+- [257. Native deconvolution channel normalization](#257-native-deconvolution-channel-normalization)
+- [258. Deconvolution in compact inference](#258-deconvolution-in-compact-inference)
+- [259. Deconvolution in compact f16 inference](#259-deconvolution-in-compact-f16-inference)
+- [260. Native JevCe loss and delta](#260-native-jevce-loss-and-delta)
+- [261. Native Segmentation loss and delta](#261-native-segmentation-loss-and-delta)
+- [262. Native ViT inference forward](#262-native-vit-inference-forward)
+- [263. Native Swin Revleaky training forward and backward](#263-native-swin-revleaky-training-forward-and-backward)
+- [264. Native Clifford Fourier forward and backward](#264-native-clifford-fourier-forward-and-backward)
+- [265. Native RecursiveBlock channel shuffle forward and backward](#265-native-recursiveblock-channel-shuffle-forward-and-backward)
+- [266. Native DCNv4 for kernels above 961 points](#266-native-dcnv4-for-kernels-above-961-points)
+- [267. CPU GRU batch-normalization training backward](#267-cpu-gru-batch-normalization-training-backward)
+- [268. DSConv multi-template CPU forward and backward](#268-dsconv-multi-template-cpu-forward-and-backward)
+- [Not implemented / open (pointer)](#not-implemented--open-pointer)
+
+## 1. Workspace, build, tooling
+
+- Flattened `rust/` to the repo root, vendored `cuda-oxide`, merged the
+  workspace, pinned `nightly-2026-08-28` (`85fb0a91`).
+- Dropped the `lightnet-cli` cuTile dependency (the `cutile-rs-aot` checkout is
+  missing; `src/lightnet-cuda-cutile` is excluded and does not build — left
+  disabled, re-enable only if the AOT fork returns).
+- `cargo oxide` cannot run from the bridge dir; `src/lightnet-cuda-oxide/README.md`
+  rewritten.
+- Build-race SIGBUS fixed via the codegen `output_name = "<crate>_test"` for the
+  lib/lib-test `.ll`/`.ptx` race.
+- `clippy-preview` component conflict on the pinned toolchain resolved (clippy
+  reinstalled as a non-preview component).
+- `src/lightnet-cuda-oxide` is **not** a workspace member: build/test it with
+  `./tools/test_oxide.sh` (`cargo oxide`); `tools/test_host.sh` is the host
+  wrapper. Every cargo command uses `-j 4`/`-j 2` and is capped.
+
+## 2. `cuda-oxide` GPU backend (P0–P9)
+
+### P0–P1 — scaffold and elementwise
+- P0: `src/lightnet-cuda-oxide`, host upload/zeros/download (`e4a42d27`).
+- P1: `bias_add`/`channel_scale`/`bias_backward`, 7 activations fwd+bwd,
+  `vector_add`/`shortcut`/`saxpy`, SGD (`e4a42d27`); 7 parity tests.
+- `bias_backward` block reduction decision (2026-10-01): kept the deterministic
+  2-stage fixed-order partials (no atomics); already 205 GB/s = 75% of the
+  272 GB/s roofline.
+
+### P2 — Convolution
+- `kernels/gemm.rs` (smem-tiled NN/NT/TN), `kernels/im2col.rs`
+  (im2col+col2im with stride/dilation/padding/groups), `kernels/conv_direct.rs`
+  (fwd/dgrad/wgrad); wired `conv2d_f32` + `conv2d_backward_{input,weights}_f32`.
+- `LIGHTNET_OXIDE_CONV={direct,gemm,auto}` heuristic; cached conv workspace.
+- Real-cfg shape coverage: scanned 101 cfgs / 5845 conv layers / 990 unique
+  geometries (`tools/cfg_conv_shapes.py`, `tests/data/*.csv`); C++ cross-check
+  3822 convs, 0 mismatches. Tests `cfg_conv_direct/gemm/gemm_tf32`, batch-2
+  sampling, LegoGears_v2 at real size, dilation Err/parity, mismatched-shape
+  shortcuts.
+- relu6 + ramp added to the trait/oxide (CPU + GPU, exact output-form
+  gradients); before this the CPU runtime silently treated them as identity.
+
+### P2b — Tensor-core GEMM
+- `kernels/gemm_mma.rs` mma.sync + ldmatrix, tf32 inputs, f32 accumulate;
+  `LIGHTNET_OXIDE_GEMM={fp32,tf32,auto}`; conv fwd/dgrad/wgrad through it.
+- Perf (2026-10-01): root cause of slow GEMMs was un-unrolled `while` loops
+  putting accumulator arrays in local memory; new `kernels/unroll.rs` made
+  indices constant (tf32 4.1 → 10.8 TFLOP/s at 2048³, 0 stack, 96 regs).
+  Added `cp.async` two-stage pipeline and deterministic split-K. 21 LegoGears
+  conv GEMMs fwd total fp32 2.211 → 0.872 ms, tf32 3.367 → 0.780 ms.
+- `[~]` per-arch wgmma (sm_90) / tcgen05 (sm_100) dispatch does **not** exist;
+  the seam is `GemmArgs` + `GemmMode`. Cannot be tested on this sm_89 GPU.
+
+### P3 — Pooling / resample / route
+- maxpool fwd/bwd (argmax), avgpool + local_avgpool, upsample (+reverse),
+  route_concat / route_backward (grouped), crop_bilinear fwd/bwd; per-op parity.
+- Mismatched-shape shortcut: C++ is a flat per-sample crop/pad, not a resample;
+  implemented as `shortcut_fit_f32` (host default + oxide kernel), removing the
+  old CPU-fallback trigger. `cfg_shortcut_shapes` covers all 18 distinct
+  mismatched rows / 30 layers.
+
+### P3b — YOLO head elementwise
+- Head output kept RAW on CPU+GPU; logistic + `scale_x_y` applied on the host in
+  decode/loss, parity with C++ covered by
+  `gpu_yolo_head_matches_cpu_and_cpp_activated_decode`. Delta accumulation uses
+  `backward_accumulate_seeded_gpu` incl. `loss_scale`.
+
+### P4 — CLI + end to end
+- `oxide` feature + `LIGHTNET_BACKEND=cpu|oxide`; dead cuTile cfg blocks removed.
+- LegoGears_v2 inference: oxide == Rust CPU (score diff ≤5e-7, IoU ≥0.99999) ==
+  C++ CUDA (score diff ≤4.5e-4, from C++ `cudnn_half=1`).
+- JPEG decode fixed via `mozjpeg` (ISLOW + fancy upsampling): 0 pixel diff vs
+  cv2 on 18 files; fixture test `jpeg_decode_matches_opencv_exactly`.
+- Preprocessing parity documented: `detector test` = float `resize_image`,
+  `detector map` = `cv::resize INTER_LINEAR_EXACT`; Rust `detect-image` modes
+  `resize` | `letterbox` | `resize-exact`.
+
+### P5 — CPU-fallback gaps
+- Trait host defaults + `kernels/layers_extra.rs` for softmax, reorg, dropout,
+  scale_channels, connected (fwd+bwd each); tests `oxide_layers_extra`.
+- Runtime dispatch replaced the CPU fallback for those layers. Reorg backward
+  bug fixed (was not the adjoint of the forward layout for c_in>1). Dropout mask
+  is `dropout_unit(seed, i)`, identical on CPU and GPU.
+- `NORM_CHAN*` f32 convolution support: CPU references and native Oxide forward
+  and backward are integrated in runtime; exact adjoints are default and
+  `LIGHTNET_GRAD_MODE=cpp` follows the inspected CUDA diagonal shortcuts (C++ CPU
+  custom gradients differ). Parser allows only `[convolutional]`; f16 inference
+  explicitly rejects these activations. No compiled-C++ golden is available.
+- SAM uses native f32 pointwise forward/backward for mapped activations,
+  including source-layer gradient fan-out; unsupported activations retain the
+  whole-network CPU backward fallback (v0.2.051, §73). No-BN RNN/CRNN/LSTM
+  backward uses backend ops; BN RNN/LSTM/CRNN backward also uses backend ops
+  with a host forward/cache upload and host optimizer.
+
+### P6 — FP16 (inference)
+- Decision: additive opt-in `F16TensorOpsBackend` (f16 storage + f32 accumulate),
+  not a f32-trait rewrite. `GemmMode::Fp16` in the f32 API is a compute mode.
+- `kernels/convert.rs` exhaustive f32↔f16/bf16 conversion tests;
+  `OxideTensorF16`; `kernels/gemm_f16.rs` mma m16n8k16 NN/NT/TN/TT + split-K;
+  fused conv epilogue (bias + activation + RNE to f16); `half_ops.rs` for
+  maxpool/upsample/route; `forward_compact_f16`.
+- LegoGears_v2 fp16: 155/155 dets, max score diff 6.3e-4 vs C++, mAP 99.6685%
+  (== fp32 == tf32). Bench: b1 fp16 1.79 ms (557 FPS), b16 9.6 ms; 4096³ GEMM
+  25.9 TFLOP/s. Batched f16 im2col gave 19.0 → 9.55 ms b16.
+- bf16 GEMM done; tests `oxide_half` (11) + `oxide_runtime_f16`.
+- `[ ]` NOT done: f16 dgrad/wgrad, standalone f16 BN/bias/activation, `reverse`
+  upsample.
+
+### P7 — Benchmarks
+- `tests/oxide_bench.rs` + `tools/oxide_bench.py` + `tools/oxide_bench_cpp.cpp`
+  (events, median/min/p95, JSON+CSV, interleaved A/B); micro (GEMM/im2col/
+  elementwise/activations/bias/pooling/upsample/route as GFLOP/s or GB/s and %
+  roofline), 21 LegoGears conv shapes fwd/dgrad/wgrad, layer+e2e latency/FPS
+  b1/b16, peak memory, nsys/ncu passes. Results in `docs/OXIDE_BENCH.md`.
+
+### P8 — GPU training
+- BN train fwd/bwd kernels (batch mean/biased var, exact dx/dscale/dbias,
+  device rolling EMA, unbiased var); runtime uses them instead of the old
+  rolling-stat round trips. C++ keep factors mirrored: GPU 0.99 / CPU 0.9.
+- Optimizers: SGD momentum/decay; `adam_update_f32` (C++ semantics + AdamW via
+  `decoupled_decay`), wired to `[net] adam=1`, per-owner device moments, Adam
+  step state sidecar. Tests `gpu_adam_and_adamw_match_f64_reference_over_steps`.
+- Loss scaling + NaN/Inf (`sanitize_nan_inf_f32`, Reset/Fix), subdivision
+  accumulation, per-layer cfg keys (`learning_rate`, `dont_update`,
+  `burnin_update`, `train_only_bn`, `clip`, `grad_centr`), `try_fix_nan`.
+- Dropout/dropblock fwd+bwd (deterministic counter-hash RNG; DropBlock ramp and
+  per-(sample,channel) block placement, exact `dy*mask` backward).
+- Mixed precision training (AMP): `LIGHTNET_OXIDE_AMP=1`; f16 working copies, f32
+  master weights/optimizer/BN state; `src/lightnet-cuda-oxide/src/mixed.rs` +
+  `kernels/amp.rs`; tests `oxide_amp` (10). Bench b16 82.7 → 62.9 ms.
+  Real-device runtime-chain test with dropout + dropblock verifies masks,
+  activations, backward, and SGD against f32; these stochastic layers remain on
+  the documented f32 boundary path.
+- Yolo loss static diff vs C++ (`tasks/rust/todo.md` table): terms verified line
+  by line; fixes landed for box `(2-w*h)` scale, cost definition, `iou_thresh`
+  extra anchors, best-anchor search, `new_coords` xy, `delta_normalizer`,
+  equidistant/bad-label thresholds. Real step-1 loss now 0.191247 vs C++ 0.191136
+  (delta L2 ratio 1.000004, was 70.78 vs 0.191).
+- Training-step overhead: fused sanitize+SGD/Adam, device BN fold, deferred host
+  sync, dropped zero-fills, multi-tensor update, fused inference bias+activation,
+  batched dgrad/wgrad GEMM, streamlined im2col, vectorised f32 GEMM shared
+  loads, auto-sized `BufPool`. b16 cumulative 125 → ~49 ms.
+- Deferred gradient flush now has real-device `subdivisions=2` coverage over two
+  optimizer iterations; `oxide_runtime_chain::subdivisions_deferred_gradient_flush_matches_cpu`
+  matches CPU weights/biases after two sub-batch backwards per iteration.
+
+### P9 — Training loop + data pipeline
+- Startup/CLI: seeded init (C++ uniform bounds), explicit flag parser (`-clear`,
+  `-dont_show`, `-gpus`, `-seed`), `-map`, `-save_every`, Adam resume.
+- Data pipeline: jitter + paired resize + letterbox + source-mean padding +
+  OpenCV-style u8 bilinear; flip; HSV; box clip/mirror; mixup; multi-scale
+  `random`; background prefetch; C++-formula mosaic geometry (Rust RNG differs);
+  background loader.
+  20 OpenCV fixtures, worst 1 LSB. See `augmentation-audit.md`.
+- Loop features: `<name>_best.weights`, periodic/`_last`/`-save_every`,
+  `<name>_map.csv`, `<name>_loss.csv`, `chart.png`, `<name>_optimizer.state`,
+  C++-field-order console output.
+- `[x]` Convergence run (2026-10-02, `docs/OXIDE_BENCH.md` §9): oxide f32, oxide
+  AMP and C++ CUDA each 3000 iters from the same init → all mAP@0.50 100.0000%;
+  step medians oxide f32 129.1 ms / AMP 113.0 ms (debug).
+- Recurrent device backward: no-BN RNN/CRNN/LSTM and BN RNN/LSTM/CRNN paths use
+  backend BPTT, projection or convolution operations, with host reference cache
+  uploads for BN forward. Rolling-stat BN scale-gradient reductions use backend
+  centering/channel-scale/pointwise-multiply/channel-reduction ops; the Oxide
+  path no longer transfers raw recurrent projection/convolution outputs and
+  deltas to host just for dscale. Forward/cache capture, rolling-stat update,
+  and optimizer remain host-side. FakeBackend and real Oxide parity cover
+  upstream connected/convolution updates, BN scales, and rolling statistics;
+  dynamic loss-scale checks inspect host-buffered connected/recurrent gradients.
+- Connected/SAM device backward and host Adam for standalone batchnorm, local,
+  weighted shortcut, MoE router/experts, deconvolutional, GRU/RNN/LSTM/CRNN,
+  and ViT params with per-block moment state and per-layer rate scaling; ViT
+  retains C++ weight order, decay groups, gradient clipping, and reduced mHC
+  rate. `maxpool_zero_nonmax`; dynamic loss scale; AMP+Adam trajectory.
+- `[ ]` Open: `reverse`/`deform` conv,
+  adversarial yolo, implicit-GEMM as default, f32 GEMM epilogue, CUDA graph
+  capture, multi-GPU/Blackwell.
+
+## 3. FP8 / FP4 (`fp8_fp4.md`)
+
+- **Phase A**: `kernels/gemm_f8.rs` Ada `mma.m16n8k32` e4m3/e5m2 tiled GEMM
+  (64×64, BK=32, NN/NT/TN/TT, batched, split-K), per-tensor quantiser + amax,
+  `GemmMode::Fp8` (`LIGHTNET_OXIDE_GEMM=fp8`). Fragment layout pinned by a wiring
+  sweep on the real GPU; `src/fp8.rs` host reference.
+- **Phase B**: FP8 dgrad/wgrad (e4m3 weights × e5m2 grads, C++ recipe),
+  `LIGHTNET_OXIDE_GEMM_BWD=fp8`; 3.1%/2.2% worst relative error vs f32.
+- **Phase C**: `kernels/quant_fp4.rs` + `kernels/gemm_fp4.rs` packed NVFP4
+  (E2M1 + E4M3 block-16 scales + f32 global) via `__dp4a`, **bit-exact** against
+  the CPU i32 reference (`src/fp4.rs`); `GemmMode::Fp4`. Emulation only (native
+  FP4 mma needs sm_120a).
+- **Phase D**: f32/tf32/fp16/fp8/fp4 GEMM bench table (RTX 4060 Laptop, sm_89;
+  `gemm_bench_low_precision_kernels` / `gemm_bench_precisions`).
+
+  Kernel only (operands pre-quantised):
+
+  | shape | f32 `sgemm_tiled` | fp8 `mma.m16n8k32` | fp4 `__dp4a` |
+  |---|---|---|---|
+  | 512³ | 0.091 ms / 2946 GF/s | 0.102 ms / 2632 GF/s | 1.066 ms / 252 GF/s |
+  | 1024³ | 0.468 ms / 4593 GF/s | 0.452 ms / 4754 GF/s | 7.35 ms / 292 GF/s |
+  | 2048³ | 3.48 ms / 4940 GF/s | 2.45 ms / 7020 GF/s | 54.3 ms / 316 GF/s |
+
+  End-to-end through the `LIGHTNET_OXIDE_GEMM` selector (fp8/fp4 include their
+  quantisation; fp4 also the host transpose):
+
+  | shape | f32 | tf32 | fp16 | fp8 | fp4 |
+  |---|---|---|---|---|---|
+  | 512³ | 0.822 ms | 0.595 ms | 0.483 ms | 1.356 ms | 54.0 ms |
+  | 1024³ | 3.26 ms | 1.62 ms | 0.868 ms | 4.65 ms | 194 ms |
+  | 2048³ | 5.50 ms | 1.80 ms | 1.274 ms | 5.90 ms | 785 ms |
+  | LegoGears_v2 convs (21 total) | 5.95 ms | 4.82 ms | 3.87 ms | 24.2 ms | 1018 ms |
+
+  Conclusions (as measured 2026-10-05; superseded for the kernel by §250: 28000 GF/s after tuning): the FP8 `mma` (7020 GF/s at 2048³) did **not** beat fp16
+  (13485 GF/s) or TF32 (9560 GF/s) on this part — fp8 is a *numerics* feature
+  here, not a speed one; per-call quantisation dominates below ~1024³, so a
+  network-level fp8 mode must hoist weight quantisation out of the GEMM seam;
+  the NVFP4 emulation is ~15x fp16 and only useful for parity with the C++
+  `raptor-fp4` reference.
+- Findings pinned on hardware (worth reading before enabling fp8 for speed):
+  the FP8 `mma` fragment's A row selector is `group` for elements 0-4/8-12 and
+  `group+8` for 4-8/12-16, **not** "elements >= 8" (a wrong-but-plausible
+  result), pinned by a wiring sweep; B fragments must be staged **transposed**
+  in shared memory (`[n][k]`, stride 36) or `ld.shared.b32` misaligns; e4m3
+  exponent bias is **7** (smallest subnormal 2^-9), e5m2 has a 5-bit exponent
+  (largest finite `0x7b`=57344); `cvt.rn.satfinite` maps every NaN to the
+  *unsigned* NaN code (sign dropped); tie-to-even on the *code* with saturation
+  applied before the search; tensor-core accumulation order floors comparisons
+  at ~5e-5 of the row norm; the quantisation factor is the **reciprocal** of the
+  C++ scale (`448/amax` as a multiplier, dequant `1/(fa*fb)`); `__dp4a` couples
+  4 bytes in lane order 0..3 (bit-identical to C++).
+- `[ ]` NOT done: step 5 (FP8 conv via im2col + LegoGears mAP vs the C++ FP8
+  path) — the C++ build is unavailable here.
+
+## 4. Layer port — Phase 0 (Tier 0 + Tier 1)
+
+Commits `8e4b0f24`..`be71eb6e`; verified by `./tools/test_host.sh` (all green)
+and `./tools/test_oxide.sh` (all suites `ok`). Tasks 1–12:
+
+- Ten elementwise activations (`gelu elu selu relie plse hardtan lhtan stair
+  hard_mish revleaky`) with exact input-form gradients; unknown activation names
+  are a config error (no silent identity); `gelu` has an oxide kernel.
+- `[maxpool]` reads `maxpool_zero_nonmax` and implements `maxpool_depth` (CPU).
+- Standalone `[batchnorm]` can be saved (Rust-only extension).
+- Weighted `[shortcut]` (`weights_type`/`weights_normalization`) with exact CPU
+  gradients and `.weights` block (`shortcut_weights.rs`). GPU forward composes
+  oxide channel-scale + add; backward assembles per-source products and applies
+  exact normalization derivatives through backend ops. Only final small weight
+  gradients transfer to host train buffers; optimizer/parameter updates remain
+  host-side. FakeBackend and real-device runtime parity pass, including short
+  source fit and an SGD step
+  (`oxide_runtime_chain::weighted_shortcut_runtime_matches_cpu_forward_backward_and_sgd`).
+- `[channel_slice]`, `[channel_shuffle]` (+ host op + oxide kernel),
+  `[deconvolutional]` (CPU exact backward, GPU host round trip, conv-layout
+  weights).
+- Dense-truth heads: `[cost]` scale, `[logistic]`, `[regression]`, `[jev_ce]`
+  + the `dense_loss` host API (`dense_loss.rs`, `jev_ce.rs`).
+
+C++ dump parity: NOT RUN for any Phase 0 layer (no owning-branch C++ build).
+
+## 5. Layer port — Phase 1b
+
+- **`[segmentation]`** (2026-10-04, `3b42e1f2`): `segmentation.rs` +
+  `SegmentationSpec`, binary logistic CE and per-pixel softmax CE, full key set,
+  the correct-pixel `seg_gate` (raised-cosine ramp, per-element loss, global
+  compensation). 18 tests. Open: label loader, `seg_gate` GPU kernel, cfgs.
+- **`[omd_loss]`** (2026-10-04, `e5d8435b`): `omd_loss.rs` + `OmdLossSpec`, all
+  three samplers (box truth, background LCG, classification), metric pair loss
+  (cos / margin), full key set + aliases. 14 tests. `dense_loss` learns its
+  non-output-shaped truth. Open: `show_details` reporting, real detector cfg.
+- **`[contrastive]`** classifier branch (2026-10-04, `487b5c3e`):
+  `contrastive.rs`, C++ `P[i][j]` definition, positive/negative gradient helpers,
+  `label_smooth_eps` + `[net] adversarial`. 11 tests. Detection branch
+  self-reports unported (needs the yolo head's per-box class ids).
+- **`[laya_scorer]`** (2026-10-04, `e9457b4c`): `laya_scorer.rs` +
+  `LayaScorerSpec`, frozen LayerNorm→Linear→GELU(erf)→Linear per option slot,
+  exact analytical backward (FD-pinned), full shared-file blob arithmetic, 14
+  tests. Validated against the real `test_data/laya/laya_english.weights` blob
+  (LayerNorm gamma mean 0.9045, beta rms 0.0425). Needs `#![feature(float_erf)]`.
+- **`[laya_marker_gather]`** (2026-10-05, uncommitted):
+  `laya_marker_gather.rs` + `LayaMarkerGatherSpec` + `LayerKind::LayaMarkerGather`.
+  Two route-style inputs (`layers=idxA,idxB`); no weights. CPU fwd/bwd in all
+  three CPU paths, route-style use-counts, GPU-f32 host round trip, f16 error,
+  GPU backward via CPU fallback. 10 tests (pure gather + exact adjoint +
+  `lround` rounding/clamping + duplicate accumulation + runtime fwd/bwd/parse).
+  Evidence: targeted 10 green, `lightnet-core --lib` 317/317.
+- **`[laya_act_head]`** (2026-10-05, uncommitted): `laya_act_head.rs` +
+  `LayaActHeadSpec` + `LayerKind::LayaActHead`. Three route-style inputs
+  (`layers=head,scorer,marker`); frozen 2-layer MLP over masked-softmax summary
+  features (`top1`, `top1-top2`, entropy/log(k), k/255) concatenated with the
+  head's CLS column. Softmax features are detached, so only the head source
+  receives the pooled-CLS gradient. Blob order and shared-file offset ported
+  (`blob_offset_bytes` reuses the scorer's encoder/head counts). CPU fwd/bwd in
+  all three CPU paths, route-style use-counts, GPU-f32 host round trip, f16
+  error, GPU backward via CPU fallback. 9 tests (hand-computed features incl.
+  all-invalid options, MLP forward, central-difference backward for all four
+  tensors, blob round trip + offset, shape errors, runtime fwd/bwd/parse).
+  Evidence: targeted 9 green, `lightnet-core --lib` 326/326.
+- **`[laya_loss]`** (2026-10-05, uncommitted): `laya_loss.rs` + `LayaLossSpec`
+  + `LayerKind::LayaLoss` + a `dense_loss` arm. Masked soft-target loss over the
+  scorer's option logits, `mode=ce` (masked cross-entropy) and `mode=rlcd`
+  (Gaussian-noised logits, strictly-proper reward, group-mean baseline / batch
+  std, REINFORCE + weighted CE), plus `td_lambda_targets` for episode prefixes.
+  Truth stride `2K+3`; padding samples (no valid option) are excluded from every
+  mean. Forward output is the masked softmax; the delta is Darknet's descent
+  direction (CE is FD-verified; RLCD is the intended policy-gradient surrogate,
+  ported as-is). The RLCD RNG is a documented deterministic SplitMix64 +
+  Box-Muller substitute (C++ uses libstdc++ `mt19937_64` + `normal_distribution`,
+  not bit-reproducible). 11 tests (CE hand computation + FD, masking, padding,
+  TD(lambda), RLCD hand formula, RNG determinism, shape errors, runtime
+  forward/seed and RLCD smoke, parse errors). Evidence: targeted 11 green,
+  `lightnet-core --lib` 337/337.
+- **`[laya_encoder]`** (2026-10-05, uncommitted): `laya_encoder.rs` +
+  `LayaEncoderSpec` + `LayerKind::LayaEncoder` + a frozen runtime forward (CPU,
+  plus a GPU-f32 host round trip). Frozen ModernBERT-large: token-embedding
+  gather -> bias-free embed LayerNorm -> `n_layers` pre-norm blocks (fused-QKV
+  attention, RoPE theta alternating full (i%3==0) / sliding local window,
+  GeGLU with GELU on the first chunk) -> final LayerNorm -> channel-major output.
+  Input `[batch,2,1,T]` (token id + mask), output `[batch,hidden,1,T]`. Blob
+  order/count ported (`blob_float_count` == the scorer's
+  `encoder_blob_float_count`). 9 tests (bias-free LayerNorm hand computation,
+  RoPE identity-at-0 + norm preservation, zero-weight and pass-through
+  invariants, padding-mask attention, blob round trip, shape errors, runtime
+  forward vs module, parse errors). Evidence: targeted 9 green,
+  `lightnet-core --lib` 346/346.
+- **`[laya_head]`** (2026-10-05, uncommitted): `laya_head.rs` + `LayaHeadSpec` +
+  `LayerKind::LayaHead` + a frozen runtime forward (CPU + GPU-f32 host round
+  trip, GPU/CPU backward no-op). Two plain pre-norm `nn.TransformerEncoderLayer`s
+  (bias everywhere, ReLU FFN, no RoPE) over `encoder_output + type_emb[qtype]`,
+  `qtype` from cfg `0..=2` or a per-sample input channel when `qtype=-1`.
+  Input `[batch, hidden+mask(+qtype), 1, T]`, output `[batch, hidden, 1, T]`.
+  Blob order fixed to the C++ layer-interleaved order with `type_emb` folded in.
+  8 tests (LayerNorm-with-bias hand computation, zero-projection double-norm
+  invariant, type_emb additive, per-sample qtype selection, blob round trip
+  matching `head_blob_float_count`, shape errors, runtime forward vs module,
+  parse errors). Evidence: targeted 8 green, `lightnet-core --lib` 354/354.
+
+**The LAYA family is now complete** (`laya_scorer`, `laya_marker_gather`,
+`laya_act_head`, `laya_loss`, `laya_encoder`, `laya_head`).  C++ dump parity is
+still NOT RUN (no `Jev_laya` build here; `test_data/laya/` has only the shared
+`.weights`, no golden tensors).
+
+## 6. Layer port — Phase 2A (anchor-free heads) — COMPLETE
+
+- **`[yolox]`** (2026-10-04, `2281e019`): `modern_yolo.rs` + `ModernYoloSpec`,
+  raw logits with sigmoid on trailing entries, SimOTA assignment, hard class
+  targets, box/obj delta. 15 tests.
+- **`[ppyoloe]` / `[yolonas]`** (2026-10-04, `eab4720d`): DFL distribution
+  regression (softmax expectation, two-bin spread), Task-Aligned assignment,
+  soft quality target, YOLO-NAS NMS-aware rank decay. 10 tests.
+- **`[centernet]`** (2026-10-04, `aff18c3b`): `centernet.rs` +
+  `CenterNetSpec`, sigmoid heatmap, adaptive anisotropic Gaussian, continuous
+  tiny-object weighting, focal + smooth-L1 losses, peak NMS. 13 tests.
+- **LegoGears nested-object fix** (same commit): per-slot `class_quality`,
+  smallest-area-wins conflict resolution, `min_object_cells`, optional VFL.
+- **Modern-head decode** (2026-10-04, `ce814b7e`):
+  `ForwardResult.modern_heads` + `detect::decode_modern_detections` + CLI merge.
+  Per-family scoring (YOLOX `obj*cls`, PP-YOLOE/YOLO-NAS `max(cls, obj*cls)`,
+  CenterNet heatmap). 5 decode tests. Cfg end-to-end + `LegoGears_centernet.cfg`
+  still open (cfg lives on `Jev_laya`).
+
+## 7. Layer port — Phase 2B (partial: MoE + EML math)
+
+- **`[moe_convolutional]`** CPU path (2026-10-05, `cdf68d00` "WIP Port"):
+  `moe_conv.rs` (softmax top-k with tie-preserving mask + uniform fallback,
+  global-average-pool router, load-balance loss + unclamped gradient, gate
+  Jacobian), `MoeSpec`/`LayerKind::Moe`, C++ parse errors, C++
+  `save_moe_convolutional_weights` blob order, CPU fwd/bwd/update, init.
+  13 tests (10 `moe_conv` + 3 runtime, hand-computed blend + FD gradients).
+  Oxide forward computes routing, cached expert convolutions, and per-sample
+  blending on-device. No-BN and BN expert backward—including BN beta/scale
+  gradients—use backend ops and accumulate gradients on-device. No-BN SGD/Adam
+  updates are device-native; BN SGD updates expert weights, beta, and scales
+  on-device with momentum buffers, and BN Adam uses DNOPT4 scale moments. DNOPT1-3
+  remain readable, and nested host BN moments migrate on the first BN device
+  Adam update. Owner/expert cache slots warm each expert; host-updated experts
+  invalidate slots, while device-updated caches support deferred host sync.
+  CPU parity: `oxide_runtime_chain::moe_container_experts_run_oxide_forward_and_device_backward_matches_cpu`,
+  `oxide_runtime_chain::moe_adam_updates_router_and_experts_on_oxide_match_cpu_gradients`,
+  `oxide_runtime_chain::moe_batchnorm_expert_device_backward_matches_cpu_on_oxide`,
+  and `oxide_runtime_chain::moe_batchnorm_adam_updates_experts_on_oxide_match_cpu_gradients`.
+  Remaining: `eml_convolutional` and `dcnv3` (no reference numerics).
+- **`[eml_convolutional]`**: v67 added `eml_conv_math.rs`, a source-derived
+  pure forward/backward reference for the clamped exponential / softplus branch
+  combination and optional residual, with exact default branch derivatives,
+  strict clamp-boundary handling, C++ nonpositive clamp/epsilon fallbacks, and
+  finite-difference/hand-reference tests (4/4). v68 added host and Oxide combine
+  ops; v69 added cfg/shape parsing, paired convolution parameters, CPU forward /
+  backward, `.weights` I/O, SGD/Adam, and host updates. Save order **verified
+  2026-10-05**: `weights.cpp:775`/`:2000` write/read `input_layer` then
+  `self_layer`. v70 added native f32 Oxide branch convolutions and rolling-stat
+  inference. v71 added no-BN native backward. v72 added per-branch batch-stat
+  BN caches, native BN and convolution backward, scale/beta/weight gradient
+  accumulation, and device-produced rolling EMA propagation; parameter
+  optimizers remain host-side. `MEM=3G PKGS=lightnet-core
+  ./tools/test_host.sh eml_convolutional` passes 3/3, and
+  `./tools/test_oxide.sh --test oxide_runtime_chain` passes 19/19. CPU EML
+  training uses rolling stats, unlike the native GPU batch-stat training path;
+  no CPU/C++ training parity is claimed. Device optimizers and compiled-C++
+  golden validation remain open.
+- **`dcnv3`**: no reference numerics (stub in all five branches).
+
+## 8. Layer port — Phase 3A shared primitives (prerequisite set)
+
+- GPU LayerNorm fwd/bwd (`1f3c47b1`): host references + oxide kernel
+  (thread-per-row, `LAYERNORM_MAX_COLS=1024`), bias-free variant; `oxide_layernorm`.
+- Fused residual + per-column bias epilogue (`206accce`).
+- Batched-GEMM wrapper `linear_f32` (torch `nn.Linear` layout, bias as GEMM
+  `beta=1`) (`593ea30a`).
+- Row-softmax backward already existed. The shared set supports `vit`,
+  `swin`/`transformer`, Tucker, MambaVision, and Kimi KDA reference paths.
+  MiniMax sparse attention is an optional shared utility, not a
+  standalone layer in the audited C++ branch; it is wired into ViT, Tucker, and
+  MambaVision.
+
+### `[vit]` reference layer path (Phase 3A)
+- `model.rs`: cfg aliases/defaults/validation and patch-grid shape inference;
+  `Layer::weights()` matches the C++ named block order.
+- `vit.rs` + `runtime.rs`: CPU forward and exact analytical backward; seeded
+  C++-scale initialization; training gradient accumulation and SGD update
+  (global norm clip 5, matrix + learned-position decay, 0.1x mHC LR/clamp).
+- `weights.rs`/runtime: modern save and header-versioned legacy loading for the
+  12-float mHC suffix; exact-size and round-trip tests cover both.
+- GPU f32 uses a host round-trip for non-attention math. Standard flash
+  attention dispatches native Oxide forward and recompute-based dQ/dK/dV
+  backward for supported head dimensions inside the whole-network CPU fallback;
+  unsupported dimensions and other ViT derivatives remain host-side. FakeBackend
+  and Oxide runtime-chain parity cover a preceding-convolution chain.
+- v0.0.260 (`16e95d9a`): native flash backward and runtime dispatch. Evidence:
+  `MEM=3G ./tools/test_host.sh vit` — 28 pass;
+  `MEM=3G ./tools/test_oxide.sh --test oxide_layernorm` — 14 pass, including
+  host/Oxide backward parity, central finite differences, and clamp masks;
+  `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain` — 22 pass, including
+  CPU-matched ViT parameter updates after native attention backward dispatch;
+  `MEM=3G ./tools/test_host.sh runtime` — 161 runtime tests pass.
+  This is Rust backend evidence, not performance or compiled-C++ parity.
+- v0.0.261 (`7ca5a58e`): added source-derived host E4M3 saturating encode/decode
+  and ExpCast modes 0/1/2 as VC-attention groundwork. Four tests cover every
+  finite E4M3 code round trip, special/subnormal/saturation cases, hand-derived
+  ExpCast outputs, and invalid inputs. `MEM=3G ./tools/test_host.sh vc_attention`
+  passed 4 tests. Helpers are not wired into cfg/runtime; no compiled-C++ parity.
+- v0.0.262 (`18ad3547`): added the source-style V-Smooth transformation with
+  per-64-token means, global per-channel residual scale, permutation support,
+  E4M3 residual reconstruction, and a piecewise-exact derivative. Backward
+  explicitly errors at E4M3 rounding boundaries and tied/zero scale maxima,
+  where the classical derivative is undefined.
+  `MEM=3G ./tools/test_host.sh vc_attention` passed 7 tests, including central
+  finite differences away from quantization boundaries. This is an isolated math
+  primitive, not an integrated VC attention path or compiled-C++ parity.
+- v0.0.263 (`8792f7b9`): added a source-shaped one-query online ExpCast row
+  forward/backward. The cache is O(T + T*C); its exact score derivative includes
+  continuous inter-tile prefix-max rescaling, while code transitions and prefix
+  max ties return an explicit error. `MEM=3G ./tools/test_host.sh vc_attention`
+  passed 10 tests, including two-tile finite differences and the single-tile
+  zero-score-gradient case. Still isolated math; no cfg/runtime or C++ parity.
+- v0.0.264 (`9a085535`): added one-head Q/K quantization and continuous score-scale
+  derivative chaining through per-row `sq` and centered-key `sk`, including
+  key-mean and Q/K-clamp adjoints; E4M3 code derivatives remain zero and exact
+  boundary/tie cases error. `MEM=3G ./tools/test_host.sh vc_attention` passed
+  12 tests, including finite differences of Q/K scale paths with a key
+  permutation and score-clamp masks. Still not assembled into full attention.
+- v0.0.265 (`fabcfba5`): composed those pieces into a single batch-head CPU
+  reference forward/cache/backward with O(T*C) retained state; online rows are
+  recomputed in backward. LSE is explicitly for the centered, configured-clamp
+  score rows, not ordinary uncentered logits. `MEM=3G ./tools/test_host.sh
+  vc_attention` passed 13 tests, including Q/K/V finite differences over 128
+  keys with a key permutation. This remains reference math, not cfg/runtime or
+  compiled-C++ parity.
+- v0.0.266 (`fc47742d`): added `[B,H]` packing/unpacking around the single
+  batch-head VC reference, storing one O(T*C) cache per head and returning
+  gradients in fused QKV order. `MEM=3G ./tools/test_host.sh vc_attention`
+  passed 14 tests, including B=2/H=2 mapping and cache-shape coverage. Config,
+  runtime, device fallback, and compiled-C++ parity remain open.
+- v0.0.267 (`3c6f5c76`): integrated VC aliases (`vc_attention`/`vc`,
+  `vc_expcast`/`expcast`) and strict mode/permutation validation into `[vit]`,
+  enforcing the flash-attention prerequisite. Added the source 8×8 full-windows-
+  first spatial ordering and routed CPU/GPU ViT forwards through the VC reference;
+  GPU paths bypass standard flash kernels, and backward consumes the matching VC
+  cache via the exact piecewise derivative. Unsupported GPU devices/head sizes
+  are handled by the host reference (no native VC kernel). `MEM=3G
+  ./tools/test_host.sh vc_attention` passed 16 filtered tests and
+  `MEM=3G ./tools/test_host.sh vit` passed 32, including config validation,
+  callback bypass, spatial-order, and FakeBackend runtime forward/backward tests.
+  No compiled-C++ parity is claimed; remaining Phase 3A layers and native VC
+  kernels remain open.
+- Earlier focused evidence: full host unit suites pass (`lightnet-core` 377,
+  `lightnet-cli` 18); targeted check/build pass with `-j 4`. The full
+  `cfg_corpus` integration run exceeded a 30-minute timeout. C++ dump parity NOT
+  RUN (no owning-branch executable).
+- v0.0.268 (`0bd26bda`): added source-derived Swin geometry, masks, mHC, and
+  one-window attention helpers with analytical derivatives. `MEM=3G
+  ./tools/test_host.sh swin` passed 10 focused tests covering hand attention,
+  finite differences, source padded-key leakage, and rectangular pad/crop/shift/
+  partition adjoints. Hand-derived from `jepa:swin_layer.cpp`; no compiled-C++
+  golden.
+- v0.0.269 (`4addcb07`): integrated the complete Rust Swin/transformer layer. `model.rs`
+  strictly parses all four aliases, infers shape, and records the Rust-owned
+  weight order; initialization and modern-header weights save/load are covered.
+  `swin_block.rs` implements full CPU forward/backward and exact derivatives of
+  that Rust forward; `runtime.rs` adds gradient buffers, accumulation, SGD/Adam,
+  optimizer-state round-trip, and GPU f32 host fallback. Masks and relative
+  indices are built once per block forward, with indices shared across window
+  caches. `MEM=3G ./tools/test_host.sh swin` passed 25 tests, `runtime` passed
+  166, and `weights` passed 29. FakeBackend matches CPU forward/backward and
+  updates on a preceding-convolution chain. No native Swin kernel, C++ weights
+  writer, or compiled-C++ parity is available.
+
+### `[tucker_attention]` reference layer path (Phase 3A)
+
+- v0.0.270 (`ecd4e54e`): added strict `[tucker]` / `[tucker_attention]` / `[tucker_attn]`
+  parsing, NCHW shape validation, rank/default and MSA alias precedence, and
+  overflow-safe geometry/weight sizing. `Layer::weights()` follows the C++
+  two-block stream: `biases[channels]`, then flat Q/K/V/O factors.
+- Added source-shaped bottom/right zero-padded non-overlapping local windows,
+  Q/K/V low-rank bases and per-head cores, O-core/basis, identity residual,
+  activation, optional MiniMax sparse-row selection, and exact backward of the
+  Rust forward. Backward finite differences cover input, Tanh, MSA routing, and
+  all eight factor blocks; a hand-computed 2×2 window and multi-head derivative
+  are pinned. Seeded init uses the source uniform bound; SGD/Adam update only
+  flat weights with coupled decay, not biases.
+- `weights.rs` writes biases then factors; modern and legacy headers round-trip
+  with exact metadata/trailing-byte checks. GPU f32 uses a host round-trip; no
+  native Tucker kernel exists. `MEM=3G ./tools/test_host.sh tucker_attention`
+  passed 14 tests; `weights` passed 32 and `runtime` 168, including FakeBackend
+  CPU forward/backward/update parity and Adam fallback. Source-derived from
+  `Jev_laya`/`jepa`; no compiled-C++ golden or parity claim.
+- MiniMax sparse attention is a shared option rather than a standalone layer,
+  and its source enablement must be audited in each
+  future attention integration. VC native-kernel/evidence follow-ups also
+  remain; see `todo.md`, `vit_plan.md`, and `swin_plan.md`.
+
+### `[mambavision]` reference layer path (Phase 3A)
+
+- v0.0.271: added strict `[mambavision]` / `[mambavision_block]` parsing,
+  shape/geometry checks, source-ordered flat parameters, deterministic seeded
+  initialization, and an explicit per-layer recurrent-state API. The source
+  recurrence, causal/noncausal depthwise convolution, post-scan identity-QKV MSA,
+  residual, LayerNorm, and FFN are implemented in `mambavision.rs`.
+- CPU backward differentiates the Rust forward exactly, including scan clamp
+  masks, MSA score clipping, and incoming `[batch, filters/2, state]` gradients;
+  top-k selection is held fixed and undefined boundary derivatives error.
+  Runtime accumulation, per-block SGD decay, host Adam, and optimizer-state
+  serialization are integrated. GPU f32 uses the host reference/fallback.
+- `.weights` metadata and load/save follow the audited C++ block order, including
+  the optional residual projection only when input channels differ from filters.
+  Tests cover aliases/defaults/errors, seeded initialization bounds, input and
+  every parameter-block finite differences, incoming-state finite differences,
+  causal-convolution finite differences, conv-size-1 streaming, MSA clipping,
+  exact-length weight round trips, optimizer-state persistence, SGD decay groups,
+  and CPU/FakeBackend forward/backward/update parity.
+- Evidence: `MEM=3G ./tools/test_host.sh mambavision` — 16 pass;
+  `MEM=3G ./tools/test_host.sh runtime` — 171 pass;
+  `MEM=3G ./tools/test_host.sh weights` — 33 pass. No native MambaVision
+  kernel or owning-branch compiled-C++ golden/parity.
+
+### `[kimi_kda]` reference layer path (Phase 3A)
+
+- v0.0.272 (`3d7202bf`): added strict aliases/config and identity-shape checks,
+  source-order biases/weights, deterministic source-bounded initialization, CPU
+  low-rank causal scan plus shared/routed experts, and exact backward of the
+  Rust forward (including router load-balance cost and piecewise key-normalization
+  behavior). SGD/Adam, optimizer-state persistence, `.weights`, and GPU f32 host
+  fallback are integrated; no native Kimi kernel exists.
+- Tests cover hand-computed forward, finite differences for input and every
+  parameter with the auxiliary cost, key-norm floor and top-k edge cases,
+  parser errors, initialization bounds, source-order weight round-trip, optimizer
+  persistence, and CPU/FakeBackend forward/backward/update parity.
+- Evidence: `MEM=3G ./tools/test_host.sh kimi_kda` — 10 pass;
+  `MEM=3G ./tools/test_host.sh runtime` — 173 pass;
+  `MEM=3G ./tools/test_host.sh weights` — 34 pass. Hand-derived from `Jev_laya`;
+  no owning-branch compiled-C++ golden or parity claim.
+
+## 9. Inference parity — LegoGears_v2 (the final target)
+
+`docs/OXIDE_BENCH.md`, `tasks/rust/todo.md` "Final target results":
+- 38-layer dump: Rust CPU vs oxide max abs 2.1e-5; C++ CUDA vs oxide up to
+  5.7e-3 but the same profile as C++ vs Rust CPU → C++ `cudnn_half=1`, not an
+  oxide error.
+- 80 val images: 155/155 detections matched at thr 0.25, min IoU 0.99897, max
+  score diff 4.5e-4; mAP@0.50 99.6685% == C++ 99.67% (fp32/tf32/fp16).
+- Perf after allocator + GEMM + batched-im2col work: b1 ~1.8–2.4 ms (C++ ~5),
+  b16 9.6–14.7 ms (C++ ~14–15).
+- Known small diffs vs C++ (documented): CPU resize uses `image` Triangle; EXIF
+  orientation ignored; dilated conv needs `pad*dilation`; relu/relu6 NaN→0 on
+  oxide; mish/swish at -inf → NaN.
+
+## 10. Data augmentation (`augmentation-audit.md`)
+
+- Implemented: `crates/lightnet-core/src/augmentation.rs` + training-only loader +
+  CPU/oxide CLI wiring; jitter/resize margins, letterbox, source-mean padding,
+  OpenCV-style u8 bilinear, flip, HSV, box clip/mirror/subpixel filter, max-box
+  cap, mixup, multi-scale `random`, seeded SplitMix64, background prefetch, and
+  C++-formula mosaic crop alignment/box clipping (Rust RNG differs).
+- Reference generator `tools/augmentation_reference.py`; 20 composite fixtures
+  worst 1 LSB (not claimed bit-identical). Unsupported active
+  blur/noise/fog/tracking/contrastive modes fail at startup.
+- Open: resume image-order replay, C++-bit-identical RNG.
+
+## 11. Housekeeping
+
+- Root `TODO.md` updated with backend status + cuTile-disabled note.
+- Commit discipline: minimal per-phase commits on branch `rust`.
+- Stale-box audit (2026-10-01) resolved most open checkboxes with inline
+  evidence.
+
+## 12. Gradient-shortcut audit (`LIGHTNET_GRAD_MODE`)
+
+Audited line-by-line against `src-lib` on 2026-10-01; `GradMode` lives in
+`src/lightnet-core/src/runtime.rs`. Keep exact analytical backward as the default;
+`LIGHTNET_GRAD_MODE=cpp` reproduces C++ shortcuts for softmax, scale_channels
+(`scale_wh=1`), and weighted shortcut. Other ops are exact and untouched.
+
+1. **softmax** — `softmax_layer.cpp:97`/`:146` pass `dy` through; exact is
+   `dx_i = y_i (dy_i - sum_j dy_j y_j)`. Rust exact by default, `cpp` =
+   passthrough (CPU + GPU arms).
+2. **scale_channels** (`scale_wh=1`) — `blas_kernels.cu:1683` divides the scale
+   gradient by `w*h`; exact is the plain sum over c. `scale_wh=0` (`:1690-1704`)
+   exact. Rust exact by default, `cpp` divides by `w*h`.
+3. **weighted shortcut** — `blas_kernels.cu:1069-1070`/`:1109-1110` use RELU
+   `grad=w` and SOFTMAX `grad=w*(1-w)` (cross terms and `eps=1e-4` dropped);
+   unweighted (`:1091`/`:1131`) = exact identity (FD-tested). Rust exact CPU
+   backward by default; `cpp` selects raw `sum(delta*x)` for normalized weights.
+   GPU fwd composes oxide scale+add; GPU backward assembles each source's raw
+   products and applies the exact normalization derivative on the backend. Only
+   the final small weight-gradient vector crosses to the host train buffer;
+   parameter/optimizer updates remain host-side. Finite differences cover all
+   normalizations; FakeBackend and real Oxide tests cover short-source prefixes,
+   C++ mode, runtime backward, and SGD parity.
+4. **activations** — `activation_kernels.cu:62-85`; gradients take the output
+   except mish/swish/hard_mish. Exact from output for
+   logistic/tanh/loggy/elu/selu/relu/leaky/relie/ramp/relu6/hardtan/lhtan/plse/
+   hard_mish; stair = 0 a.e. **WRONG in C++**: gelu `:78-81` / `:450-454`
+   evaluates the derivative at the *output*. Rust oxide implements only
+   linear/logistic/relu/leaky/mish/swish/tanh, all exact.
+5. **dropout** exact (`delta = mask*scale`); dropblock mask×per-sample scale
+   treated as constant. Rust exact (FD with fixed mask).
+6. **batch norm** — cuDNN path (`batchnorm_layer.cpp:312-331`) exact; non-cuDNN
+   path exact up to epsilon placement (forward 1e-5 vs delta kernels 1e-6);
+   `fix_nan_and_inf`/`constrain_ongpu` clamps not implemented in Rust (exact,
+   eps 1e-5, FD-tested).
+7. **conv** — exact dgrad/wgrad are FD-tested. The GPU update-only `reverse`
+   transform and `deform` weight transform remain unimplemented. `grad_centr`
+   is implemented in CPU/GPU update paths with the C++ BN gate and warp-size
+   skip; `gpu_grad_centr_runtime_matches_cpu_and_respects_batchnorm_gate` and
+   `gradient_centralization_matches_reference_and_is_noop_off_warp_sizes`
+   verify runtime/reference parity.
+   Weight clipping and the `try_fix_nan` sanitization path are also implemented.
+8. **yolo/region/gaussian_yolo** deltas are a training policy, not the
+   printed-loss derivative (`delta_yolo_box` `yolo_layer.cpp:76-178`); Rust
+   mirrors on the host, no kernel, nothing to gate.
+9. **maxpool** — exact subgradient, ties to the first tap (`:73-75`); `maxpool_depth`
+   exact. SHORTCUT `maxpool_zero_nonmax` (`:135-142`) zeroes non-argmax input
+   deltas; `antialiasing` (`:220-232`) runs an extra conv backward. Rust: exact
+   maxpool; `zero_nonmax`/`depth`/`antialiasing` noted.
+10. **update step** (CORRECTED) — `loss_scale` multiplies softmax and yolo GPU
+    deltas and divides lr in every update; SGD decay `axpy(-decay*batch*loss_scale, w)`;
+    Adam decays `-decay*batch*w` without `loss_scale`. Out of GRAD_MODE scope.
+11. **NORM_CHAN_SOFTMAX / NORM_CHAN** CUDA gradients drop the normalization
+    cross terms (`activation_kernels.cu:788-874`). v65 added exact standalone
+    backend derivatives and v66 wired them into f32 convolution CPU/Oxide
+    runtimes; `LIGHTNET_GRAD_MODE=cpp` selects the inspected CUDA shortcut. CPU
+    C++ custom gradients differ. The parser permits these only on
+    `[convolutional]`; f16 inference remains unsupported.
+12. **gelu gradient at the output** (see 4).
+
+FD coverage: every audited op with a Rust path is finite-difference tested; the
+unweighted shortcut gained
+`shortcut_add_backward_is_identity_and_matches_finite_difference`
+(`oxide_grad_methods.rs`); weighted shortcut's None/ReLU/softmax derivatives
+have central finite-difference coverage in `shortcut_weights::tests`, and the
+v65 `NORM_CHAN*` standalone exact derivatives are finite-difference checked in
+`oxide_layers_extra`. Not implemented/testable by finite differences yet: gelu &
+friends, conv `reverse`/`deform`, and the YOLO kernel. `grad_centr` is an optimizer transform, verified by source-derived
+runtime/kernel parity rather than finite differences.
+`maxpool_zero_nonmax` uses the existing Oxide maxpool-backward kernel and has
+real-device CPU parity coverage.
+
+---
+
+## 13. OBB CPU training gaps (plan-open-items Waves 0–1)
+
+Evidence: `MEM=3G ./tools/test_host.sh obb_` = 135 core + 4 CLI tests pass.
+No compiled-C++ parity (hand-derived from `raptor:src-lib/*.cpp`, no golden).
+
+- v0.0.247 (`98003667`): `ForwardResult::from_heads`; fixes the oxide CLI build break.
+- v0.0.248 (`2941a2ee`): default CUDA toolkit path in `.cargo/config.toml` (not part of the plan).
+- v0.0.249 (`f9664e63`): OBB CPU Adam (`update_weights_adam`, moments round-trip via sidecar).
+- v0.0.250 (`5b98fe1c`): OBB photometric augmentation (hue/saturation/exposure).
+- v0.0.251 (`968c1beb`): weighted OBB NMS merge (`obb_w`/`obb_wnms`).
+- v0.0.252 (`fae49267`): OBB default augmentation settings (zero default jitter).
+- v0.0.253 (`31219aba`): `ciou_obb_mul` multiplicative training loss.
+
+---
+
+## 14. ONNX export
+
+- v0.0.254 (`fc50aa57`): added a dependency-free protobuf wire encoder and ONNX message builders; varint, signed-int, model wire structure, and raw float tensor tests pass.
+- v0.0.255 (`1b632932`): implemented supported-layer ONNX export for Conv/BN, activations, maxpool, route, shortcut, upsample, and YOLO heads; unsupported constructs fail explicitly. `MEM=3G ./tools/test_host.sh onnx` passed 11 tests, including asymmetric maxpool padding, grouped-route source-channel slicing, separate BN, unsupported dilation/shortcuts, Mish opset 18, and no-YOLO outputs.
+- v0.0.256 (`4a0d99e7`): added `export-onnx` CLI parsing, default output path, `--no-fuse`, argument rejection, and usage text. `MEM=3G ./tools/test_host.sh export_onnx_args` and `systemd-run --user --scope -p MemoryHigh=3G cargo build -p lightnet-cli -j 2` passed; fused and unfused model exports from a local matching cfg/weights succeeded.
+- v0.0.257 (`778242ab`): added `tools/onnx_check.py`; syntax check passed. ONNX Runtime checks against Rust CPU layer dumps yielded worst relative errors of `3.257e-06` (fused), `3.908e-05` (unfused), and `3.831e-06` (Mish-opset-18 variant), all below `1e-4`. Verified with local cfg/weights/image because the canonical dataset paths are absent. This is Rust-runtime parity; no compiled-C++ golden exists.
+
+## 15. CARPN sample-level polygon mAP dispatch
+
+- v0.0.258 (`7681f478`): `obb_detector_map` now dispatches all-CARPN sample sets to the existing polygon evaluator, rejects mixed front-point/CARPN predictions, and preserves the legacy route for empty prediction sets. `MEM=3G ./tools/test_host.sh obb_map` passed 5 core tests, `MEM=3G ./tools/test_host.sh carpn_map` passed 3, and `MEM=3G ./tools/test_host.sh carpn_polygon_iou` passed 2. This is caller-provided sample API support only: Rust CARPN network decoding, CLI/training mAP integration, and compiled-C++ parity remain unsupported/not established.
+
+## 16. CARPN CPU network inference and direct mAP
+
+- v0.0.259 (`29889c5c`): added `[obb_refine]` CPU inference, Stage-2 quadrilateral decoding/NMS, full-forward OBB validation with explicit polygon mAP, `detect-image` integration, and a cfg/weights-backed direct `detector map` route. Generated fixtures verify AP/report counts, a same-AABB/wrong-polygon case (AABB AP 1.0 versus polygon AP 0.0 at IoU 0.6), and required front-point labels even with zero proposals. CARPN `detector train` including `-map` rejects before training because Stage-2 assignment/loss/backward/update support is not implemented. Legacy OBB behavior is preserved (`MEM=3G ./tools/test_host.sh obb_`: 138 core + 4 CLI tests).
+- Focused evidence: `carpn_refine_cfg` (2), `carpn_refine_weights` (1), `carpn_refine_forward` (3), `carpn_proposals_apply` (1), `carpn_refine_decode` (5), `carpn_map` (6), `carpn_cli` (1), `detect_image_routes_carpn` (1), and `detector_train_rejects_carpn` (1) all passed through `MEM=3G ./tools/test_host.sh`. `systemd-run --user --scope -p MemoryHigh=3G cargo build -p lightnet-cli -j 4`, targeted `rustfmt --check`, and `git diff --check` passed. Workspace-wide `cargo fmt --check` reports pre-existing formatting differences in unrelated ONNX/CUDA files; those were not reformatted. No full cfg-corpus run was required.
+- Source behavior is hand-derived from `raptor`; there is no compiled-C++ oracle or canonical CARPN cfg/weights/dataset, so no compiled-C++ parity or canonical-dataset result is claimed. GPU CARPN inference and CARPN training/scheduled `detector train -map` remain deferred.
+
+## 17. DCNv4 CPU reference and GPU f32 host fallback
+
+- v0.0.274 (`e24d7625`): mirrors `Jev_laya:src-lib/darknet_cfg.cpp` by defaulting `[net] try_fix_nan=1` when a deformable-sampling layer is present, unless the net explicitly sets `try_fix_nan`. The `dcnv4` host filter passed 16 tests, including explicit zero/one override coverage. No compiled-C++ parity.
+- v0.0.273 (`cb96aa49`): integrated strict `[dcnv4]` / `[dcnv4_convolutional]` config and shape support, C++ source-order `.weights`, deterministic initialization, grouped deformable sampling, coarse `d_stride` offset projection and interpolation, optional softmax masks/center removal, and the exact derivative of the Rust forward. Runtime support includes bias/BN/activation, SGD and Adam, persisted optimizer state, and GPU f32 execution through the host fallback. Compatibility dummy weights serialize but are never differentiated or updated; offsets use the source-derived 0.01 learning-rate scale.
+- Verification: `MEM=3G ./tools/test_host.sh dcnv4`, `weights`, and `runtime` passed; the targeted `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_f32_host_fallback_matches_cpu_chain_and_updates` passed. Output counts were not retained. Tests cover hand-computed sampling/grouping/masks, finite differences for input and offset parameters across standard and coarse-stride cases, BN/optimizer behavior, exact-length BN/non-BN weight round trips, and CPU/FakeBackend/Oxide host-fallback parity. Targeted Rustfmt and `git diff --check` passed. No training was run, no native Oxide kernel was added, and no compiled-C++ golden/parity is claimed.
+
+## 18. DCNv1 and DCNv2 CPU reference and GPU f32 host fallback
+
+- v0.1.001 (`8f5a9a94495cbc376f0b91cbf12f5123fe7ee42c`): integrated both `[deform_conv]` aliases with strict source-derived cfg/shape validation, parameter metadata, deterministic initialization, exact source-order weights, grouped NCHW sampling, offsets and optional sigmoid masks, per-image conditional offset normalization, and exact backward of the Rust forward. Runtime covers bias/BN/activation, rolling statistics, SGD source-rate groups, Adam with persisted moments, update gates, loss scaling, CPU/FakeBackend parity, and GPU f32 host fallback; compact execution rejects explicitly. Unsupported modes, f16/compact paths, and undefined clamp boundaries reject explicitly.
+- Verification: `MEM=3G ./tools/test_host.sh deform_conv` passed 23 core tests; `weights` passed 38 core tests; `runtime` passed 184 runtime tests; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- deform_conv_f32_host_fallback_matches_cpu_chain_and_updates` passed 1 Oxide test. Named coverage includes NCHW/group/kernel-axis hand math, zero-padded boundary sampling, all-trainable-block/input finite differences (including conditional normalization and masked grouped sampling), BN scale finite differences and rolling stats, source-order byte layouts, SGD/Adam updates and state round trip, accumulation/gates/loss-scale neutrality, and CPU/FakeBackend/Oxide host fallback. Targeted Rustfmt and `git diff --check` passed.
+- Source contract: hand-derived from `Jev_laya`; no compiled-C++ golden/parity. No training run or native Oxide kernel. GPU status is host fallback only. CPU Muon was delivered separately in v0.1.005; this bounded DSConv port still does not complete Phase 3B.
+
+## 19. DSConv single-template Stage-1 CPU reference
+
+- v0.1.002 (`f49cfc56f571329c14f6b43224d635199b6cca1b`): integrated `[dsconv]` / `[dynamic_snake_conv]` with strict source-derived config/shape handling, source-order weights, seeded initialization, NCHW CPU forward for `morph=0/1/2`, exact backward of the Rust forward, activation handling, SGD source-rate groups, and Adam with persisted moments. Multi-template `morph=0/1` explicitly rejects; `morph=2` follows the source normalization to one template.
+- Verification: `MEM=3G ./tools/test_host.sh dsconv` passed 12 core tests, `weights` passed 40 core tests, and `runtime` passed 187 runtime tests. Coverage includes named hand-computed NCHW axes, finite differences for input and every parameter block across all morphs, integer/border derivative conventions, exact source-order bytes/file length, seeded initialization, update rates/gates, optimizer-state round trip, and explicit GPU rejection. Targeted `rustfmt --check --edition 2024` and `git diff --check` passed. No training or Oxide tests were run.
+- Source contract: hand-derived from `Jev_laya`; no compiled-C++ golden/parity. The later bounded single-template f32 GPU runtime path is recorded in §200; multi-template/drop-mask gradients landed in §268. CPU Muon was delivered separately in v0.1.005. Do not claim full DSConv parity or v0.1 completion.
+
+## 20. Graph-convolution Stage-1 CPU reference
+
+- v0.1.003 (`f9a90bd5940f0dfce40e4e2ded0d7c1838f50e11`): integrated `[graph_conv]` / `[graph_convolutional]` with strict source-derived config/shape validation, grouped NCHW projections, uniform valid-neighbor means or learned masked-softmax edges, optional center projection, source-order weights, seeded initialization, BN/activation, exact backward of the Rust forward, SGD, and Adam with persisted moments. GPU execution and updates reject explicitly.
+- Verification: `MEM=3G ./tools/test_host.sh graph_conv` passed 14 tests; `weights` passed 42; `runtime` passed 192. Coverage includes non-square NCHW hand math, grouped projection and learned-edge finite differences across input and all trainable blocks, uniform-mode border finite differences and zero upstream, finite-difference bias, preceding-convolution gradient accumulation, BN/rolling statistics, every optional weight-block combination with exact file size/trailing-byte checks, optimizer updates/state round trip, and GPU rejection. Targeted Rustfmt and `git diff --check` passed. No Oxide tests, training, or `cfg_corpus` run.
+- Source contract: hand-derived from `Jev_laya`; `LAYER_GRAPH_CONV` is disabled in the source branch and there is no compiled-C++ golden, so no compiled-C++ parity is claimed. Adam is a Rust extension; CBN uses ordinary CPU BN semantics. Stage-1 CPU only; native GPU paths and GPU Muon belong to Stage 2. CPU Muon was delivered separately in v0.1.005.
+
+## 21. WMHF Stage-1 CPU reference
+
+- v0.1.004 (`49ce73ccfc03d76c9a79e53389d283198d5d788e`): integrated the strict `[wmhf]`, `[wavelet_mamba_hf]`, and `[wavelet_mamba_high_frequency]` config paths, seeded initialization, seven source-order convolution blocks plus four scan vectors, Haar DWT/IWT and four-direction EMA scan CPU forward, exact backward, batch-stat BN with rolling-stat updates, SGD, Adam with persistent moments, and exact `.weights` serialization. GPU execution and updates reject explicitly; no GPU fallback or kernels were added.
+- Verification: `MEM=3G ./tools/test_host.sh wmhf_` passed 17 tests; `weights` passed 43; `runtime` passed 198. Coverage includes hand-computed full forward, zero-upstream and finite-difference input/parameter gradients across all blocks, preceding-convolution accumulation, odd-edge Haar adjoints, BN/rolling statistics, SGD and GPU rejection, Adam-state persistence, initialization, strict config, and exact source-order file length. Targeted Rustfmt checks on modified core files and `git diff --check` passed. No training, Oxide tests, or `cfg_corpus` run.
+- Source contract: hand-derived from `Jev_laya`; `LAYER_WMHF` is disabled and guarded tests are not a numerical oracle, so no compiled-C++ golden/parity is claimed. WMHF is Stage-1 CPU-only. `recursive_block` remains open; do not claim Phase 3B/Stage 1 complete.
+
+## 22. CPU Muon hybrid optimizer
+
+- v0.1.005 (`2674f5741405e33371448bb9a664d482ffa02e8d`): added opt-in `[net] muon=1` hybrid CPU updates. Eligible dense matrix blocks use arXiv:2502.16982's additive momentum/Nesterov lookahead, five Newton–Schulz iterations with `(3.4445,-4.7750,2.0315)`, scale `0.2*sqrt(max(rows,cols))`, and decoupled decay. Explicit per-layer matrix mappings cover convolution/recurrent/attention families; other trainable parameters use AdamW fallback. Conflicting/unsupported config rejects.
+- CPU trainer dispatch covers general and OBB CLI training, direct OBB batch helpers, and the benchmark update step. DNOPT6 persists shape-checked Muon momentum and retains DNOPT1–5 reads; loading old state in Muon mode starts fresh Muon/AdamW state. GPU execution/updates and GPU optimizer-state save/load reject explicitly.
+- Verification: `MEM=3G ./tools/test_host.sh muon_` passed 13 tests, `weights` passed 43, and `runtime` passed 204, including `train_only_bn` gating. Core-file `rustfmt --check --edition 2024` and `git diff --check` passed. No training or Oxide tests were run.
+- Evidence boundary: update is paper-derived plus hand-computed/runtime tests. There is no compiled-C++ Muon implementation or golden, so no compiled-C++ parity is claimed. Stage 1 remains open for `recursive_block`; GPU Muon belongs to Stage 2.
+
+## 23. Clifford Stage-1 CPU reference
+
+- v0.1.006 (`1cc80d92b06a7b4fcbd90bea0f6a38931bb0d0ed`): integrated `[clifford]` as an ordinary source-derived NCHW layer, not a nested config container. CPU support covers local/global/hybrid branches, avgpool/Fourier global context, inner/wedge/full interaction schedules, abs/diff context, higher vector-bivector mode, and cached DropPath. The guarded C++ `LAYER_CLIFFORD` macro is disabled, so this is hand-derived from `Jev_laya`, not compiled-C++ parity.
+- Added seeded source-scale initialization; exact source-order `.weights` load/save; training forward/backward with internal depthwise BN and rolling-stat updates; SGD, AdamW, and Muon matrix mappings (with AdamW fallback for non-matrix parameters). DNOPT host-Adam/Muon state round trips validate nested state; GPU full/compact execution and updates reject explicitly in Stage 1.
+- Verification: `MEM=3G ./tools/test_host.sh clifford_` passed 13 tests, `weights` passed 44, and `runtime` passed 208. The Clifford tests cover finite differences for input and trainable parameters across avgpool+DropPath, Fourier, inner/abs/local, and wedge/global modes; exact weight bytes/round-trip; seeded initialization; optimizer updates/state; BN stats; and GPU rejection. Targeted Rustfmt and `git diff --check` passed. No training, Oxide tests, or `cfg_corpus` run.
+- Evidence boundary: no compiled-C++ golden exists and no compiled-C++ parity is claimed. Clifford is Stage-1 CPU-only at this increment; `recursive_block` remains open and native GPU support/GPU Muon belong to Stage 2.
+
+## 24. Recursive-block Stage-1 CPU reference
+
+- v0.1.007 (`94513d426c190ab8b7fb012ee3bf0b5f68ff5e55`): integrated `[recursive_block]` / `[recurrent_block]` with nested body-section consumption, strict option/shape validation, deterministic initialization, per-pass body tapes/dropout masks, and nested BN rolling-stat updates. CPU forward covers static recurrence, controller-gated `ouroboros=1`, and lattice projection; backward is exact for the Rust forward across the full unrolled recurrence, controller, and lattice. SGD, AdamW, Muon traversal/state validation, body-only C++ `.weights` order, and explicit GPU/compact/update rejection are included.
+- C++ `.weights` omits controller weights/biases (and LoRA values), so controller learning is not restored by Darknet checkpoints. Stage-1 rejects `ouroboros=2` and every explicit `lora_*` option. Rust full BPTT and lattice derivatives intentionally differ from C++ truncated k=1 backward and stop-gradient lattice behavior.
+- Verification: `MEM=3G ./tools/test_host.sh recursive_block` passed 11 core tests, `weights` passed 45 core + 2 CLI tests, `runtime` passed 219 core tests, and `MEM=3G cargo check -p lightnet-core -j 4` passed. Tests include all-trainable finite differences for static/controller/lattice branches, dropout mask reproducibility/independence, nested BN running stats, exact body-only weight bytes, optimizer state validation, Muon matrix ordering, and GPU rejection. Targeted rustfmt and `git diff --check` passed. No training, Oxide tests, or feature-specific `cfg_corpus` run; the full host baseline/cfg-corpus status remains non-green/unverified under the memory cap (see `STATUS.md`).
+- Evidence boundary: hand-derived from `Jev_laya`; there is no compiled-C++ golden/parity. CPU-only Stage-1 support is complete for this layer; native GPU and GPU Muon remain Stage 2.
+
+## 25. Hyperbolic-foveation Stage-1 CPU reference
+
+- v0.1.008 (`f7b044bc84c6b19ed5b99cc97633fd859724db74`): integrated strict `[hyperbolic_foveation]` / `[hf]` config and shape handling, source-derived NCHW warp and learned predictor, deterministic init, source-order weights, exact finite-iteration inverse derivatives, alternate predictor/network-input fan-in, label-driven tiny-box/strength regularizers, SGD/AdamW/Muon updates and state validation, and axis-aligned/OBB/CARPN detection plus mAP reprojection.
+- Full and compact GPU execution, f16 inference, GPU backward and optimizer updates explicitly reject this Stage-1 CPU-only layer. No CUDA/Oxide fallback or kernel was added.
+- Verification: `MEM=3G ./tools/test_host.sh hyperbolic_foveation` passed 30 core tests; `runtime` passed 231; `weights` passed 47 core + 2 CLI; `detect` passed 36 core + 10 CLI. Targeted Rustfmt and `git diff --check` passed. No training, Oxide tests, or feature-specific `cfg_corpus` run.
+- Evidence boundary: source-derived from `Jev_laya`; its layer macro is disabled and no compiled-C++ golden/parity is available. `foveation_film` Stage-1 CPU support is tracked in §26; native GPU support and the other Phase 4 layers remain open.
+
+## 26. Foveation FiLM Stage-1 CPU reference
+
+- v0.1.009 (`51e381b8a94ae4e23ecc8054f6045a128f87fc8f`): integrated `[foveation_film]` / `[hf_film]` with strict HF-source resolution, source-order six-block parameters, deterministic initialization, NCHW CPU forward, exact backward, additive HF parameter gradients, learned-predictor/source-feature fan-in, SGD/AdamW/Muon updates, and optimizer state validation/persistence. Full/compact/f16 GPU inference, backward, and optimizer updates reject explicitly; no CUDA/Oxide or host fallback was added.
+- Verification: `MEM=3G ./tools/test_host.sh foveation_film` passed 12 core tests; `runtime` passed 237; `weights` passed 49 core + 2 CLI. Coverage includes NCHW hand math and finite differences, predictor/source finite differences, detached and additive HF gradients, multiple FiLM sources, train-buffer accumulation, initialization identity/seed reproducibility, exact source-order bytes/file size, optimizer state persistence/gating, and GPU rejection. Rustfmt check passed for new math/runtime-test files; `git diff --check` passed. No training, Oxide tests, or feature-specific `cfg_corpus` run.
+- Evidence boundary: hand-derived from `Jev_laya`; `LAYER_FOVEATION_FILM` is disabled, so no compiled-C++ golden/parity is available. C++ SGD has a different sign convention; Rust uses the established downhill-update convention and makes no update-parity claim. Stage-1 CPU only; native GPU support and GPU Muon remain Stage 2. Depth-Anything and DPT are covered in §§27 and 30; YOLO-3D and DETR remain open, so the overall roadmap is not complete.
+
+## 27. Depth-Anything Stage-1 CPU reference
+
+- v0.1.010 (`f0a3f2391655d120044bd13f6ded6ca6c655971e`): integrated the frozen `[depth_anything]` / `[depth_anything_v2]` / `[dinov2]` / `[dino]` DINOv2 ViT-S/14 encoder with strict config/shape validation, source-derived type-major weights, cfg-relative layer-only `weights=` loading, and separate sequential checkpoint behavior when no external blob is configured. CPU forward covers channel-major NCHW patchification, bicubic positional interpolation, LayerNorm, exact-erf GELU, full multi-head attention, LayerScale residuals, tap-major NCHW output, final norm, and clamp. Rust-mode backward differentiates the full forward to input; `GradMode::Cpp` preserves the source no-op. Frozen weights are inert under SGD/AdamW/Muon; full/compact/f16 GPU execution, GPU backward, and eager/deferred GPU updates reject explicitly. No GPU fallback, CUDA/Oxide path, or dependency was added.
+- Verification: `MEM=3G ./tools/test_host.sh depth_anything` passed 16 tests; `runtime` passed 244; `weights` passed 52. Coverage includes source-order array lengths, a hand-computed tiny transformer, bicubic reference, asymmetric patch and B>1 non-square/tap-major axes, input finite differences and clamp derivatives, alias/default/invalid-config tests, external and sequential weight round trips, frozen optimizer behavior, upstream convolution fan-in, Cpp-vs-analytical backward, and GPU rejection. Targeted edition-2024 Rustfmt and `git diff --check` passed. No training, Oxide, full `cfg_corpus`, or local HuggingFace dump comparison was run.
+- Evidence boundary: hand-derived from `Jev_laya`; no compiled-C++ golden/parity is claimed. Depth-Anything is Stage-1 CPU only; `[dpt_head]` is implemented in §30. `[yolo_3d]`, native GPU support, GPU Muon, and the broader v0.1–v0.3 roadmap remain open. The known full host/cfg-corpus baseline remains non-green/unverified under the memory cap.
+
+## 28. Stage-1 axis/layout audit (bounded A1 list)
+
+- v0.1.011 (`a34aef8f`): added hand-computed, named tests for NCHW batch/channel/spatial ordering in ViT patchification, per-image MoE routing/blending, EML branches, DCNv4 offset/group axes, every `laya_*` tensor family, channel slicing, deconvolution, and weighted shortcut. The source-level contracts and test names are tabulated in `STATUS.md`'s Axis audit section. No forward behavior changed.
+- Verification: `MEM=3G ./tools/test_host.sh axis_layout` passed 13 core tests; `MEM=3G ./tools/test_host.sh laya_` passed 66. Targeted edition-2024 Rustfmt checks and `git diff --check` passed.
+- Evidence boundary: hand-derived from `Jev_laya` after `git grep`/`git show`; no compiled-C++ golden/parity is claimed. This section records the initial subset; the complete A1 audit of already-ported families is in §29. Per-backlog axis requirements for remaining missing layers, native GPU work, GPU Muon, and v0.1–v0.3 remain open.
+
+## 29. Stage-1 axis/layout audit of already-ported layers
+
+- v0.1.012 (`60db7b444b8db722aa145954919a798169bb45c8`): completed A1 from `AGENTS.md` for all already-ported families: ViT, Swin, Tucker attention, MambaVision, Kimi KDA, MoE, EML, DCNv4, LAYA, channel slice, deconvolution, and shortcut. Added named hand-computed tests for Swin's batch/window/token/channel partition and cyclic-shift axes, Tucker's batch/window/token/channel isolation, MambaVision's NCHW/token/state axes, and Kimi KDA's NCHW raster scan and per-batch reset. No forward behavior changed.
+- Verification: `MEM=3G ./tools/test_host.sh axis_layout` passed 18 core tests; focused suites passed `tucker_attention` (15), `mambavision` (17), and `kimi_kda` (11). Edition-2024 Rustfmt checks for the four touched modules and `git diff --check` passed.
+- Evidence boundary: hand-derived from `Jev_laya` using `git grep`/`git show`; no compiled-C++ golden/parity is claimed. This closes only the A1 audit for already-ported layers. Every remaining missing-layer port still has its own axis/layout DoD; native GPU work, GPU Muon, and v0.1–v0.3 remain open.
+
+## 30. DPT-head Stage-1 CPU reference
+
+- v0.1.013 (`a995fe95`): added CPU `[dpt]` / `[dpt_head]` / `[depth_anything_head]` / `[neck]` parsing and inference, strict config/shape validation, the source-order 66-slot parameter arena, sequential `.weights` handling, zero initialization, NCHW tap-major forward, and analytical backward for the full Rust forward. `GradMode::Cpp` preserves the source no-op. SGD, AdamW and Muon updates/state are integrated; Muon keeps per-slot matrix views, AdamW bias fallback, and matrix decay. GPU execution/backward/updates and unsupported stream settings reject explicitly.
+- Verification: `MEM=3G ./tools/test_host.sh dpt_head` passed 18 tests; `runtime` passed 260; `weights` passed 55 core + 2 CLI; and `axis_layout` passed 19. Tests pin all 66 slot offsets and exact default file length (2,728,513 floats; 10,914,072 bytes including the 20-byte header), batched non-square NCHW/tap axes, independent hand-computed forward, finite differences for input and all nonempty parameter slots, optimizer updates/state round trips, update gates, `GradMode::Cpp`, Depth-Anything chaining, and GPU rejection. Targeted edition-2024 Rustfmt checks and `git diff --check` passed. No training, Oxide tests, or full `cfg_corpus` run.
+- Evidence boundary: hand-derived from `Jev_laya`; no compiled-C++ golden/parity is claimed. This is Stage-1 CPU support only; native GPU and GPU Muon remain Stage 2. `[yolo_3d]` is a separate scope-confirmed backlog item and the v0.1–v0.3 roadmap remains open.
+
+## 31. C++ enum boundary config regression
+
+- v0.1.014 (`fe3a554c`): added `model::tests::unused_cpp_layer_enum_names_are_not_rust_noop_layers`. It pins `[network]` as top-level metadata and ensures `[blank]`, `[empty]`, and `[silence]` are rejected instead of becoming silent identity layers. This is a parser-regression test; no runtime behavior changed.
+- Verification: `MEM=3G ./tools/test_host.sh unused_cpp_layer_enum_names_are_not_rust_noop_layers` passed 1 test; targeted edition-2024 Rustfmt and `git diff --check` passed.
+- Evidence boundary: source-derived from `Jev_laya:src-lib/darknet_enums.cpp` and `darknet_cfg.cpp`; no compiled-C++ golden/parity. The larger v0.1–v0.3 roadmap remains open.
+
+## 32. Axis-coverage gate and shared NCHW fixtures
+
+- v0.1.015 (`e848f4ef`): added `AxisPin` and `AXIS_PINS` in `model.rs` with one decision per `LayerKind` variant (64 variants plus `Unsupported`), and `LayerKind::axis_pin`, whose match is exhaustive so a new variant fails the build until classified. Added `axis_fixture.rs` with `PROBE`/`probe_shape`, `axis_value` (`n*1000+c*100+h*10+w`), `decode_axis_value`, `nchw_index`, and `axis_tensor`, replacing the per-test sentinel loops.
+- Verification: `MEM=3G ./tools/test_host.sh every_layer_kind_has_an_axis_pin_decision` passed 1 test; `model::` passed 75; `axis_fixture` passed 3; `axis_layout` passed 19 (unchanged); targeted edition-2024 Rustfmt and `git diff --check` passed.
+- Coverage baseline recorded in `tasks/rust/02_state/axis-coverage.md` (local-only): 18 variants pinned by 19 tests, 41 C++-backed variants open, 5 Rust-only extensions, 3 variants not ported. No layer math changed, so no behavior claim is made beyond the new checks.
+- Evidence boundary: enum audited against `Jev_laya:src-lib/darknet_enums.hpp`; `Logistic` is referenced on `raptor`/`raptor-dev` and `Regression` on `fog`, neither on `Jev_laya`. No compiled-C++ golden/parity.
+
+## 33. Convolutional axis pins and the dilation contract
+
+- v0.1.016 (`051021fe`): added `model::tests::convolutional_axis_layout_pins_dilated_extent_and_groups` (C++ extent for dilated/strided non-square input, `batch=2`, and the `[out][in/groups]` weight cardinality for `filters=6, groups=2, C=4`) and `runtime::tests::convolutional_axis_layout_keeps_nchw_and_group_partitions` (channel-swapping 1x1 weights, then `groups=2` partitioning, both over `batch=2`).
+- Verification: `MEM=3G ./tools/test_host.sh convolutional_axis_layout` passed 5; `axis_layout` passed 21 (was 19); `runtime::` passed 261. Full CPU baseline `cargo test -p lightnet-core --lib -j 2` passed 897 and `-p lightnet-cli` 28; GPU baseline `MEM=3G ./tools/test_oxide.sh --test oxide_parity` passed 11 and `oxide_runtime_chain` 24. Targeted edition-2024 Rustfmt and `git diff --check` passed.
+- Finding F1 retracted: `conv_dim` must keep ignoring dilation because `Jev_laya:src-lib/convolutional_layer.cpp:317` does; applying `dilation*(size-1)` shrank the extent and broke `cfg/resnet152_trident.cfg` at route #244 (`16x16` vs `38x38`). `conv_dim` now documents that, and the pin fails if the term returns. The cuDNN/oxide `pad*dilation` difference is recorded as a source-level inconsistency, not a Rust defect.
+- Evidence boundary: hand-derived from `Jev_laya`; no compiled-C++ golden and no parity claim.
+
+## 34. GPU convolution extent parity
+
+- v0.1.017 (`263fa448`): fixed `Geom::new` in the cuda-oxide conv driver. It computed the textbook dilated span `(in + 2*pad - (dil*(k-1)+1))/stride + 1`, while `lightnet-core`'s `conv_dim` and C++ `convolutional_out_width` compute `(in + 2*pad - k)/stride + 1`: dilation changes the sampling offsets, not the extent. The device map was smaller than the caller requested, so `expect_shape` rejected every dilated convolution. f32 and f16 now use the CPU extent; extent validation uses `k`.
+- Verification: `oxide_conv_parity` passed 13 (including `dilation2_pad2`, `fd_dil2`), `oxide_cfg_shapes` 13 (6 dilated geometries, Direct and Gemm, 12 runs, 0 failures), `oxide_gemm_mma` 5, `oxide_half` 13. The `oxide_cfg_shapes` contract was inverted: raw `pad` must reproduce the cfg dimensions and parity, while a `pad*dilation` call with cfg dimensions must be rejected.
+- Evidence boundary: hand-derived from `Jev_laya` and `lightnet-core`; no compiled-C++ golden/parity. YOLO heads are pass-through on device (the loss/decode runs on the host), so this was the only conv-side parity gap.
+
+## 35. Annotation GUI (`lightnet-gui`)
+
+- v0.1.018 (`0ca7613e`): added the opt-in `lightnet-gui` crate (egui/eframe 0.32.3, `glow`), the first slice of `gui_plan.md`. `annotation.rs` holds normalized centre/size marks with a 10-decimal YOLO text round trip and click hit testing; `project.rs` scans a flat image folder, reads class names from the first `*.names` or `classes.txt`, and loads/saves sidecars; `main.rs` is the window with folder open, class and image lists, fit-to-window canvas, drag-to-create, click-to-select, rubber band, and per-image undo.
+- Semantics: malformed label lines are errors, so a partial read cannot overwrite a file; a degenerate drag creates nothing; an empty annotation deletes the sidecar instead of writing a blank one.
+- Verification: `cargo build -p lightnet-gui --offline` and `cargo test -p lightnet-gui --offline` pass with 7 tests.
+- Evidence boundary: builds offline against the locally cached eframe. Not implemented: DarkMark `.json` sidecars, class remap, filters/sort, neighbour copy/interpolation/homography, alternate views, launcher, and the `detect-server` prediction overlay.
+
+## 36. Annotation GUI plan implementation
+
+- v0.1.019 (`fcd23bbd`): split the annotator into `lightnet-gui-project` (pure logic), `lightnet-gui-engine` (child-process inference) and `lightnet-gui` (eframe shell), and implemented the plan's milestones:
+  - `annotation.rs`: DarkMark detector JSON (`G3`-`G7`) parsed through `serde_json::Value` so unknown sidecar and mark fields survive; string and integer `annotation_mode`; exactly four points (`D4`); `G4`/`G5` save rules; `.txt` with ten decimals.
+  - `project.rs`: recursive `G2` scan with chart/mask/cache exclusions, `<name>.names`/`.data` preference (`D5`), detector-mode validation, mark index counting `completely_empty` as one.
+  - `filter.rs`, `nav.rs`: tri-state/regex/class/age filters, stable sort, clamped navigation, unmarked walking that stops on the boundary image.
+  - `undo.rs`, `edit.rs`: capped undo/redo and the `G9`-`G16` edit model (smallest-area hit test, corner re-drag with `D8` restore, clamped creation, additive digit classes with refusal, Tab cycling including predictions, accept rules, threshold clamp, nudge/scale/clear/empty/copy).
+  - `actions.rs`, `create.rs`, `classes.rs`: interpolation, clipboard JSON, edge snapping, homography; `G1` project creation; dry-run class remap with backup and atomic rename.
+  - `lightnet-gui-engine`: `DetectWorker` JSON-lines protocol with a 30 s timeout, child-exit and malformed-reply errors.
+  - `lightnet-cli detect-server`: one request per stdin line, normalized boxes, error objects that keep the server alive, CPU and feature-gated oxide backends.
+  - `lightnet-gui`: launcher with persisted recents, new-project dialog, image cache, zoom/pan canvas, six view modes, filters, class editor with dry run, prediction overlay.
+- Verification: `cargo test -p lightnet-gui-project` 36, `-p lightnet-gui-engine` 4, `-p lightnet-cli` 28; offline build of the three GUI crates is warning-free; `cargo metadata --locked` reports 33 members.
+- v0.1.020 (`2640b902`): the overlay's model loader resolves `LIGHTNET_RS_BIN` before the current executable, so `cargo run -p lightnet-gui` can find `lightnet-rs`.
+- Evidence boundary: DarkMark compatibility is derived from the `G`/`D` tables, not verified against a running DarkMark (`T1.5` still open). Not wired: add/delete classes from the dialog, delete-image/undo-delete, heatmaps, jump, screenshots, train runner.
+
+## 37. DarkMark hotkey parity and model discovery
+
+- v0.1.021 (`8c536b6d`): the key map is transcribed from `DarkMark/src-darkmark/DMContent.cpp::keyPressed()` (`:1013-2050`) rather than the `G16` summary. Corrections: `r` random sort and `R` alphabetical; `,`/`.` apply `scale_all_marks(+-0.01)`, a normalized delta, not a box-relative factor; `o` is mass-delete mode; `P` homography; `` ` `` merge; `l` labels on/off/auto; `b`/`B` bold/shade; `d` snap-all; `D` snapping toggle; `h`/`H` heatmaps; `j` jump; `s`/`S` screenshots and `F12` window screenshot; `t`, `[`/`]`, `(`/`)` tiling; `y`/`Y` copy neighbour; `Shift+U` undo-delete; `Shift+Delete` delete image; `Escape` cancel. `Tab` skips invisible marks and records the recent class/size; `A` accepts only the selected prediction.
+- `Project` now discovers the project's model files (`G1`): `<name>.cfg` else the first `*.cfg`, and `<name>_best.weights` / `<name>_final.weights` / `<name>.weights` else the first `*.weights`. The GUI prefills the overlay paths from them.
+- Weight parsing remains in `lightnet-rs`: `load_weights_file` for inference and `weights-inspect` for a header report. The GUI process never parses `.weights`; it starts `detect-server`, which loads them and reports mismatches as errors.
+- Verification: `lightnet-gui-project` 38 tests, `lightnet-gui-engine` 4, offline builds of the GUI and CLI.
+- Evidence boundary: mapped actions for features not yet built (mass-delete, homography, merge, heatmaps, screenshots, tiling, jump, delete-image) report "mapped but not implemented" instead of silently doing nothing. Parity is with the DarkMark source, not a running DarkMark.
+
+## 38. YOLO-3D configuration preparation (not a layer port)
+
+- v0.1.024 (`4506e46e`): added `model/yolo_3d_config.rs`, re-exported through `model.rs`, with `Yolo3dSpec`, `Yolo3dGeometrySpec`, `Yolo3dVertexLoss`, `from_section`, checked anchor-entry arithmetic and identity-shape validation. Defaults/keys were checked directly against `depth_3d` at `9c9e0b4b5e0836330a70a0667fd9e161bd1aac1a`, `src-lib/darknet_cfg.cpp:2556-2697` and `yolo_3d.cpp:1275-1394`.
+- Verification: test-first compile failed with E0432/E0425 for the missing types; final `MEM=3G ./tools/test_host.sh yolo_3d_cfg` passed **12 core tests**, and `MEM=3G ./tools/test_host.sh model::` passed **88 core tests**. Both used user systemd `MemoryHigh=3G` scopes and `-j 2`; CLI/integration targets compiled but matched zero tests. Targeted edition-2024 Rustfmt checks and `git diff --check` passed. No training, Oxide, corpus or full-host run.
+- Scope audit: `defaults_match_source` and `retains_projected_and_loader_overrides` pin defaults/overrides; `aliases_follow_existing_section_normalization` covers all four aliases and the existing Rust case-folding convention; `projected_channels_and_identity_shape` pins `A*(5+C+3*K)` with B=2 and a 3x5 grid, but is **not** an A2 numeric axis/decode test. Unknown-key, invalid-value, nonfinite, array, overflow and staged-feature tests cover explicit failure boundaries. `truth_intrinsics_and_projected_options_are_not_staged_out` proves focal/winding/OKS config is accepted; it does not prove truth encoding or losses.
+- Deliberate strictness: finite/range checks, unique masks, exact `2*num` anchors and three edge weights, and bounded source-int storage reject inputs C++ may ignore or default. Zero loss normalizers still disable terms. `map_file`, counters and loader/NMS options are retained metadata only; class-map loading and class-multiplier conversion await network integration.
+- **Still open:** `LayerKind`/network parse and shape dispatch, mixed-head/depth-reference validation, axis-pin registration, labels/truth encoding, forward/backward, loss/decode/evaluator, checkpoint/optimizer proof and CLI/GPU guards. Network construction still rejects this layer (pinned by `preparation_does_not_enable_incomplete_runtime`). This is only the helper portion of plan Step 1; that step and the layer DoD remain incomplete. Depth/metric nondefault config is explicitly rejected pending the second CPU increment.
+- Evidence boundary: hand-derived from source, no compiled-C++ golden. GPU status: none. DSConv multi-template, remaining CPU/axis work, all Stage-2 native GPU/GPU Muon and Stage-3 sparse MoE requirements remain open. The known full-host/corpus baseline remains non-green/unverified.
+
+## 39. Cuboid labels and deterministic truth helpers
+
+- v0.1.025 (`8f6178ed`): added `cuboid_labels.rs` and `cuboid_labels/tests.rs`, with public `lib.rs` re-exports. The pure and mixed parsers/loaders preserve source row precedence, clamped coordinates, unknown/absent visibility and source track IDs. Truth helpers encode the 11-float prefix, crop/flip intrinsics, K triplets, padding and mixed ownership, with explicit original/network image sizes. This advances plan Step 2 independently; Step 1 network integration remains open and the existing unsupported-layer regression remains green.
+- Source checked directly: `depth_3d` at `9c9e0b4b`, `data.cpp:500-1250,1335-1505` and `utils.cpp:1292-1303` (64-bit Linux DJB2 track hash). Pure files use a zero-based object ordinal; mixed files use one-based ordinals. `MixedLabel::Box2d` includes `track_id` alongside the existing `YoloLabel`, rather than discarding source metadata as the plan sketch's bare payload would. `Yolo3dImageMeta` additionally takes network W/H for the source one-pixel hull filter.
+- Verification: initial test-first `MEM=3G ./tools/test_host.sh yolo_3d_label` failed to compile with missing-type/function E0422/E0425/E0433. Final `MEM=3G ./tools/test_host.sh yolo_3d` passed **31 core tests** (19 new label/truth + 12 config); `MEM=3G ./tools/test_host.sh label` passed **43 core tests**. Both used `MemoryHigh=3G` systemd scopes, `-j 2`; CLI/integration targets compiled but matched zero tests. Targeted edition-2024 Rustfmt checks and `git diff --check` passed. No training, Oxide, corpus or full-host run.
+
+Scoped prompt-to-artifact audit (test names below are in `cuboid_labels/tests.rs` and start with `yolo_3d_`):
+
+| Requirement | Concrete evidence |
+|---|---|
+| Pure/mixed grammar, class conversion and 2D ambiguity | `label_row_parses_source_layout`, `mixed_label_ambiguous_row_precedence_matches_source` |
+| Hull visibility, coordinate clamps, finite/range errors | `label_unknown_visibility_is_not_absent`, `label_clamps_coordinates_but_rejects_nonfinite_and_malformed_rows` |
+| File I/O/errors and source path/ordinal tracks | `label_file_loaders_preserve_grammar_and_report_io_errors`, `label_source_track_hash_and_pure_mixed_counter_offsets` |
+| Prefix, vertex offsets, padding, independent batches | `truth_prefix_offsets_padding_and_independent_batches`, `truth_each_image_uses_its_own_crop_intrinsics_and_flip` |
+| Focal/crop math and flip without corner permutation | `truth_intrinsics_hand_computed_and_crop`, `truth_flip_mirrors_px_and_negates_geo_without_reordering_vertices` |
+| Clip all corners, transform hull separately | `truth_clipped_absent_corner_zeroes_intrinsics_but_keeps_points`, `truth_cropped_hull_does_not_rebuild_from_clamped_vertices` |
+| Mosaic disables projected fields and mixed flags | `truth_mosaic_drops_fields_after_class`, `truth_mixed_mosaic_also_drops_ownership_like_source` |
+| Mixed ownership and explicit pure-mode 2D rejection | `truth_mixed_ownership_routes_rows_to_heads` (encoding only, not loss routing) |
+| Deterministic cap-before-filter, missing focal, 2D sentinel | `truth_deterministic_cap_before_tiny_filter_and_missing_focal`, `truth_two_dimensional_zero_center_is_source_sentinel` |
+| Public-input/storage overflow and bounds errors | `truth_invalid_public_inputs_are_errors_not_panics`, `truth_inconsistent_public_storage_is_an_error` |
+
+- Boundaries: deterministic caller order replaces source random shuffle; cap is applied before tiny-hull filtering without refilling. Nonfinite/malformed tokens, invalid public values and non-UTF-8 file identities error explicitly. Mosaic callers provide already positioned geometry; no tile sampler, clipping-policy implementation or image augmentation loader is added. Crucially, C++ `blend_truth_mosaic` copies only entries 0–4 and drops the trailing mixed flags too, so mixed mosaic records carry flag zero and are not assigned to either head; this is not a claim of useful mixed-mosaic training.
+- **Not complete:** no network enum/dispatch, mixed-head build validation, output-axis/decode pin, runtime/backward/loss integration, evaluator, optimizer/checkpoint proof, CLI integration or depth/metric consumption. This suite verifies label/truth math, not end-to-end training or any compiled-C++ comparison. Hand-derived from source, no compiled-C++ golden; GPU status none. DSConv variants, remaining CPU/axis requirements, Stage-2 native GPU/GPU Muon and Stage-3 sparse MoE remain open. No overall parity or green full-host claim.
+
+## 40. YOLO-3D raw CPU runtime and fail-closed consumers
+
+- v0.1.026 (`755e5145`): added `LayerKind::Yolo3d`, alias dispatch, identity-shape re-inference, shared classical-YOLO/cuboid class validation and shared cuboid K validation in `model.rs`. `runtime.rs` captures raw `Yolo3dHeadOutput` separately from 2D heads, passes supplied seeds upstream with the exact identity derivative, and keeps head parameters/train buffers/Adam/Muon state empty. `lib.rs` exports the typed output. CPU compact inference uses the full CPU path; all GPU paths remain rejected by the existing Stage-1 guard.
+- `train.rs`, `detect.rs`, `evaluate.rs` and CLI consumers now reject cuboid networks before legacy loss/decode/evaluation can silently discard their heads, including empty caller-supplied head lists. CLI guards cover `detector train`, `detector map`, `detect-image`, and `detect-server`; `detector test` is still an unknown subcommand globally, not a new supported cuboid command. ONNX still rejects through its existing unsupported arm; no ONNX/CUDA source change.
+- Source read directly at pinned `depth_3d=9c9e0b4b5e0836330a70a0667fd9e161bd1aac1a`: `darknet_cfg.cpp:1603-1687` for shared class/K checks and `yolo_3d.cpp:1501-1542,1667-1672` for activation storage/backward. Rust deliberately keeps raw logits per plan D3, unlike C++ in-place activation; activations must be applied inside future loss/decode math. This is not C++ forward-output parity.
+- Test-first: network dispatch tests failed with missing `LayerKind::Yolo3d` before implementation. The required `MEM=3G ./tools/test_host.sh does_not_exist` compile inventory then passed with zero tests: wildcard arms meant the enum alone did not force further integration. Runtime tests later caught unwanted empty Muon state on the weightless head; CPU Adam/Muon now explicitly skip this kind. Final tests prove both head states remain None after updates and DNOPT round trips.
+
+Scoped prompt-to-artifact audit:
+
+| Contract | Actual evidence |
+|---|---|
+| All four aliases, weightless identity shape | `model/yolo_3d_config.rs::yolo_3d_cfg_network_aliases_build_weightless_identity_heads`; replaces the old preparatory unsupported-network test |
+| Shared classes and K, resize/batch/route geometry, honest open axis decision | `yolo_3d_cfg_mixed_network_requires_shared_classes_and_keypoints`, `yolo_3d_cfg_shape_rebuild_preserves_head_and_route_geometry`; exhaustive axis gate now has 66 rows (65 kinds + Unsupported), with 19 pinned/41 open/6 Rust-only-or-sentinel; `axis-coverage.md` updated |
+| Typed raw forward collection, full/training/compact CPU, no head params | `runtime/tests/yolo_3d_runtime_tests.rs::yolo_3d_forward_is_raw_pass_through_and_records_separate_head` (B=2, 3x5 grid, A=2, C=2, K=8) |
+| Exact raw identity backward and preceding conv derivative | `yolo_3d_backward_is_identity_and_reaches_upstream_convolution`: central FD on three conv weights of a raw-output dot product, not a cuboid loss |
+| Mixed head vectors remain disjoint | `yolo_3d_mixed_forward_keeps_the_two_head_collections_disjoint`; this is not mixed loss routing |
+| No checkpoint block or optimizer tensors in head | `yolo_3d_weights_round_trip_exact_length_with_upstream_conv`: 380 bytes (20 + 4*90), trailing_bytes=0; `yolo_3d_seeded_sgd_adam_and_muon_update_only_upstream_weights`: upstream updates, None head buffers/states and DNOPT round trips, using supplied seeds only |
+| Existing 2D/OBB/modern decoders, losses and validation datasets reject graph | `yolo_3d_existing_2d_and_obb_apis_reject_even_empty_head_lists` covers nine entry points without relying on the passed head list |
+| CPU-only boundary | `yolo_3d_rejects_gpu_execution_backward_and_updates` covers full/compact GPU, immediate/deferred update and backward; f16 is checked via the shared preflight helper, not real device execution. Source inspection confirms the f16 entry calls that helper |
+| Constructor and unsupported export | `yolo_3d_from_heads_constructor_has_no_cuboid_outputs`, `yolo_3d_onnx_export_still_rejects`; all ForwardResult constructors compile with the new field |
+| CLI rejection before asset loading/training | `lightnet-cli::tests::yolo_3d_cli_rejects_train_map_and_detect_server_before_loading_assets`; malformed data and missing weights prove those three paths reject before use. The detect-image guard is source-inspected, not exercised through a CLI process |
+
+Verification commands ran serially under `MemoryHigh=3G` systemd scopes (scripts `-j 2`):
+
+| `MEM=3G ./tools/test_host.sh <filter>` | Core passed | CLI passed |
+|---|---|---|
+| `yolo_3d` | 42 | 1 |
+| `model::` | 90 | 0 |
+| `runtime::` | 270 | 0 |
+| `yolo` | 106 | 2 |
+| `map` | 27 | 8 |
+| `weights` | 57 | 2 |
+| `axis_layout` | 21 | 0 |
+| `dpt_head` | 18 | 0 |
+| `onnx` | 12 | 1 |
+
+- `systemd-run --user --scope -p MemoryHigh=3G cargo check -p lightnet-cli --features oxide -j 4` passed. Targeted edition-2024 Rustfmt and `git diff --check` passed. No actual training runs, Oxide tests, corpus or unfiltered host suite; existing warnings remain. Temporary weights/sidecars used RAII cleanup; test logs/source snapshots were removed after recording evidence.
+- **Remaining layer DoD:** projected activations/math, assignments, losses and exact loss derivatives/Cpp-mode deltas; standalone and mixed loss APIs consuming the label helpers; decode and its A2 anchor/entry/vertex pin; projected evaluator; depth/metric consumption and references; end-to-end loss-to-conv/optimizer tests. Parsed map/counter metadata still needs consumption by these APIs. Supplied-seed optimizer tests are not a substitute for full training-loss integration. The current axis decision stays Open; `axis_layout` remains 21, not a new cuboid pin. No compiled-C++ golden exists. Hand-derived from source, no compiled-C++ golden; GPU status none. Stage 1, all-native GPU/GPU Muon Stage 2, and sparse MoE Stage 3 remain incomplete; no overall parity or green full-host claim.
+
+## 41. Native f32 LAYA marker gather
+
+- v0.2.001 (`f56342ca`): operator explicitly requested GPU priority before CPU completion. Added native Oxide f32 forward/backward for `[laya_marker_gather]`, removed full/compact forward's per-operator downloads/CPU math/uploads, and removed this layer from the whole-network CPU-backward fallback gate. No weights, optimizer tensors or config changes. Other GPU layers/GPU Muon and all remaining CPU requirements are still open; parked YOLO-3D activation work is uncommitted and not part of this release.
+- Source inspected directly: `Jev_laya@4af013d2c59d1db54247aeff21f43e1d8d295cda:src-lib/laya_marker_gather_layer.cpp:111-182`. Features are `[B,H,1,T]`; marker channel `2*j`, sequence column zero, chooses each option's position. Masks/extra channels/other sequence columns are ignored. Backward adds duplicate-option gradients in ascending option order to A only, even when A/B alias. Native threads own individual outputs/input gradients, so no atomics/races. Half-away rounding uses f64 before integer conversion; clamp-before-cast handles extreme values safely. NaN -> 0 and infinities -> endpoints preserve the Rust CPU reference's defensive extension, not a claim about C++ `lround` on invalid values.
+
+Scoped requirement-to-artifact audit:
+
+| Requirement | Actual artifacts and verification |
+|---|---|
+| Checked backend contract/default reference | `lightnet-cuda/src/host_ops/marker_gather.rs::Layout`, exposed via `host_ops.rs`; two `F32TensorOpsBackend` methods in `lightnet-cuda/src/lib.rs`. The generic default remains a host reference for non-Oxide/FakeBackend, consistent with existing ops; Oxide overrides both |
+| Native, device-resident f32 operations | `lightnet-cuda-oxide/src/kernels/layers_extra.rs::{marker_position,marker_gather,marker_gather_backward}` and overrides in `src/lib.rs`. Inspection confirms no operator download/upload or host data math; `mixed.rs::f32v` borrows f32 or widens on device. Ordinary full-runtime debug/output downloads remain |
+| Per-sample layout, duplicate/clamped/nonfinite indices, ignored metadata, exact adjoint | `oxide_marker_gather.rs::marker_gather_native_forward_backward_and_raw_input_fd`: B=2, H=3, T=7, K=5, CB=12; tile lengths 32/128/256, ragged lengths, actual GPU forward FD at eight input elements with fixed metadata, exact independent reference output/gradient comparisons |
+| Deterministic reduction and subtle rounding | `marker_gather_native_duplicate_reduction_has_fixed_option_order`: repeated `[1e20,1,-1e20,1]` sum gives 1; `marker_gather_native_rounds_adjacent_half_values_before_clamping`: adjacent f32 values below/at/above 0.5 and 1.5, extremes and NaN/infinities |
+| Errors before unsafe device reads | `marker_gather_native_invalid_layouts_and_storage_error_before_launch`: bad rank/height/batch/T/channel count, zero options/dimensions, checked-product overflow, short feature/marker/gradient storage |
+| Correct runtime routing and no forced CPU backward | `runtime.rs` full/compact/backward thin arms and fallback-gate removal; `runtime/tests/marker_gather_gpu_tests.rs::marker_gather_gpu_uses_device_backward_and_accumulates_only_feature_source` asserts gate false, A/B alias handling plus a direct source seed, full/compact agreement, and upstream update agreement on FakeBackend |
+| Real-device runtime chain | `oxide_runtime_chain.rs::marker_gather_native_full_compact_backward_and_upstream_sgd_match_cpu`: B=2, two upstream convs, distinct A/B references, full/compact output parity, backward and both conv weight/bias gradient updates through SGD |
+
+Test-first evidence: direct Oxide tests initially failed compilation on missing backend methods. The runtime test then failed specifically because marker gather forced CPU backward; it passed after native dispatch integration. Final serial, `MemoryHigh=3G`, script `-j 2` verification on NVIDIA GeForce RTX 4060 Laptop GPU:
+
+| Command | Result |
+|---|---|
+| `MEM=3G ./tools/test_oxide.sh --test oxide_marker_gather` | 4 passed |
+| `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- marker_gather` | 1 passed, 24 filtered |
+| `MEM=3G ./tools/test_oxide.sh --test oxide_layers_extra` | 24 passed |
+| `MEM=3G ./tools/test_host.sh marker_gather` | 12 core passed; 0 CLI matched |
+| `MEM=3G ./tools/test_host.sh runtime::` | 271 core passed; 0 CLI matched |
+
+Targeted edition-2024 Rustfmt and diff checks passed. Tests ran with parked CPU activation code still in the working tree; it is not selected by these filters and adds no GPU dependency. Temporary GPU logs/source snapshot removed after recording results; no weights/sidecars were created by these new tests. No actual training run, benchmark/speedup measurement, unfiltered host/corpus or full Oxide-suite run. GPU status: **native f32 forward/backward/full/compact; f16 remains explicitly unsupported and was not device-tested**. New optimizer evidence is upstream SGD only; this weightless layer has no Muon/Adam parameter blocks, and GPU Muon remains open. Native GPU vs Rust CPU agreement only. Hand-derived from source, no compiled-C++ golden. No overall Stage-1/2/3 completion claim.
+
+## 42. Native f16 marker-gather inference
+
+- v0.2.002 (`32822894`): extended the source-backed marker-gather routing contract to native half-storage inference. `F16TensorOpsBackend::marker_gather_f16` has a numeric generic-backend reference default; the Oxide trait override delegates to the native method in `lightnet-cuda-oxide/src/half.rs`, with checked shared layout and actual buffer lengths before allocation/launch. `kernels/layers_extra.rs::marker_gather_f16` copies feature u16 payloads exactly and widens only marker metadata on device, using the existing rounded/clamped position helper. No feature floating-point conversion or operator host round trip.
+- `runtime.rs` permits marker gather in the f16 preflight and replaces its rejection arm with native source dispatch using the existing compact lifetime/use-count mechanism. Existing relative-source resolution and A/B alias handling are preserved. Only `forward_compact_f16` exists for this inference API: no new full-state f16 forward or f16 training/backward API is claimed. F32 training/backward remains from v0.2.001; no parameter, optimizer, checkpoint, config, AMP-global setting or dependency change.
+
+Scoped requirement-to-artifact audit (`oxide_marker_gather_f16.rs`):
+
+| Requirement | Actual test/artifact |
+|---|---|
+| Half bits copied exactly, independent batches/channels, ignored metadata | `marker_gather_f16_native_preserves_feature_bits_and_rounds_half_metadata`: B=2, H=3, T=9, K=7, CB=16; independent IEEE-half CPU decoder, three tile sizes and ragged lengths. An explicit assertion requires every feature edge-case to be selected: quiet/signaling NaN payloads, negative zero, smallest/largest subnormal, smallest normal and infinities. Poison masks/extra columns must not be read |
+| Round after half quantization, not before | `marker_gather_f16_native_uses_quantized_not_original_f32_positions`: f32 immediately below .5/1.5 rounds to half .5/1.5 and therefore selects columns 1/2. Direct bit-input test also covers adjacent half values, duplicate, negative, out-of-range, subnormal and NaN/infinite marker positions |
+| Reject invalid dimensions/storage before unsafe launch | `marker_gather_f16_native_rejects_bad_layouts_and_short_storage`: zero/rank/height/batch/T/channel/overflow cases and truncated feature/marker buffers |
+| Runtime preflight, compact lifetimes, positive/negative references, aliased sources | `marker_gather_f16_runtime_handles_nonprevious_sources_and_aliased_metadata`: two identity convs, B=2, hidden=16, T=5, K=4; sources `0,1` and `-2,-2`; exact CPU gather reference on quantized input. Nonprevious feature source must survive until gather |
+| Native dispatch rather than generic host default | UFCS trait calls in direct tests plus source inspection of the trait override, native allocation/launch and u16 kernel; runtime calls the same trait method |
+
+Tests were written before the new trait/operator existed and failed compilation; the three direct native tests passed before the runtime rejection was replaced. Final serial RTX 4060 Laptop runs, all through 3G systemd scopes with script `-j 2`:
+
+- `MEM=3G ./tools/test_oxide.sh --test oxide_marker_gather_f16`: **4 passed**.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16`: **6 passed**, including existing real-cfg inference and unsupported-mode checks.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_marker_gather`: **4 passed** (f32 forward/backward/FD regressions).
+- `MEM=3G ./tools/test_host.sh marker_gather`: **12 core passed**, 0 CLI matched.
+
+Targeted edition-2024 Rustfmt/diff checks passed; only the newly inserted half.rs blocks were formatted/checked to avoid rewriting that file's existing style. Temporary logs/formatter snippet removed after recording evidence. Parked CPU activation code remained in the working tree but was not selected or committed. No training run, benchmark, full-host/corpus/full-Oxide run, new optimizer proof or compiled-C++ golden. GPU status for marker gather: native f32 full/compact forward/backward and native f16 compact inference. Other layers, GPU Muon, remaining CPU/axis work and sparse MoE remain open. Half storage is a Rust backend extension of the inspected C++ routing math; hand-derived from source, no compiled-C++ golden. Next bounded GPU work is native LAYA act-head, starting with its exact detached-feature and frozen/update contract audit.
+
+## 43. Native detached act-head feature primitive
+
+- v0.2.003 (`3de7c327`): added the standalone `F32TensorOpsBackend::laya_act_features_f32` operation. `lightnet-cuda/src/host_ops/laya_act.rs` owns checked layout and the generic reference, exposed via `host_ops.rs`; Oxide's override in `src/lib.rs` validates actual storage and launches `kernels/layers_extra.rs::laya_act_features`. All input data/reductions stay on device; one thread owns each sample's `[H+4]` row with serial option reductions and no scratch allocation/atomics. `f32v` only borrows or widens on device. This operation is **not yet wired into act-head runtime** and is not the MLP/backward/update port.
+- Source audit: pinned `Jev_laya=4af013d2c59d1db54247aeff21f43e1d8d295cda`, retrieved executable `src-lib/laya_act_head_layer.cpp` with git show. `ah_features` (:29–78) uses CLS column zero plus `[top1, top1-top2, entropy/log(max(valid_count,2)), max(valid_count,2)/255]`; masks use odd channel `2*j+1`, column zero, strict `>0.5`. Masked logits become finite `-1e4`, not excluded/-infinity; softmax includes all K slots, with entropy log floor `1e-9`, no extra temperature or entropy/count clamp. Head/marker sequence lengths are independent.
+- **Newly confirmed full-port gap:** C++ `ah_backward_sample` (:80–122), `backward_laya_act_head_layer` and `update_laya_act_head_layer` (:309–336) accumulate/update all four parameter blocks. Its GPU backward (:344–383) itself uses host math, which is not the native-GPU target. Rust's pure `act_head_backward` returns four parameter gradients, but `runtime.rs::backward_laya_act_head` forwards only dcls; accumulated ActHead params are ignored and no train buffers are allocated. The module's frozen-weight description is therefore not a full source-training contract. A question about including the training fix was asked but not answered; automatic continuation is not treated as approval to change existing frozen behavior. This release changes no training semantics and advances an independent GPU primitive. Full training parity remains unachieved.
+- The existing native `F32ActivationKind::Gelu` is tanh-approximate; CPU act-head uses exact erf-GELU via `laya_scorer::{gelu_erf,gelu_erf_grad}`. A native exact-erf primitive is an independent remaining prerequisite; do not substitute the tanh approximation.
+
+Scoped requirement-to-artifact audit (`oxide_laya_act_features.rs`):
+
+| Requirement | Actual evidence |
+|---|---|
+| Checked geometry, complete storage, safe device output ownership | Shared Layout requires `[B,H,1,T_head]`, `[B,1,1,K>=2]`, `[B,CB>=2K,1,T_marker]`, positive dimensions, shared B and bounded checked products; Oxide override checks all three buffer lengths before device views/launch |
+| Source math, batches/channels/sequence axes, threshold and ignored columns | `laya_act_features_native_matches_source_hand_math_and_cpu_batches`: B=3, H=3, K=4, CB=10, T_head=5, T_marker=3; three tile sizes, poisoned non-CLS/even-mask/unused columns, strict .5 vs .5001 masks, independent CPU helper/reference comparisons |
+| Hand math beyond reference-only parity | Same test explicitly checks (.75,.25) top/gap/entropy/count, all-masked uniform K=4 with normalized entropy **2**, and tied masked logits outranking a valid -10001 score |
+| Rust defensive nonfinite behavior, uncapped count feature | `laya_act_features_native_preserves_rust_nonfinite_policy_and_large_k`: NaN/+Inf/-Inf logits compared by finite values/NaN classification to Rust CPU, not C++ -Ofast behavior; direct K=257 operation proves count/255 can exceed one. Generic host reference also compared to the CPU helper |
+| Invalid input rejection | `laya_act_features_native_rejects_bad_layout_and_truncated_storage`: bad rank/height/scorer channels/K/marker channels/batch, zero size, overflow and three short-buffer cases |
+| No premature native-layer claim | Runtime dispatch/fallback, weights and optimizer membership were not modified. No full-network native act-head execution, native MLP, backward, CLS-adjoint scatter or parameter-update proof is claimed |
+
+Test-first: direct tests failed compilation on the missing backend method before implementation. Final serial RTX 4060 Laptop runs, all via 3G scopes and script `-j 2`:
+
+- `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_features`: **3 passed**.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_layers_extra`: **24 passed**.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_marker_gather_f16`: **4 passed**.
+- `MEM=3G ./tools/test_host.sh laya_act_head`: **9 core passed**, 0 CLI matched.
+
+Targeted edition-2024 Rustfmt/diff checks passed. Temporary source/log snapshots removed after recording evidence; no weights or sidecars created. Parked uncommitted CPU math remained unselected and outside this release. GPU status: feature primitive native f32; **act-head layer remains host fallback**, f16 unsupported. No new derivative/optimizer/checkpoint proof, training run, benchmark, full-host/corpus/full-Oxide run or compiled-C++ golden. Other GPU layers/GPU Muon, CPU/config/axis gaps and sparse MoE remain open. Hand-derived from source, no compiled-C++ golden.
+
+## 44. Native exact-erf GELU primitives
+
+- v0.2.004 (`eec5eab0`): added dedicated `F32TensorOpsBackend::{gelu_erf_f32,gelu_erf_backward_f32}`, without changing `F32ActivationKind::Gelu`, activation IDs, cfg behavior or existing AMP/f16 dispatch. `lightnet-cuda/src/host_ops/gelu_erf.rs` supplies checked bounded shape products and exact-erf host reference; `host_ops.rs` exposes it and the CUDA contract crate enables `float_erf`, matching the already pinned-nightly core reference. No Cargo/dependency changes.
+- Oxide's overrides in `src/lib.rs` validate positive nonempty declared shapes, actual input/seed metadata and lengths before allocation/launch. `src/kernels/activations.rs` adds dedicated elementwise forward/backward kernels and scalar helpers: y=.5*x*(1+erf(x/sqrt(2))); derivative=normal CDF+x*normal PDF; backward multiplies the supplied seed. Arrays stay on device, with one thread/output and no host math/downloads in the override. Generic trait defaults remain host references for other backends.
+- CPU oracle: `laya_scorer::{gelu_erf,gelu_erf_grad}`; source context is the pinned C++ act-head exact-erf function recorded in §43. The custom collector intentionally rejects Rust's std erf shim, so the GPU uses the supported `#[device] extern "C"` libdevice `__nv_erff` route instead. Inspected generated linked LLVM and confirmed an internal **defined** `__nv_erff` body, not just an unresolved declaration; real-device execution passed. No compiler/bridge changes, approximation or host fallback was added. "Exact-erf" identifies the source variant, not bit-exact CPU/libdevice agreement.
+
+Scoped requirement-to-artifact audit (`oxide_gelu_erf.rs`):
+
+| Requirement | Actual evidence |
+|---|---|
+| Source variant and seeded analytic derivative | `gelu_erf_native_forward_backward_matches_hand_values_and_cpu_not_tanh`: hand y at -1/0/1/2 and derivative at +/-1, full CPU and new host-helper comparisons, nonunit/zero/signed seeds, B=2/C=2/H=3/W=5 and tile lengths 32/128/256 with ragged tails. Existing native tanh GELU stays measurably distinct at x=1 |
+| Differentiate actual device forward, not only a CPU surrogate | `gelu_erf_native_backward_matches_actual_gpu_forward_central_differences`: ten selected coordinates spanning both batches, actual GPU forward dot-product scores, epsilon .001 and absolute derivative tolerance .0005 |
+| Explicit IEEE/nonfinite contract, no silent sanitation | `gelu_erf_native_extremes_and_nonfinite_follow_literal_cpu_formula`: finite +/-MAX, +/-100/15, tiny/subnormal inputs, NaN/infinite inputs and seeds. Literal -Inf*0 forward and Inf*0 derivatives remain NaN as in the CPU formula; no substituted limiting values or clipping |
+| Fail before unsafe device access | `gelu_erf_native_rejects_bad_shape_storage_and_seed_metadata`: empty/zero/overflow shapes, wrong element count, equal-length wrong layout, short input/seed and equal-length seed metadata mismatch |
+| Preserve existing APIs and avoid premature layer completion | Existing enum/kind mappings untouched; no act-head runtime, parameter, optimizer or checkpoint modifications. New f32 primitives only; no new f16 or act-head network integration claimed |
+
+Test-first: new tests initially failed compilation on missing methods. Final serial RTX 4060 Laptop runs, via 3G scopes/script `-j 2`:
+
+- `MEM=3G ./tools/test_oxide.sh --test oxide_gelu_erf`: **4 passed**.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_grad_methods`: **2 passed, 1 ignored** (timed benchmark not run; cases include leaky/logistic/mish and other existing gradient ops, not an all-activation coverage claim).
+- `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_features`: **3 passed**.
+- `MEM=3G ./tools/test_host.sh gelu`: **2 core passed**, 0 CLI matched.
+
+Targeted edition-2024 Rustfmt/diff checks passed; only inserted activation-file blocks were formatted/checked to preserve unrelated existing style. Temporary logs/formatter snippet removed after recording evidence. Generated compiler products remain part of the active incremental build. Parked uncommitted CPU math remained outside this release. No real training, benchmark, full-host/corpus/full-Oxide run or compiled-C++ golden. GPU status: exact-erf f32 forward/backward primitive native; **act-head runtime remains host fallback** and its training-contract question remains unanswered. Next independent work is native act-head f32 forward composition, retaining CPU backward until gradient/update eligibility is resolved and implemented. All broader GPU/GPU Muon, CPU/config/axis and sparse-MoE requirements remain open. Hand-derived from source, no compiled-C++ golden.
+
+## 45. Native act-head f32 forward composition
+
+- v0.2.005 (`79ce20bb`): replaced `[laya_act_head]` full/compact GPU forward's three source downloads, host feature/MLP execution and result upload with shared native composition in `runtime/laya_act_gpu.rs`: native features, connected fc1, dedicated exact-erf GELU, connected fc2. Thin arms in `runtime.rs` retain existing source resolution/use counts. Existing Oxide connected/feature/GELU overrides execute on device; no new backend trait or kernel was needed. Ordinary runtime debug/final output downloads remain.
+- Helper checks source/spec agreement, positive/bounded F/A and checked products plus all four parameter lengths before head uploads/math. Matrix orientation follows source row-major `[F,H+4]` / `[A,F]`, with connected output `[B,F]` used for the strict exact-GELU metadata contract. Final `[B,A]` storage is downloaded with the existing layer's NCHW shape, as with other connected operations.
+- **Deliberately uncached:** all four parameter blocks upload each call, so direct host edits and blob-based parameter replacement are immediately visible. Native compute does not imply fully resident weights or a speedup. Precision inherits the existing connected/GEMM backend configuration; numerical parity tests explicitly select `GemmMode::Fp32`. Other precision/AMP modes were not newly validated or globally changed. F16 remains rejected.
+- CPU-backward fallback and act-head parameter eligibility/update behavior remain unchanged. No native act-head backward, new training buffers, optimizer state or checkpoint/file loader was introduced. In-memory `to_blob/from_blob` replacement is tested, **not shared-file loading**; the existing runtime error's `load_laya_act_head_blob` hint does not identify an implemented loader in core. Do not treat that hint or these forward tests as full `.weights` support. Source-training mismatch/question from §43 remains open.
+
+Scoped requirement-to-artifact audit:
+
+| Requirement | Actual evidence |
+|---|---|
+| No host act-head math in inference forward | `runtime/tests/laya_act_gpu_tests.rs::laya_act_head_gpu_forward_matches_hand_erf_and_retains_cpu_backward`: test-only thread-local probe in `laya_act_head.rs` asserts no CPU act-head calls from full/compact inference; known fc1 values +/-1 give the closed-form erf outputs. Probe is absent in production builds |
+| Keep fallback and existing update behavior | Same FakeBackend test asserts fallback selection remains true, executes backward after GPU training-forward, compares upstream conv SGD updates to CPU and proves a nonzero update; all act-head params remain unchanged. This is preservation evidence on FakeBackend, not native GPU backward proof |
+| Checked parameter geometry, all blocks | `laya_act_head_gpu_forward_rejects_all_parameter_blocks_and_bad_dimensions`: short fc1_w/fc1_b/fc2_w/fc2_b in both paths and a post-construction oversized F fail cleanly. This is runtime defense, not a claim that arbitrary oversized cfgs are safe to initialize |
+| Real-device full/compact CPU-reference agreement | `oxide_laya_act_forward.rs::laya_act_head_native_full_compact_observe_edits_blob_replacement_and_sources`: B=2, H=6/8, K=T=4, F=5, A=3; valid/all-masked/aliased-marker graphs, absolute and relative references, nonprevious head input surviving compact lifetimes, all four blocks edited after warm calls, then blob-based replacement; outputs must actually change and both GPU paths match CPU |
+| Actual native primitive dispatch | Core helper has only validated parameter uploads and backend feature/connected/exact-GELU calls, with no data downloads or host tensor math. Oxide implementations of these operations were directly verified in prior increments; real runtime composition now executes successfully on RTX 4060 |
+| Clean errors and unchanged unsupported dtype | `laya_act_head_native_invalid_parameters_error_cleanly`: real GPU full/compact rejects short fc1 weights; f16 still returns its explicit unsupported-layer error |
+
+Test-first: the host probe failed on the old CPU-forward calls and the malformed-parameter assertion failed before the new helper was wired. Final serial 3G scopes/script `-j 2`:
+
+- `MEM=3G ./tools/test_host.sh laya_act_head`: **11 core passed**, 0 CLI matched.
+- `MEM=3G ./tools/test_host.sh runtime::`: **273 core passed**, 0 CLI matched.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_forward`: **2 passed** on RTX 4060 Laptop.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_gelu_erf`: **4 passed** on RTX 4060 Laptop.
+
+Targeted edition-2024 Rustfmt/diff checks passed; only new CPU-module probe blocks were formatted to avoid unrelated style churn. Temporary logs/formatter snippet removed after recording evidence; no file weights/sidecars created. Parked CPU math remained unselected/outside this release. No actual training run, benchmark, full-host/corpus/full-Oxide or compiled-C++ golden. GPU status: **native f32 full/compact forward; CPU backward; frozen/no act-head updates preserved; f16 unsupported**. Next independent work can implement standalone native act-head gradient math without changing runtime eligibility or applying updates until the operator question is resolved. All broader CPU/config/axis, GPU/GPU Muon and sparse-MoE requirements remain open. Hand-derived from source, no compiled-C++ golden.
+
+## 46. Standalone native act-head gradient math
+
+- v0.2.006 (`2ffc33e2`): added `F32TensorOpsBackend::laya_act_head_backward_f32`, typed resident operands/results (`LayaActBackwardInputs`, `LayaActHeadGrad`) and shared composition in `lightnet-cuda/src/laya_act.rs`. Immutable `MlpLayout` in `host_ops/laya_act.rs` validates source views and positive/bounded MLP products before construction. Oxide's override in `src/lib.rs` checks all seven buffer lengths and canonical parameter/seed metadata before any math; source storage uses the declared NCHW views, like the existing feature primitive. Seeds accept `[B,A]` or `[B,A,1,1]`.
+- Composition uses existing feature, connected, exact-erf forward/backward, connected-backward and route-copy operations: recompute x/preactivation/hidden, compute fc2 gradients, apply exact activation chain, compute fc1 gradients, extract the first H input-gradient columns as `[B,H]` dcls. All four parameter gradients are positive, **batch-summed**, not averaged or optimizer updates. The last four feature adjoints are discarded; no scorer/marker gradients escape. Fc2 bias **values** are unnecessary for this Jacobian, so are not an operand; fc2 bias gradients are still returned.
+- Existing Oxide overrides for every composed operation use device kernels/private GEMM; no new GPU kernel, host tensor downloads/math, parameter upload, persistent cache, compiler change, runtime dispatch or optimizer mutation was introduced. Generic backends use their own primitive implementations and may execute host references. Verified precision is explicit `GemmMode::Fp32`, not all backend precision/AMP modes.
+
+Scoped requirement-to-artifact audit (`oxide_laya_act_backward.rs`):
+
+| Requirement | Actual evidence |
+|---|---|
+| All four gradients and dcls match CPU, sign and batch convention | `laya_act_backward_native_all_blocks_and_cls_match_cpu_sums_without_updates`: B=2, H=3, K=4, CB=10, T_head=5, T_marker=3, F=5, A=3; mixed/all-masked inputs, signed/zero/nonunit seeds and three tile lengths. Explicit db2=(.5,.5,-1.5) proves sum rather than mean; all result metadata checked and all seven resident operands remain unchanged |
+| Honest oracle domain | CPU `laya_act_head.rs::validate_shapes` requires CB exactly 2*K, whereas native feature views allow extra ignored channels. The first oracle call failed on CB=10; tests now compact only each sample's unused trailing channels for the CPU oracle (CB=8), preserving every read mask value. No CPU validator/schema changed, and no full CPU/config parity for CB>2K is claimed |
+| Actual GPU-forward finite differences | `laya_act_backward_native_matches_actual_gpu_forward_parameter_and_cls_fd`: two selected entries per parameter block (8 total) plus 3 CLS/2 non-CLS input coordinates, epsilon .001 and tolerance .001. Device forward composition is scored directly; scorer/marker buffers remain fixed to honor detach semantics |
+| Checked descriptors/operand storage/layout | `laya_act_backward_native_checks_layout_all_operands_and_seed_metadata`: zero/overflow F/A, invalid head/marker views, each of seven truncated operands, equal-length wrong fc1/fc2/bias/seed metadata. Constructor state is private/immutable, preventing safe mutation into unchecked dimensions |
+| Owned results, not dangling operand views | `laya_act_backward_native_results_outlive_temporary_operand_buffers`: drops all operand buffers, forces allocator-pool reuse with fifteen new uploads and verifies all five gradient outputs afterward |
+| No premature native-runtime/update claim | Runtime source, fallback selection, act-head buffers/eligibility, optimizer/checkpoint handling and f16 rejection are unchanged. Returned dcls is not full sequence scatter; the new API is not called by runtime backward |
+
+Test-first: missing imports/methods failed compilation before implementation. Final serial RTX 4060 Laptop runs, 3G scopes/script `-j 2`:
+
+- `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_backward`: **4 passed**.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_forward`: **2 passed**.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_gelu_erf`: **4 passed**.
+- `MEM=3G ./tools/test_host.sh laya_act_head`: **11 core passed**, 0 CLI matched.
+
+Targeted edition-2024 Rustfmt/diff checks passed. Temporary logs removed after recording evidence; no weight/sidecar files created. Parked CPU math remained unselected/outside this release. No real training, benchmark, unfiltered host/corpus/full-Oxide run or compiled-C++ golden. GPU status: standalone f32 gradient math native; act-head runtime still has native f32 forward plus CPU backward, frozen updates and unsupported f16. Source-training question, full-sequence adjoint routing, runtime/update/file-loading integration and broader CPU/axis/GPU Muon/sparse-MoE work remain open. Hand-derived from source, no compiled-C++ golden.
+
+## 47. Native `[deform_conv]` forward and backward
+
+v0.2.007 (`15fc3f8c9cd96cae8c315fbea78821cac867cd40`). The version map was also
+missing v0.2.006's row; both are appended (indices 306, 307).
+
+- Shared deformable sampling implemented twice and kept in agreement: host
+  contract `lightnet_cuda::host_ops::bilinear_gather` (`BilinearGatherGeometry`,
+  `forward`, `backward`, `sample_at`) and device kernels
+  `src/lightnet-cuda-oxide/src/kernels/deform_sample.rs`. Contract taken from
+  `lightnet_core::deform_conv::bilinear_sample`, including the far-outside
+  zero-gradient early-out, the floor-cell one-sided convention at integers, and
+  NaN propagation.
+- Five forward stages on device: offset/mask predictor (a `groups = 1`
+  convolution — `deform_offset_predict`), per-batch statistics
+  (`deform_offset_stats`, f64, source gate order), envelope
+  (`deform_offset_envelope`: sanitize → optional normalize → sanitize → centered
+  lhtan), mask sigmoid, and the deformable accumulation
+  (`deform_conv_accumulate`, ±10000 sanitize).
+- Four backward stages, each FD-verified in isolation, then composed:
+  accumulation adjoint (4 atomic scatter targets), envelope slope adjoint,
+  the batch-coupled normalization Jacobian (`offset_normalization_backward`),
+  and the predictor + column-gather adjoint.
+- Runtime wiring: `DeformDeviceCache` holds the device intermediates; a single
+  shared predicate (`has_host_only_deform`: `dilation != 1 || batch_normalize`)
+  gates **both** directions; `DeformConv` left
+  `requires_cpu_backward_fallback`; the backward arm composes the trait
+  primitives, performs exactly one host hop (normalization Jacobian + stage-1
+  slope), applies the activation derivative and `bias_backward`, and accumulates
+  into the existing `LayerTrainBuffers::DeformConv` fields.
+
+Scoped requirement-to-artifact audit:
+
+| Requirement | Actual evidence |
+|---|---|
+| Host contract for sampling | `cargo test -p lightnet-cuda --lib` (33 tests, 6 for `bilinear_gather`) |
+| Device sampling parity incl. adjoint | `MEM=3G ./tools/test_oxide.sh --test oxide_deform_gather` — 5 passed |
+| Forward stages + composition | `--test oxide_deform_conv_accumulate` 8 passed, `--test oxide_deform_envelope` 14 passed |
+| Forward vs the real CPU runtime | `--test oxide_deform_conv_chain` 3 passed (masked/unmasked + dilation rejection) |
+| Backward stages FD-exact | `cargo test -p lightnet-cuda --lib` (accumulation 4 operand groups, envelope both modes, normalization Jacobian through recomputed stats, predictor) |
+| Backward vs the real CPU backward | `--test oxide_deform_conv_backward_chain` 3 passed (main/offset/mask weights and biases) |
+| Device backward composition | included in the same suite's `native_backward_composition_matches_the_cpu_gradients` |
+| Runtime device path end to end | `--test oxide_runtime_chain` 26 passed, incl. `deform_conv_device_path_matches_cpu_chain_and_updates` (forward outputs, one SGD step, every parameter block, "parameters actually moved") and the retained BN host-fallback test |
+| Host path unaffected | `MEM=3G ./tools/test_host.sh deform_conv` 23 passed |
+| Honest scope | `layer-support.md` records `native (dilation 1, no BN) / host otherwise`; the one host hop is documented; no compiled-C++ golden exists |
+
+Deliberately not done: `dilation > 1` and batch-norm variants stay on the host
+path (tested); `f16` is not supported for the layer; no benchmark or speedup
+claim; `[dcnv4]`, `[dsconv]`, `[graph_conv]` and the remaining hard-reject layers
+are untouched.
+
+## 48. DCNv4 native aggregation primitives (offsets given)
+
+**Evidence correction in v0.2.012 (§49):** the v0.2.009–011 stage reference
+and kernels shared the wrong point count/row stride (`size²`, unpadded rows).
+Their stage parity/FD results did not establish real CPU-layer agreement. Both
+host/device layouts are now corrected and those tests rerun; §49 adds the real
+CPU runtime oracle. Keep the original counts below as historical evidence only.
+
+- v0.2.011 (`8fe32a09`): native f32 `OxideBackend::dcnv4_aggregate_backward_native`
+  returns NCHW input adjoints and packed `[B, OH*OW, groups*3*K]` offset/mask
+  adjoints; device kernel `kernels/dcnv4.rs::backward` owns each row and uses
+  atomics only for input scatter. Fixed the pending kernel's batch-zero-only
+  thread bound (red test: batch 1 input gradient was 0 instead of 0.67130804).
+  Shared `Dcnv4Geometry::checked` now rejects dimension-product overflow before
+  unsafe launch/allocation arithmetic. No runtime/optimizer behavior changed.
+- v0.2.010 (`7874c225`): added native aggregation forward and its checked
+  launcher, originally verified by 2 device tests. The fixed mask array permits
+  at most 25 kernel points; larger kernels error. This release's 6-test run
+  rechecks that forward, including the strided/dilated/edge fixtures below.
+- v0.2.009 (`e3cfb27d`): added `host_ops::dcnv4::{aggregate,
+  aggregate_backward, Dcnv4Geometry, group_masks}` with host finite differences.
+  The host suite was rerun in this increment (35 passed).
+
+Scoped requirement-to-artifact audit (all commands serial, `-j 2`, 3G user
+systemd scopes; no training runs):
+
+| Requirement | Actual evidence |
+|---|---|
+| Native adjoint, all batches/groups and four mask/center modes | `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_aggregate`: **6 passed**; `device_aggregation_backward_matches_the_host_reference` covers B=2, C/G=2/1 and 4/2, signed/nonunit seeds; compares every input and offset element at 2e-5 absolute + relative tolerance |
+| Different geometry and edge sampling | `device_adjoint_covers_strided_dilated_and_far_outside_samples`: sizes 1/3/5, groups=2, stride x/y=2/3, dilation=2, non-square input, padding=2, signed masks and large displacements outside all edges, all four modes; forward and both adjoints compared |
+| Independent actual-device derivative check | `device_adjoint_matches_device_forward_finite_differences`: every input and packed offset/mask value, B=2/groups=2, all four modes; actual native forward objective with signed seeds; scale=1, coordinate fraction=0.5, epsilon=0.01 (cannot cross floor seams), absolute tolerance 2e-3 |
+| Fail closed before unsafe launch | `device_adjoint_rejects_bad_geometry_and_each_short_operand`: each short operand; zero/nondividing groups, zero batch/dilation, >25 points and overflowing dimensions |
+| Host oracle regression | `systemd-run --user --scope -p MemoryHigh=3G cargo test -p lightnet-cuda --lib -j 2 -- --test-threads=1`: **35 passed**, including host DCNv4 finite differences |
+| CPU/runtime behavior preserved | `MEM=3G ./tools/test_host.sh dcnv4`: **17 core passed**, 0 CLI; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4`: **1 passed** (`dcnv4_f32_host_fallback_matches_cpu_chain_and_updates`) |
+| Storage ownership | Launcher validates full lengths and allocates distinct zeroed `d_input`/`d_offsets`; `OxideBackend::alloc` zeros recycled buffers; thread bound derives from full seed length; `d_offsets` has a unique writer per row, input scatter is atomic |
+| Scope and evidence honesty | Runtime still lists `Dcnv4` in `requires_cpu_backward_fallback`; no trait/runtime wiring, predictor/backward composition, native updates, f16, benchmark or speedup claim. Device vs Rust CPU reference; hand-derived from source, no compiled-C++ golden |
+
+Targeted Rustfmt and `git diff --check` passed. Full host/corpus/Oxide suites
+were not run; existing corpus residuals remain open. No temporary weights,
+optimizer sidecars, models or test logs were created by this slice. Existing
+compiler IR/PTX and older build trees are retained because the backend workflow
+and prior evidence refer to them; no unrelated cleanup was attempted.
+
+## 49. Native DCNv4 projection and backward composition
+
+- v0.2.012 (`c51b25f6`): `dcnv4_forward_native` now composes native coarse projection,
+  replicated-border lattice interpolation and deformable aggregation, returning
+  raw NCHW output and dense NHWC offset cache. `dcnv4_backward_native` returns
+  input plus positive batch-summed offset weight/bias gradients through all
+  three stages. No tensor downloads/host math, runtime fallback removal,
+  epilogue/optimizer behavior change, f16 support or performance claim.
+- Corrected shared aggregation layout: `K=size²-remove_center`, row width
+  `ceil(groups*3*K/8)*8`, matching `Jev_laya:src-lib/dcnv4_layer.cpp:27–36`
+  and real Rust CPU `dcnv4.rs::layout`. The red host layout test observed
+  row width **27 vs expected 32**. Size=1/remove_center now fails explicitly.
+- Checked `Dcnv4Composition` validates source output extents, positive d_stride,
+  finite scale, padded storage/counts, coarse strides and coordinate arithmetic
+  before unsafe launches. New kernels live in `kernels/dcnv4_projection.rs`;
+  wrappers/types in `dcnv4_native.rs`; aggregation kernels remain in `dcnv4.rs`.
+  Input/weight/coarse gradient scatters use atomics: summation order is not
+  bitwise deterministic. Direct-loop correctness kernels, not a speedup claim.
+
+Scoped requirement-to-artifact audit (serial `-j 2`, MemoryHigh=3G user scopes):
+
+| Requirement | Actual evidence |
+|---|---|
+| Real CPU forward and complete math gradients | `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain`: **3 passed**. `native_composition_matches_real_cpu_outputs_and_all_math_gradients` constructs a real one-layer `ExecutableNetwork`, uses its `forward`/`backward` outputs and compares every output, input gradient, offset weight and bias at abs+rel 3e-4 tolerance. Eighteen cases: B=2, non-square 7x5 input, sizes=1/3/5, groups=1/2, stride x/y=2/1, d_stride=1/2/3, dilation=1/2, all four softmax/remove_center combinations where valid (size=1/remove_center is explicitly rejected). No synthetic stage oracle |
+| Packed axes/padding are real, not shared-proxy agreement | `aggregation_layout_uses_active_points_and_eight_aligned_rows` pins K=9/8 and rows=32/24/48; real CPU parameter cardinalities asserted in chain fixtures. Padding biases are set to 20, but padding weight/bias gradients must remain exactly zero; all active parameter gradients compared |
+| Differentiate full native forward, not only aggregation | `native_composition_matches_device_finite_differences`: all four modes, coarse d_stride=2, every bias plus sampled inputs/weights, signed seed objective via actual native forward; epsilon=0.002, abs tolerance 2e-3; derived coordinate margin >0.48 excludes floor-cell seams |
+| Cache/lifetime/input immutability | Real CPU comparison drops original forward input/weight/bias uploads before independent backward uploads to force pool reuse; output and cache remain live and unchanged, input/weights unchanged after backward |
+| Reject malformed descriptors/storage | `native_composition_rejects_bad_descriptors_and_storage`: zero/overflowing d_stride, nonfinite scale, wrong output extent, overflowing padding, oversized kernel; each short forward operand and each short backward operand rejected |
+| Retain aggregation/FD/edge/error coverage after layout fix | `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_aggregate`: **6 passed**, including size=1/remove_center rejection, eight-aligned padding and corrected compact center-removal slots |
+| Host math regression and source-layout pin | `systemd-run --user --scope -p MemoryHigh=3G cargo test -p lightnet-cuda --lib -j 2 -- --test-threads=1`: **36 passed** |
+| CPU/runtime behavior preserved | `MEM=3G ./tools/test_host.sh dcnv4`: **17 core passed**, 0 CLI; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4`: **1 passed** (host fallback plus updates). `runtime.rs` unmodified, `Dcnv4` still forces CPU backward fallback |
+| Native execution rather than generic host defaults | Wrappers launch four `dcnv4_projection` device entries plus existing native aggregation/adjoint; wrapper source has no download/CPU math calls. Both new tests exercise an actual Oxide backend |
+
+Targeted Rustfmt and diff checks passed. Initial device compile caught unsupported
+DisjointSlice indexing (changed to owned, bounds-checked pointer writes); first
+CPU-oracle fixture caught `element_count()` excluding batch (fixed full B=2 data
+length). No failed test is left in the slice. No training/data/model downloads,
+weights, sidecars or logs were created; existing compiler IR/PTX and unrelated
+build trees were inspected and retained. No full-host/corpus/full-Oxide or
+compiled-C++ parity claim: **hand-derived from source, no compiled-C++ golden**.
+
+Completion boundary: this completes standalone raw DCNv4 math composition,
+not the handbook's all-layer goal. **Next:** add trait defaults/Oxide overrides,
+wire both forward and backward/cache selection together, apply existing
+bias/activation/BN semantics, then prove two-step optimizer/weight parity before
+removing runtime/optimizer rejection. Matrix remains **host fallback**. Stage-1
+missing variants/axis pins, other Stage-2 native layers/GPU Muon, and Stage-3
+sparse MoE remain open; these selected tests do not cover them.
+
+## 50. Bounded DCNv4 native runtime forward/backward
+
+- v0.2.013 (`3f3c2226`): generic `dcnv4_forward_f32` / `dcnv4_backward_f32` trait entries
+  have host defaults (`host_ops/dcnv4_composition.rs`) and direct Oxide native
+  overrides. Runtime dispatch is in `runtime/dcnv4_gpu.rs`, with small guarded
+  arms in `runtime.rs`. Eligible f32 networks now execute projection/upsample/
+  aggregation plus bias/activation and input/parameter gradient math on device.
+- Gate: no DCNv4 BN, <=25 active points, supported elementwise activation, no
+  whole-network CPU fallback or host-only deform_conv variant. Both forward and
+  backward use the same global gate. Excluded/mixed networks still produce and
+  consume the original host caches; f16 and compact rejection are unchanged.
+- Backward recomputes offsets **on device** from that forward state's own input
+  and current unchanged parameters; no mutable last-forward cache or public
+  GpuForwardState shape change. Existing contract requires backward before an
+  optimizer update. Projection weights/biases upload again and an unnecessary
+  aggregation output is recomputed. No residency/performance/speedup claim.
+- Parameter gradients download to existing host train buffers; SGD/Adam remain
+  host-side for DCNv4, including the 0.01 predictor rate, gates/momentum/decay
+  and Adam state layout. Dummy weights remain unchanged. GPU Muon is absent;
+  this is bounded native math integration, **not full native-layer completion**.
+
+Requirement-to-artifact checklist (serial builds/tests; user MemoryHigh=3G
+scopes, -j 2 except the -j 4 CLI check):
+
+| Requirement | Inspected evidence |
+|---|---|
+| Backend-generic surface with real native override | `lightnet-cuda/src/lib.rs` declares both methods; `lightnet-cuda-oxide/src/lib.rs` forwards directly to v0.2.012 native math. Host composition validates geometry/storage and returns positive batch sums |
+| Host default derivative/storage validation | `systemd-run --user --scope -p MemoryHigh=3G cargo test -p lightnet-cuda --lib -j 2 -- --test-threads=1`: **37 passed**, including every input/weight/bias FD through recomputed coarse offsets (B=2) and short-storage rejection |
+| Test-first runtime selection | New `dcnv4_gpu_selects_native_math_without_host_cache` first failed the old unconditional fallback assertion; now passes and verifies the CPU cache is absent |
+| No stale offsets or dropped subdivision gradients | `dcnv4_gpu_multiple_forward_states_and_microbatch_accumulation_match_cpu`: forward A then B, backward A then B on a standalone B=2/groups=2 DCNv4; every accumulated output-bias/offset-weight/offset-bias value agrees with CPU |
+| Error before backend math | `dcnv4_gpu_rejects_parameter_storage_before_backend_math` truncates each of three parameter blocks; each returns InvalidConfig, not a panic or unsafe launch |
+| Preserve whole-network fallback | Host tests `dcnv4_gpu_retains_host_cache_for_bn_and_mixed_fallback` (BN, large kernel, channel normalization, deconvolution neighbor) and `dcnv4_gpu_and_host_only_deform_choose_the_same_whole_network_path` verify cache production and successful backward. Real-device BN fallback and mixed deconvolution cases also pass |
+| Mandatory runtime guard regression | `MEM=3G ./tools/test_host.sh runtime::`: **278 passed** (includes muon_runtime matches). Existing ViT fallback, deform_conv device/host gates, optimizer and parked cuboid guard tests remain green |
+| Focused host/DCNv4 regression | `MEM=3G ./tools/test_host.sh dcnv4`: **22 core passed**, 0 CLI; includes prior CPU math/weights/optimizer-state tests |
+| True device dispatch and two optimizer steps | `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4`: **3 passed**. `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` uses preceding conv + B=2, groups=2, size=3, dilation=2, d_stride=2, signed/nonunit seeds, softmax/remove_center on+off, swish/leaky. Explicit Fp32 GEMM mode; all layer outputs and both steps' updated values/deltas agree; every conv/DCNv4 trainable block actually moves; dummy weights unchanged |
+| Not a hidden CPU backward | In that device test CPU backward on GPU forward artifacts errors specifically for missing DCNv4 cache, while GPU backward and updates succeed; retained BN/mixed cases instead prove CPU backward can consume the GPU-produced host artifacts |
+| Composition/adjoint regressions after trait migration | `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain`: **3 passed** (18 real CPU cases, device FD, errors/lifetimes); `--test oxide_dcnv4_aggregate`: **6 passed** |
+| Integration check | `systemd-run --user --scope -p MemoryHigh=3G cargo check -p lightnet-cli --features oxide -j 4`: passed |
+| Formatting/scope/hygiene | Targeted Rustfmt/new-module formatting and `git diff --check` passed; only named GPU/host-default/runtime/test/docs files committed. No parked YOLO-3D, Cargo.lock or .gitignore edits included |
+
+**Full runtime-chain suite remains unverified:** attempted serial
+`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain` timed out at 600 seconds
+while running `vit_flash_attention_runtime_uses_native_forward_and_backward_and_matches_cpu`.
+The 25 preceding tests reported `ok` (including the three DCNv4 cases and the
+existing deform_conv device/host cases), but there is no final suite result.
+No test/build processes survived the timeout. The focused DCNv4 run above then
+completed normally. Do not claim a full runtime-chain/Oxide green baseline or
+infer the cause of the timeout. Full host/corpus were not run; known corpus
+residuals remain unresolved.
+
+Resolved build-only issues: helper needed the existing B::Error Display bound,
+test helper needed its parent-qualified path, and Fp32 is GemmMode (not ConvMode).
+No persistent model/data/log artifact was created intentionally; compiler IR/PTX
+and unrelated build trees are retained because the build workflow/earlier docs
+still reference them. Unit step tests only, no dataset training. **Hand-derived
+from source, no compiled-C++ golden.**
+
+Completion audit boundary: handbook deliverables are full CPU/source variants
+plus axis pins/optimizers, all native GPU layer paths plus GPU Muon, then sparse
+MoE with performance evidence, with per-version docs and C++-golden boundaries.
+This slice only closes bounded DCNv4 f32 runtime math selection. BN, unsupported
+activations/large kernels, compact/f16, native parameter gradients/updates/
+residency and GPU Muon remain open, as do all documented CPU/other-GPU/MoE gaps.
+Next independent DCNv4 slice: native rolling-stat BN affine math and its exact
+adjoint (preserve the CPU DCNv4 rolling-stat semantics, not conv batch stats).
+
+## 51. Native DCNv4 rolling-stat BN
+
+- v0.2.014 (`ceef2037`): DCNv4's bounded f32 native runtime path now accepts BN. Existing
+  device bias-add/channel-scale/product/reduction primitives implement
+  `xhat=(raw-mean)/sqrt(var+1e-5)`, `pre=xhat*gamma`,
+  `d_raw=delta*gamma/sqrt(var+1e-5)` and `d_gamma=sum(delta*xhat)`.
+  Gamma may be zero or negative; no division by gamma. Ordinary biases and BN
+  beta remain unused and unchanged, matching the existing Rust CPU contract.
+- Native post-backward stats reduction preserves the CPU **0.9 EMA with unbiased
+  variance**, for every DCNv4 BN layer including unseeded/gated layers. It runs
+  after all gradients, never in forward. Reuses only the stats/EMA outputs of
+  `batchnorm_train_forward_f32`; that primitive's batch-normalized output is
+  discarded, not substituted for the layer's rolling-stat normalization.
+  Only per-channel EMA values return to host params (no raw activation download).
+- Code is in `runtime/dcnv4_gpu.rs`; `runtime.rs` adds one post-backward hook and
+  updates the old BN test expectation. Eligibility still excludes >25 points,
+  unsupported activations and whole-network host fallback/host-only deform_conv.
+  Existing SGD/Adam buffers, rate scaling, gates, state encoding and ignored
+  parameter blocks are unchanged. Parameter gradients/updates remain host-side;
+  repeated uploads/raw recomputation and no residency/speedup claim remain.
+
+Scoped prompt-to-artifact checklist (serial, MemoryHigh=3G user scopes, -j 2
+except the -j 4 CLI check):
+
+| Requirement | Concrete evidence |
+|---|---|
+| Test-first BN path relaxation | `dcnv4_bn_gpu_uses_native_path_before_stats_update` first failed the old unconditional BN fallback assertion. Now verifies native selection, no host math cache, no forward EMA update |
+| Real CPU output/input/parameter derivatives and gamma=0 | `dcnv4_bn_native_gradients_match_cpu_including_zero_gamma` compares every input, offset weight/bias and gamma gradient with the real CPU backward (B=2/groups=2, non-square map, zero/negative gamma); gamma=0 derivative must be nonzero; rolling values agree after accumulation |
+| Historical hand expectation and EMA timing retained | Existing `dcnv4_batchnorm_scale_derivative_and_rolling_stats_use_native_defaults` still pins gamma gradient and rolling mean=0.43, variance=0.7966667; CPU/FakeBackend buffers/params agree, now without CPU backward fallback |
+| Unseeded stats, malformed BN metadata | `dcnv4_bn_native_updates_unseeded_stats_and_rejects_bad_bn_storage`: unseeded callback agrees with CPU; truncated beta/gamma/mean/variance or absent BN state return InvalidConfig before backend math |
+| Update gates and ignored fields | `dcnv4_bn_native_preserves_optimizer_gates_but_advances_stats`: SGD and Adam, dont_update/train_only_bn/burnin_update; optimizer leaves all params unchanged relative to post-EMA state, while EMA still advances. Existing/real tests pin ordinary-bias/beta/dummy invariance |
+| Mandatory full host runtime filter | `MEM=3G ./tools/test_host.sh runtime::`: **282 passed**; includes existing mixed fallback/host-only deform guards and all parked tests. Focused `test_host.sh dcnv4`: **26 core passed**, 0 CLI |
+| Actual-device BN derivative check | `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_bn`: **2 passed**. `native_bn_runtime_forward_derivatives_hold_rolling_stats_fixed` differentiates actual GPU runtime forwards: input-adjoint direction via an upstream identity-conv update, sampled predictor weights/biases and both gammas (zero/negative). Supplied-seed lr=1 readout accounts for batch=2 and predictor rate=0.01; FD epsilon=0.002, floor seams excluded; every forward holds EMA fixed |
+| Native unseeded EMA and N=1 variance | Same suite's `native_bn_unseeded_and_single_sample_stats_match_cpu` compares per-channel mean/variance against real CPU for B=2/non-square map and B=1/H=W=1; scale values unchanged |
+| Native selection, two SGD/Adam steps, all blocks | `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4`: **3 passed**. Expanded two-step test covers BN off/on × SGD/Adam × softmax/remove_center on+off, B=2/groups=2, dilation=2/coarse stride=2, swish/leaky, zero/negative gamma, upstream conv and all active DCNv4 blocks moving; rolling stats agree, ordinary biases/beta/dummy invariant |
+| Mixed networks retain original cache/stats path | Same device suite's deconvolution-mixed network now has BN DCNv4 and proves CPU backward can consume GPU-produced host caches. Native BN test proves the opposite (CPU backward fails specifically for missing DCNv4 cache while GPU backward succeeds) |
+| Raw math regressions | `--test oxide_dcnv4_chain`: **3 passed** (18 CPU cases, device FD and guards); `--test oxide_dcnv4_aggregate`: **6 passed**; capped `cargo test -p lightnet-cuda --lib -j 2 -- --test-threads=1`: **37 passed** |
+| Native, not a new host math fallback | Inspected Oxide implementations of vector_mul/channel_scale/bias reductions and batchnorm_train_forward: device launches/reductions. Helper downloads only gradients and per-channel EMA values; CPU counterparts remain defaults for generic/FakeBackend |
+| Integration/format/hygiene | Capped `cargo check -p lightnet-cli --features oxide -j 4` passed; targeted Rustfmt/diff checks passed; no persistent weights/sidecars/ONNX artifacts found in the work scope. Unrelated user/parked edits excluded |
+
+One compile-only issue was caught and fixed: vector_mul_f32 requires an explicit
+output shape. No failed test remains in these focused gates. No new kernels,
+optimizer formats, public forward-state fields, global AMP/precision semantics
+or dataset training runs. Existing compiler IR/PTX/build trees remain referenced
+and were retained. Full host/corpus/Oxide suites were not run; the previous
+600-second runtime-chain ViT timeout remains unresolved and is not a pass.
+
+Evidence boundary: **device vs existing Rust CPU contract; hand-derived from
+source, no compiled-C++ golden**. C++ DCNv4 calls forward_batchnorm_layer and
+its CPU backward is a stub; this is not evidence of C++ training BN parity.
+Normalize with the current rolling values for a forward/backward pair; do not
+change weights or rolling stats between that pair. Post-backward EMA is state
+maintenance, not part of that forward's differentiated function.
+
+Completion audit: BN math/EMA is closed within this increment, not the full
+handbook objective. CPU source variants/axis pins, native unsupported/large
+DCNv4 paths, compact/f16, device parameter updates/residency, other GPU layers,
+GPU Muon and sparse MoE/performance evidence remain open. Next independent slice:
+native DCNv4 NormalizeChannels* activations/adjoints using existing backend
+primitives, preserving BN ordering and whole-network fallback for other gaps.
+
+## 52. Native DCNv4 channel-normalization activations
+
+- v0.2.015 (`1fc80f27`): DCNv4's bounded f32 native path now accepts `normalize_channels`, `_softmax` and `_softmax_maxval` activations (after optional rolling-stat BN) using the existing `normalize_channels_f32`/backward primitives; channel output is recomputed on device from the forward preactivation. Exact `SoftmaxMaxval` adjoint gained the max-chain term (epsilon sits outside exp(x-max); first max selected at ties; one-channel case is constant, zero translation derivative) in both host_ops and the Oxide kernel; `GradMode::Cpp` shortcut unchanged. Gates (serial, 3G): lightnet-cuda lib 40, host dcnv4 28, `runtime::` 284, `oxide_dcnv4_normalization` 3 (3 norms x BN x SGD/Adam two-step CPU/GPU parity, GPU forward FD with fixed stats, mixed-network CPU cache), `oxide_layers_extra` 25. Not compiled-C++ parity; larger variants, other activations, compact/f16, device updates/residency, GPU Muon remain open.
+
+## 53. Extend native DCNv4 kernel bound to 7x7
+
+- v0.2.016 (`a96d6d95`): increased the fixed device mask capacity from 25 to 49 points and expanded the native composition CPU-parity test matrix with 7x7 cases. The runtime eligibility gate admits up to 49 active points; >49 remains host-fallback. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (real GPU composition output, input/parameter-gradient CPU parity and error guards, including 7x7); `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests including path-selection/fallback regressions. No 7x7 runtime optimizer-parity test, compiled-C++ parity, or performance claim. Other unsupported activations, device updates/residency, compact/f16, GPU Muon and broader parity work remain open.
+
+## 54. DCNv4 7x7 runtime optimizer parity
+
+- v0.2.017 (`8a3ef3b0`): extended `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` with an actual 7x7 (49 active points) layer. GPU runtime forward/backward takes the native path (the CPU-cache fallback is asserted unavailable) and matches CPU output, parameter deltas and two updates under SGD/Adam, BN on/off. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed on the RTX 4060; one test, ~108 seconds. No large-kernel >7x7 support, compiled-C++ parity, or performance claim.
+
+## 55. Extend native DCNv4 runtime through 9x9
+
+- v0.2.018 (`613b243e`): enlarged the fixed native mask buffer and runtime gate from 49 to 81 points. A 9x9 case now passes real-GPU native composition parity against CPU outputs and all math gradients, plus two-step runtime SGD/Adam parity with BN on/off. The over-limit host-fallback fixture now uses 11x11. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain -- native_composition_matches_real_cpu_outputs_and_all_math_gradients` passed; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed; `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests. >81 points and unsupported activations remain fallback; no performance or compiled-C++ parity claim.
+
+## 56. Extend native DCNv4 runtime through 11x11
+
+- v0.2.019 (`76242245`): enlarged the native fixed mask capacity/runtime gate from 81 to 121 active points. 11x11 real-GPU composition matches CPU output and all math gradients; runtime two-step SGD/Adam parity passes with BN on/off, and the >121 host-fallback fixture uses 13x13. Gates: focused `oxide_dcnv4_chain` composition test passed, `oxide_runtime_chain` DCNv4 optimizer test passed (~186 s), and `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests. No compiled-C++ or performance claim; >121/unsupported variants remain host fallback.
+
+## 57. Extend native DCNv4 runtime through 13x13
+
+- v0.2.020 (`c99f83d8`): increased the native fixed mask capacity/runtime gate from 121 to 169 active points. 13x13 real-GPU composition matches CPU outputs and all math gradients; runtime two-step SGD/Adam parity passes with BN on/off, and >169 remains host fallback (exclusion fixture is 15x15). Evidence: focused `oxide_dcnv4_chain` composition and `oxide_runtime_chain` DCNv4 optimizer tests passed; `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests. No compiled-C++ or performance claim.
+
+## 58. Retain native DCNv4 forward cache for backward
+
+- v0.2.021 (`7a262a13`): store each native GPU forward's raw aggregation and dense offsets in its `GpuForwardState`; backward consumes that exact cache instead of re-uploading offset biases and recomputing projection/upsampling/aggregation. CPU fallback caches remain separate, and host-resident parameters/gradients/optimizer are unchanged. Per-forward ownership is covered by existing multiple-forward/microbatch tests, with explicit native-cache presence assertions. Gates: `MEM=3G ./tools/test_host.sh dcnv4` passed 28 core tests; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed on the RTX 4060 (1 test, 226 seconds). No speedup measured or claimed; full runtime chain/corpus not run.
+
+## 59. Native DCNv4 gradient accumulation
+
+- v0.2.022 (`27ab3cfb`): native DCNv4 backward now retains bias, offset-weight, offset-bias and optional BN-scale gradients as device tensors and accumulates them on-device across microbatches. No parameter-gradient downloads occur during backward; gradients transfer once at the host optimizer boundary, where existing SGD/Adam logic and parameter residency remain unchanged. The first gradient seeds an exact-layout device accumulator to avoid opaque backend tensor-shape assumptions. Host tests: `MEM=3G ./tools/test_host.sh dcnv4` passed 28 tests, including gradient and multi-forward/microbatch parity. Real GPU: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed on RTX 4060 (1 test, 229 s), covering two-step SGD/Adam CPU parameter parity through device accumulation. `git diff --check` passed. No speedup, compiled-C++ golden or full-suite claim; optimizer updates/parameter residency, unsupported variants, other GPU layers, CPU gaps, GPU Muon and sparse MoE remain open.
+
+## 60. Native act-head CLS adjoint scatter
+
+- v0.2.023 (`2ff4544e`): added a checked backend operation to add the standalone `[B,H]` act-head CLS adjoint into token zero of an existing `[B,H,1,T]` NCHW head gradient. Host reference validates dimensions/storage; Oxide uses a native one-thread-per-output kernel, keeping the full sequence gradient device-resident and leaving scorer/marker summary features detached. Evidence: `systemd-run --user --scope -p MemoryHigh=3G cargo test -p lightnet-cuda --lib laya_act -j 2` passed 2; `MEM=3G ./tools/test_host.sh laya_act` passed 11 core tests; `MEM=3G ./tools/test_oxide.sh --test oxide_laya_act_backward` passed 5 on the RTX 4060, including the new actual-device NCHW scatter/parity/error test and the existing MLP gradient parity/FD/guard suite; `git diff --check` passed. This is a primitive, not runtime backward/update integration; f16 and trainable-parameter contract remain unresolved, and no C++ golden or performance claim is made.
+
+## 61. Native DCNv4 SGD optimizer update
+
+- v0.2.024 (`0087d109`): eligible native DCNv4 SGD now combines device-accumulated gradients with device-resident momentum buffers and applies the standard backend SGD update to the offset projection and either ordinary biases or BN scales. The existing 0.01 offset-projection rate, weight decay on offset weights, layer rate scaling, batch handling and update gates are preserved. Parameters remain host-canonical and are uploaded/downloaded per step; Adam still flushes gradients to the existing host optimizer. Whole-network CPU fallback and non-native DCNv4 variants retain the host path. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 28 tests; `MEM=3G ./tools/test_oxide.sh dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (RTX 4060, 258.95 s), exercising BN on/off, two-step SGD and Adam parity, multiple kernel sizes and update deltas; `git diff --check` passed. No speedup, parameter residency, compiled-C++ golden or full-suite claim. Native DCNv4 Adam, unsupported/large variants, compact/f16, other GPU layers, CPU gaps, GPU Muon and sparse MoE remain open.
+
+## 62. Native DCNv4 Adam optimizer update
+
+- v0.2.025 (`7c96d45a`): eligible native DCNv4 Adam now applies offset projection and ordinary-bias/BN-scale updates through backend optimizer operations. First/second moments reuse the existing `HostAdamLayerState` layout and optimizer-sidecar serialization, uploaded for the device step and returned to the host state afterward; canonical parameters remain host-side. Layer-rate scaling, the 0.01 offset-projection LR factor, Adam/AdamW decay behavior, update gates and host fallback for mixed/unsupported networks are preserved. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 29 tests, including FakeBackend CPU parameter parity and optimizer-sidecar save/load round-trip; `MEM=3G ./tools/test_oxide.sh dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed on RTX 4060 (1 actual-GPU test, 255.16 s), covering two-step SGD/Adam parity with BN on/off and multiple DCNv4 sizes. No full suite, speedup, persistent parameter residency or compiled-C++ golden is claimed; broader CPU/GPU gaps, GPU Muon and sparse MoE remain open.
+
+## 63. Native Revleaky activation mapping
+
+- v0.2.026 (`fafa95ae`): map the source-derived `Activation::Revleaky` scalar semantics to the existing native Leaky f32 backend operation (same positive/negative slopes and non-positive branch), removing its unnecessary device-path rejection for all f32 GPU consumers. DCNv4 now exercises Revleaky through native runtime forward/backward and SGD/Adam updates in the real-device CPU-parity matrix. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 29 tests, including native selection/cache behavior; `MEM=3G ./tools/test_oxide.sh dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 RTX 4060 test (262.86 s) with the added Revleaky case. No compiled-C++ golden, speedup, or full-suite claim; other GPU layer gaps and overall CPU/axis/Muon/sparse-MoE work remain.
+
+## 64. Extend native DCNv4 through 15x15
+
+- v0.2.027 (`e5217f8a`): raised the native DCNv4 mask capacity and runtime gate from 169 to 225 active points (15x15). Actual GPU composition parity compares outputs and all math gradients against the real CPU layer; the runtime matrix exercises two-step SGD/Adam, BN on/off, and includes the 15x15 case. The >225 fallback guard now uses 17x17. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 29 tests; `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (15x15 included); `MEM=3G ./tools/test_oxide.sh dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (301.50 s). Larger kernels/unsupported activations and mixed networks remain host fallback; parameters remain host-canonical. No speedup, compiled-C++ golden or full-suite claim; CPU/axis/Muon and sparse-MoE requirements remain open.
+
+## 65. Retain native DCNv4 Adam moments on device
+
+- v0.2.028 (`d7b0e5cc`): eligible native DCNv4 Adam now reuses device-resident first/second moments between updates instead of downloading/re-uploading them every step. Parameters remain host-canonical and still cross at each optimizer step. `save_optimizer_state` materializes the device moments into the existing host Adam sidecar structure; loading an existing DNOPT sidecar uploads moments lazily on the next native update, with no format bump. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 29 tests, including device-state creation and byte-identical save/load/save sidecar round-trip. Focused actual-GPU two-step SGD/Adam CPU parity passed on rerun (1 test, 300.16 s); its preceding run had one near-threshold parameter-delta failure. No speedup or compiled-C++ golden claim; only DCNv4 Adam moments are resident, not its parameters. GPU Muon, broader GPU work, CPU/axis gaps and sparse MoE remain open.
+
+## 66. Reuse DCNv4 projection weights from forward during backward
+
+- v0.2.029 (`9b722d35`): each native DCNv4 forward cache now retains the exact uploaded offset-projection weight tensor; backward consumes that tensor rather than uploading the host copy again. This also ensures the adjoint uses the same parameter snapshot as forward if host parameters are changed between the two calls. Focused host DCNv4 tests passed (29), including an assertion that the forward cache holds the expected weights; actual-GPU two-step SGD/Adam CPU parity passed (1 test, 316.19 s). DCNv4 parameters remain host-canonical and are still uploaded for each new forward/optimizer update; this is per-forward lifetime reuse, not persistent network-wide residency or a speedup claim. No compiled-C++ golden; GPU Muon and broad parity gaps remain.
+
+## 67. Retain native DCNv4 parameters across forwards and updates
+
+- v0.2.030 (`6433f57f`): native f32 DCNv4 now caches learned parameter tensors (offset weights/biases, output biases and BN gamma) per layer and reuses them across forwards, backward, rolling-stat recomputation and native SGD/Adam updates. After an optimizer update, the device tensors are replaced in the cache and the existing host-canonical copies are refreshed; the next GPU call needs no parameter upload. Exact host value snapshots detect direct edits to public `params` and trigger a refresh; BN rolling statistics remain separately host-managed. Evidence: `MEM=3G ./tools/test_host.sh dcnv4` passed 29 tests, including measured upload reduction on repeated forward and invalidation after host edits. The actual-GPU two-step SGD/Adam CPU-parity test passed (1, 313.12 s). This retains parameter copies on device but still downloads updates to maintain host canonical state; no speedup or compiled-C++ golden claim. GPU Muon and broader parity requirements remain open.
+
+## 68. Native GPU Muon orthogonalization primitive
+
+- v0.2.031 (`b46ad9c8`): added a native Oxide f32 Newton–Schulz orthogonalization primitive exposed through `F32TensorOpsBackend::muon_orthogonalize_f32`; the generic default uses a host reference, while Oxide uses device Frobenius-norm accumulation, transpose/linear-combination kernels and existing GPU GEMM for five paper-coefficient iterations. Actual-GPU parity passed against the host reference for square, tall and wide matrices (including 17x31 and 31x17); zero and invalid-shape cases passed (`MEM=3G ./tools/test_oxide.sh --test oxide_muon`, 2 tests); host-reference zero/non-finite/transpose-equivariance tests also passed (`MEM=3G PKGS=lightnet-cuda ./tools/test_host.sh muon_orthogonalize`, 2 tests). This is a standalone matrix primitive, **not** GPU Muon optimizer integration: `update_weights_gpu` still rejects `[net] muon=1`, and GPU momentum/update, hybrid AdamW fallback, runtime layer eligibility/gates and optimizer-sidecar state remain unimplemented. CPU Muon is still v0.1.005. No compiled-C++ golden or full-suite claim.
+
+## 69. Connected GPU Muon and deconvolution GPU runtime slices
+
+- v0.2.032 (`2ddcaa6b`): added opt-in `[net] muon=1` update dispatch for host-resident connected parameters (plus standalone BatchNorm AdamW-only state); eligible dense matrices call the native Oxide Newton–Schulz primitive, while momentum staging, final direction application, host-canonical parameters and optimizer state remain host-side. DNOPT6 save/load now carries GPU Muon momentum in the same host-only layout as CPU Muon. Unsupported parameter families reject before updates, and deferred host synchronization rejects explicitly. Evidence at the release: `MEM=3G ./tools/test_host.sh gpu_muon_` passed 2 tests and `muon_` passed 23; actual-GPU `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_connected_two_step_update_matches_cpu` passed (1), covering two CPU-parity steps plus sidecar save/resume and a third parity step. This is a limited connected-layer runtime slice, not full GPU Muon: other eligible layer families, device-resident momentum/final parameter updates, and broader gate/optimizer coverage remain open.
+- v0.2.033 (`d73a87e7`): added standalone BatchNorm GPU-Muon-path parity for scale/bias AdamW fallback and optimizer state using FakeBackend. Follow-up `MEM=3G ./tools/test_host.sh gpu_muon_` passed 3 tests and `muon_` passed 24. This did not expand native GPU layer coverage.
+- v0.2.034 (`f27b370c`): added native Oxide momentum/lookahead and decoupled direction-application ops, then wired connected-layer GPU Muon to keep momentum tensors cached on-device between updates and apply matrix decay/direction on-device. Host momentum mirrors are downloaded per update for DNOPT6 compatibility, and connected weights remain host-canonical (uploaded/downloaded at each step); biases/BN fallback remains host AdamW. Evidence at the release: host `lightnet-cuda` Muon 4, `oxide_muon` 3, GPU-Muon host 3, Muon regressions 24, and actual-GPU single-connected two-step/resume parity 1.
+- v0.2.035 (`cc0c00c1`): added actual-GPU CPU-parity coverage for two connected layers over two updates and FakeBackend `dont_update=1` gate behavior (parameters/state remain unchanged while the global step advances). Follow-up `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4 and `muon_` passed 25; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_multiple_connected_layers_match_cpu_across_steps` passed 1. Scope remains connected-only, with host-canonical parameters/state mirror; other eligible families and real-device gate coverage remained open at this release.
+- v0.2.036 (`86b2fbda`): actual-GPU two-layer test now checks `dont_update=1` against CPU across two updates: the gated first layer stays unchanged initially, the ungated second layer updates, then parity holds when the first layer becomes eligible. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_connected_update_gate_matches_cpu_on_device` passed 1. Actual-device coverage for other gate variants/connected BN and other eligible families remains open.
+- v0.2.037 (`281cdc7c`): extended GPU Muon eligibility to deconvolutional matrices, whose forward/backward gradients are host-fallback. The shared hybrid staging path runs Newton–Schulz through Oxide, while momentum, final parameter update, and optimizer state remain host-side. Two-step actual-GPU CPU parity passed with `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_deconvolution_host_gradients_match_cpu_across_steps`; `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4. Convolutional GPU Muon remains explicitly rejected because its gradients are device-resident; other families remain unsupported. This adds GPU Muon eligibility, not a native GPU deconvolution layer path.
+- v0.2.038 (`fadfcb95`): added actual-GPU CPU-parity coverage for the connected-layer `burnin_update=1` gate. A first update within burn-in preserves parameters; after setting the iteration beyond burn-in, the Oxide Muon update changes parameters and matches CPU. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_connected_burnin_gate_matches_cpu_on_device` passed 1. Other gate variants/connected BN remain unverified; no compiled-C++ golden or full-suite claim.
+- v0.2.039 (`b1fef3f9`): added host-reference and native Oxide f32 transposed-convolution forward, input-gradient, weight-gradient and bias-gradient operations, then integrated the backend operations in GPU runtime forward/backward. Supported activations take the GPU path; unmapped activations retain the legacy host route. `MEM=3G PKGS=lightnet-cuda ./tools/test_host.sh deconvolutional` passed; `MEM=3G ./tools/test_host.sh deconvolutional_layer_trains_on_cpu_and_gpu_native_ops_identically` and `gpu_adam_updates_deconvolutional_host_parameters` each passed; native Oxide primitive tests compare outputs/gradients and invalid shapes against the host reference; actual-GPU `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_deconvolution_native_forward_backward_and_muon_match_cpu_across_steps` passed (1), including multi-step parity. Optimizer parameter/gradient staging remains host-side; this does not add f16 or compiled-C++ parity. No full-suite claim.
+- v0.2.040 (`798d3389`): added an actual-Oxide runtime-chain test for native deconvolution forward/backward plus two-step CPU parity under both SGD and Adam. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_deconvolution_native_sgd_and_adam_updates_match_cpu_across_steps` passed (1); optimizer updates still stage through host buffers. This is focused GPU evidence, not full-suite or compiled-C++ parity.
+- v0.2.041 (`4edd8860`): added actual-Oxide CPU-parity coverage for connected GPU Muon with batch normalization, including output, connected weights/biases, BN scales and rolling stats across two updates. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_connected_batch_norm_matches_cpu_across_steps` passed (1). This exercises the existing CPU-backward/host BN optimizer fallback; connected BN backward is not native. Other Muon families and gate variants remain open.
+- v0.2.042 (`56bfbe2f`): added actual-device two-update CPU parity for connected GPU Muon with `train_only_bn=1`; CPU and Oxide both preserve parameters under the propagated gate. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_connected_train_only_bn_gate_matches_cpu_on_device` passed (1). Together with `dont_update` and `burnin_update`, all three layer update gates have connected actual-device coverage; other parameter families remain open.
+- v0.2.043 (`506dc9bd`): extended the GPU Muon hybrid path to ViT matrices, using native Oxide Newton–Schulz orthogonalization with the existing host gradients, momentum/state, and final updates. Two-step actual-Oxide CPU parity covers all five eligible ViT matrices and the AdamW fallback parameters; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_vit_host_gradient_matrices_match_cpu_across_steps` and `MEM=3G ./tools/test_host.sh gpu_muon_` passed. This does not add native ViT layer forward/backward or device-resident Muon updates.
+- v0.2.044 (`32a111b7`): added Swin matrices to the same hybrid GPU Muon path. Actual-Oxide two-step CPU parity covers QKV/attention/FFN matrices and AdamW-updated parameters; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_swin_host_gradient_matrices_match_cpu_across_steps` passed, and host `gpu_muon_` passed 4. Swin layer forward/backward and optimizer state/final updates remain host-side.
+- v0.2.045 (`5bff2104`): added TuckerAttention matrices to hybrid GPU Muon eligibility. Actual-Oxide two-step CPU parity covers its packed factor weights and biases; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_tucker_host_gradient_matrices_match_cpu_across_steps` passed, and host `gpu_muon_` passed 4. TuckerAttention forward/backward and momentum/final updates remain host-side.
+- v0.2.046 (`dd40ca39`): added MambaVision matrices to hybrid GPU Muon eligibility. Actual-Oxide two-step CPU parity covers its packed parameter vector; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_mambavision_host_gradient_matrices_match_cpu_across_steps` passed, and host `gpu_muon_` passed 4. MambaVision forward/backward and momentum/final updates remain host-side.
+- v0.2.047 (`fb05dad0`): added KimiKda matrices to hybrid GPU Muon eligibility. Actual-Oxide two-step CPU parity covers its packed factor/FFN weights and biases; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_kimi_kda_host_gradient_matrices_match_cpu_across_steps` passed, and host `gpu_muon_` passed 4. KimiKda forward/backward and momentum/final updates remain host-side.
+
+## 70. Native locally connected layer
+
+- v0.2.048: added host-reference and native Oxide f32 locally connected `[local]` forward, input-gradient, weight-gradient and bias-gradient operations, with GPU runtime routing for supported activations. Oxide primitive parity (2 tests) and actual-GPU two-step SGD runtime CPU parity passed; `MEM=3G ./tools/test_host.sh local` passed 11. Fixed the GPU runtime CPU-fallback SGD update gap for local parameters. Extended hybrid GPU Muon to each location-specific local matrix; actual-GPU two-step CPU parity passed under Muon, and `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4. Local optimizer gradients/state/final updates remain host-staged; Muon orthogonalization is native Oxide. Unsupported activations retain the legacy host path. No compiled-C++ golden, full-suite, or performance claim.
+
+## 71. GPU Muon RNN matrices
+
+- v0.2.049: extended hybrid GPU Muon eligibility to RNN's input, recurrent, and output matrices, using the existing native-device RNN forward/backward and Oxide orthogonalization with host-staged gradients/state/final updates. Actual-GPU two-step CPU parity passed for outputs, all three weight groups, and biases (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_rnn_device_matrices_match_cpu_across_steps`); host `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4. No compiled-C++ golden, full-suite, or performance claim.
+
+## 72. GPU Muon LSTM matrices
+
+- v0.2.050: extended hybrid GPU Muon eligibility to LSTM's four input and four recurrent matrices, using native-device forward/backward and Oxide orthogonalization with host-staged gradients/state/final updates. Actual-GPU two-step CPU parity passed for outputs, all eight weight groups and biases (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- gpu_muon_lstm_device_matrices_match_cpu_across_steps`); host `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4. No compiled-C++ golden, full-suite, or performance claim.
+
+## 73. Native GPU SAM forward and backward
+
+- v0.2.051: replaced SAM's host-round-trip forward with native f32 pointwise multiply plus supported activation, and added the exact activation adjoint plus gradients to both the preceding layer and the configured source layer. Unsupported activations retain host forward and whole-network CPU backward fallback. Actual-Oxide two-step SGD parity passed for outputs and both upstream convolution parameter sets; coverage also checks `forward_training_device` and the fan-out source gradient (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- sam_native_gpu_forward_backward_fans_out_source_gradient_matches_cpu_across_steps`). The broad host `sam` filter passed 28 matched tests, though it is not a SAM-specific test. No compiled-C++ golden, full-suite, or performance claim.
+
+## 74. Hybrid GPU Muon for convolution matrices
+
+- v0.2.052: extended hybrid GPU Muon to standard convolutional matrices without batch normalization. The optimizer downloads accumulated device weight/bias gradients at the update boundary, runs Oxide Newton–Schulz orthogonalization, applies host-staged AdamW/Muon updates, refreshes cached device parameters, and clears consumed device gradients. Actual-Oxide grouped-convolution parity passed for two updates with two accumulated seeded backward calls per step, including outputs, weights, and biases (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_convolution_device_gradients_match_cpu_across_steps`); `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4, including the explicit BN-convolution rejection. BN convolutions and other convolutional families remain unsupported; gradients/state/final updates cross the host boundary. No compiled-C++ golden, full-suite, or performance claim.
+
+## 75. Hybrid GPU Muon for non-BN EML branches
+
+- v0.2.053: extended hybrid GPU Muon to both non-batch-normalized EML convolution branches. Accumulated device weight/bias gradients are downloaded at the optimizer boundary, each branch's matrices use Oxide Newton–Schulz, host AdamW/Muon updates apply, and updated parameters are re-uploaded to the appropriate device cache slots while gradients are cleared. Actual-Oxide CPU parity passed across two updates with two accumulated seeded backward calls per step, covering outputs, both branches' weights/biases, and a subsequent forward after cache refresh (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_eml_device_gradients_match_cpu_across_steps`). Host `MEM=3G ./tools/test_host.sh gpu_muon_` passed 4 and rejects BN EML/convolution before mutation. BN EML remains unsupported; gradients/state/final updates cross the host boundary. No compiled-C++ golden, full-suite, or performance claim.
+
+## 76. Hybrid GPU Muon for non-BN MoE
+
+- v0.2.054: extended hybrid GPU Muon to the MoE router matrix and all expert convolution matrices when expert batch normalization is disabled. Accumulated router/expert gradients are downloaded from device at the update boundary, Oxide performs Newton–Schulz orthogonalization, host AdamW/Muon updates apply, expert parameters are re-uploaded to their device cache slots, and device accumulators are cleared. Actual-Oxide CPU parity passed over two updates with two accumulated seeded backward calls per step, covering outputs, router weights/biases and every expert's weights/biases (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_moe_device_gradients_match_cpu_across_steps`). BN MoE remains explicitly rejected by the host regression test. Gradients/state/final updates cross the host boundary. No compiled-C++ golden, full-suite, or performance claim.
+
+## 77. Hybrid GPU Muon for non-BN DCNv4 offset projection
+
+- v0.2.055: extended hybrid GPU Muon to the DCNv4 offset-projection matrix when batch normalization is disabled. The existing per-layer device-gradient flush is now targetable so update-gated layers retain untouched device buffers; eligible accumulated DCNv4 gradients are staged to host, Muon orthogonalizes the offset matrix with the existing 0.01 learning-rate scale, remaining DCNv4 parameters receive the existing AdamW fallback, and updated host parameters are detected/re-uploaded by the DCNv4 snapshot cache on the next forward. Actual-Oxide CPU parity passed across two updates with two accumulated backward calls per step, covering outputs, offset weights/biases and output biases (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_dcnv4_offset_projection_matches_cpu_across_steps`). BN DCNv4 remains explicitly rejected before mutation. This is hybrid: gradients, state and final updates cross the host boundary; no compiled-C++ golden, full-suite or performance claim.
+
+## 78. Hybrid GPU Muon for non-BN deform_conv
+
+- v0.2.056: enabled GPU Muon for supported non-batch-normalized `[deform_conv]` layers. Its native Oxide forward/backward computes parameter gradients; backward currently downloads those gradients into host train buffers, where Muon Newton–Schulz and the existing AdamW fallback/state/update apply. The hybrid path covers the main convolution, offset predictor, and optional mask predictor matrices while biases retain AdamW. Actual-Oxide CPU parity passed across two updates with two accumulated seeded backward calls per step, including a preceding native convolution (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_deform_conv_native_gradients_match_cpu_across_steps`). BN deform_conv remains explicitly rejected before mutation. No compiled-C++ golden, full-suite, or performance claim.
+
+## 79. Native Oxide GraphConv uniform aggregation primitives
+
+- v0.2.057: added checked host-reference and native Oxide f32 forward/adjoint primitives for `[graph_conv]` edge mode 0's uniform valid-neighbor spatial average. NCHW, odd-kernel shape validation covers asymmetric geometry, stride, dilation and padding; backward gathers into unique input-gradient elements without atomics. Actual-device tests pass against the host reference plus finite differences (`MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv`, 2 tests); the existing GraphConv CPU host filter passes 15 tests (`MEM=3G ./tools/test_host.sh graph_conv`). **This does not wire `[graph_conv]` into GPU runtime forward/backward**: learned-edge softmax, self projection, BN, runtime caches, projection epilogue/gradients and optimizer integration remain open. Hand-derived from Rust CPU reference/source, no compiled-C++ golden, no full-suite or performance claim.
+
+## 80. GraphConv aggregation coordinate-overflow guards
+
+- v0.2.058: strengthened the new GraphConv aggregation geometry validator to reject i64 coordinate arithmetic overflow before kernel launch, including large padding/stride combinations whose tensors appear shape-consistent. The actual-Oxide suite now has 3 passing tests, adding explicit overflow rejection to host-reference parity, finite-difference and malformed-output checks (`MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv`). This hardens only the aggregation primitive; GraphConv runtime remains unwired. No compiled-C++ golden, full-suite or performance claim.
+
+## 81. Native GPU GraphConv uniform runtime path
+
+- v0.2.059: wired native Oxide f32 forward/backward for `[graph_conv]` edge mode 0 with no self projection or BN and backend-supported activation. Aggregation and grouped 1x1 projection/bias/activation run on device; backward computes activation, projection parameter, and aggregation-adjoint gradients on device, then stages projection gradients to host train buffers for SGD/Adam updates. Actual-Oxide runtime parity passed for layer outputs and SGD/Adam parameter updates through GraphConv and an upstream convolution (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_uniform_runtime_forward_backward_and_sgd_match_cpu`); host `graph_conv` filter passed 15 tests including host fallback. Unsupported learned-edge/self/BN/activation variants retain CPU fallback; compact GPU inference remains unsupported. Parameters are uploaded for projection and gradients download at backward; no residency/speedup claim. No compiled-C++ golden or full-suite claim. A prior broad runtime-chain run reported 50 passes and one failure because the test passed a GPU host snapshot (which intentionally omits device caches) to CPU backward; the test now pairs each forward state with its matching backward path, and `dcnv4_mixed_network_cpu_and_gpu_backward_succeed` passes.
+
+## 82. GraphConv learned-edge masked-softmax host contract
+
+- v0.2.060: added checked host references for GraphConv learned-edge mode 1 aggregation and its exact input/edge-kernel/edge-bias adjoint. The contract fixes group-local `[groups, size*size, 2*channels_per_group]` layout, row-major edge order, center-reference zeroing when out of bounds, and masking invalid neighbors before stable softmax. Host-reference finite differences cover every input/kernel/bias element; constant-input masking and malformed group/length rejection pass in `MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv` (4 tests total). This is a contract/reference increment only: **no native learned-edge GPU kernel or runtime integration exists yet**; CPU reference source and hand-derived equations only, no compiled-C++ golden. `PKGS=lightnet-cuda MEM=3G ./tools/test_host.sh learned_aggregate` could not run because an unrelated existing unit-test compile error in `host_ops/local.rs` prevents the `lightnet-cuda` library test target from compiling; the contract is exercised through the Oxide integration test target instead.
+
+## 83. Native GraphConv learned-edge forward primitive
+
+- v0.2.061: added a native Oxide learned-edge mode 1 forward kernel and backend operation for group-local row-major edge parameters. The kernel computes valid-edge logits, masks invalid spatial neighbors before max-stabilized softmax, and aggregates NCHW values; the backend validates geometry, group divisibility, and parameter extents before launch. Actual-Oxide parity against the checked host reference, including boundary sites, plus malformed group/parameter rejection passes in `MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv` (4 tests total); host-reference input/kernel/bias finite differences also remain green. This is **primitive-only**: no native backward or runtime dispatch yet, and no compiled-C++ golden/full suite/performance claim. The trait's default implementation remains host reference for other backends.
+
+## 84. Native GraphConv learned-edge adjoints
+
+- v0.2.062: added actual-Oxide learned-edge backward primitives for input, edge-kernel, and edge-bias gradients. Device scratch stores normalized edge weights and masked-softmax logit adjoints; gather/reduction kernels avoid write races. Oxide outputs for all three gradients match the checked host adjoint, whose every input/kernel/bias element is finite-difference checked. `MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv` passes 4 tests. No GraphConv runtime dispatch yet; this is primitive-only and has no compiled-C++ golden/full-suite/performance claim.
+
+## 85. GraphConv learned-edge runtime path
+
+- v0.2.063: routed learned-edge mode 1 GraphConv through native Oxide aggregation forward/backward for no-self/no-BN supported-activation configurations. Learned edge-kernel/bias gradients are downloaded into existing host optimizer buffers; projection and edge parameters continue to update host-side (SGD/Adam). Actual-Oxide runtime output and updates match CPU across SGD then Adam in `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_learned_runtime_forward_backward_and_updates_match_cpu` (1 test). Unsupported edge modes, self projection, BN, and unsupported activations keep host fallback; compact inference and compiled-C++ golden validation remain open. No full-suite or performance claim.
+
+## 86. GraphConv center-reference gather primitive
+
+- v0.2.064: added checked host and native Oxide center/reference gather and exact input adjoint. Odd-kernel center coordinates use the same stride/padding/dilation mapping as GraphConv; out-of-bounds references are zero, and the adjoint gathers the unique mapped output without atomics. Actual-Oxide forward/backward parity, all-input finite differences, and padded/strided boundary coverage pass in `MEM=3G ./tools/test_oxide.sh --test oxide_graph_conv` (5 tests total). This prepares—but does not yet implement—self-projection runtime support. No compiled-C++ golden/full-suite/performance claim.
+
+## 87. GraphConv self-projection runtime path
+
+- v0.2.065: integrated the native center-reference branch into GraphConv no-BN runtime. Self projection now runs as a grouped pointwise convolution added to the neighbor projection; backward computes its weight gradient, gathers its input adjoint through the reference primitive, and accumulates self-weight updates into existing host optimizer buffers. Actual-Oxide runtime forward/backward and parameter parity against CPU pass across SGD and Adam in `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_self_projection_runtime_forward_backward_and_sgd_adam_match_cpu` (1 test). BN, unsupported activations/edge modes, compact inference, and compiled-C++ golden remain open; optimizer gradients/updates are host-staged. No full-suite/performance claim.
+
+## 88. Compact GraphConv inference
+
+- v0.2.066: enabled the compact f32 GPU inference path for GraphConv configurations already supported by the native runtime (edge modes 0/1, optional self projection, no BN, supported activation). The compact layer arm composes native aggregation/reference gather, grouped pointwise projections, bias, and activation without a backward cache. Actual-Oxide compact output matches CPU for learned edges plus self projection in `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_compact_inference_matches_cpu_with_learned_edges_and_self` (1 test). Unsupported variants retain an explicit preflight rejection; no C++ golden/full-suite/performance claim.
+
+## 89. Compact GraphConv batch-normalization inference
+
+- v0.2.067: extended compact f32 GraphConv inference to apply batch normalization using rolling mean/variance, gamma, and projection beta. The compact-only eligibility check now permits BN while the training/full-runtime predicate still preserves the existing BN fallback. Actual-Oxide CPU parity passes for learned edges plus self projection and BN in `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_compact_inference_matches_cpu` (2 tests, BN and non-BN). Training BN and compiled-C++ golden remain open; no full-suite/performance claim.
+
+## 90. Full GraphConv batch-normalization inference
+
+- v0.2.068: extended the ordinary f32 GPU inference runtime to execute supported GraphConv variants with BN natively, using rolling statistics, gamma and projection beta; compact inference support from v0.2.067 remains. Training BN and unsupported activation/edge variants retain CPU fallback. A FakeBackend test confirms this inference path avoids constructing the CPU GraphConv cache; actual-Oxide full and compact outputs match CPU in `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv_compact_inference_matches_cpu` (2 tests). The focused `MEM=3G ./tools/test_host.sh graph_conv_batchnorm_inference_uses_gpu_backend_without_cpu_cache` passed 1 core test. Hand-derived from the Rust CPU contract; no compiled-C++ golden, full-suite, or performance claim.
+
+## 91. Hybrid GPU Muon for non-BN GraphConv matrices
+
+- v0.2.069 (`d79c3aaf`): enabled GPU Muon for GraphConv projection, self-projection, and learned-edge kernel matrices when BN is disabled. Native Oxide Newton–Schulz orthogonalization is used; GraphConv forward/backward gradients, Muon state, and final parameter updates remain host-staged. Actual-Oxide CPU parity passed over two updates for learned edges plus self projection, comparing projection weights/biases, self weights, edge kernels, and edge biases: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_matrices_match_cpu_across_steps`. A host FakeBackend regression confirms batch-normalized GraphConv rejects before mutation: `MEM=3G ./tools/test_host.sh gpu_muon_rejects_batch_normalized_convolution_eml_moe_dcnv4_and_deform_before_updating` passed 1 core test. BN GraphConv remains unsupported; no compiled-C++ golden, full-suite, or performance claim.
+
+## 92. GraphConv GPU Muon DNOPT6 sidecar resume
+
+- v0.2.070 (`3886b6c2`): extended the GraphConv hybrid GPU Muon parity test through optimizer-state save/load and a resumed third update. CPU and GPU DNOPT6 sidecars are loaded into fresh executables; resumed output and projection/self/edge matrix plus bias updates match CPU. Verified by `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_matrices_match_cpu_across_steps` (1 actual-Oxide test). This verifies the existing sidecar format for the tested learned-edge+self, non-BN variant; other GraphConv variants and full GPU/CPU parity requirements remain open. No compiled-C++ golden, full-suite, or performance claim.
+
+## 93. GraphConv GPU Muon update gate
+
+- v0.2.071 (`9aaa30fb`): added actual-Oxide CPU parity for GraphConv Muon with `dont_update=1`. The test runs forward/backward, confirms CPU and Oxide outputs agree, verifies all GraphConv parameters remain unchanged after the gated optimizer call, and confirms the global optimizer step advances. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_dont_update_gate_preserves_parameters` passed 1 test. This covers only the no-BN learned-edge+self variant; other per-layer gates/configurations remain unverified. No compiled-C++ golden/full-suite/performance claim.
+
+## 94. Grouped GraphConv GPU Muon parity
+
+- v0.2.072 (`543d57e0`): strengthened actual-Oxide GraphConv Muon coverage to `groups=2` for learned-edge+self with batch normalization disabled. Two optimizer updates, DNOPT6 save/load, and a resumed third update match CPU for projection/self/edge matrices and biases. The focused test passes: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_matrices_match_cpu_across_steps` (1 test). This pins tested grouped parameter slicing and sidecar continuation, not all GraphConv variants; no compiled-C++ golden/full-suite/performance claim.
+
+## 95. GraphConv BN GPU Muon through CPU fallback
+
+- v0.2.073 (`007d6eed`): enabled GPU Muon updates for batch-normalized GraphConv by using the existing whole-network CPU forward/backward fallback for BN variants, while Oxide supplies matrix orthogonalization. Actual-device two-step parity covers grouped learned edges+self, projection/self/edge matrices and biases, BN gamma/beta, and rolling mean/variance: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_graph_conv_batch_norm_cpu_fallback_matches_cpu` passed 1 test. This is optimizer eligibility over the CPU training fallback—not native GraphConv BN training. Native BN training, other activation/edge/group variants, and compiled-C++ evidence remain open; no full-suite/performance claim.
+
+## 96. Native GraphConv BN training
+
+- v0.2.074: native f32 GraphConv training now supports batch-statistics BN with the eligible edge modes 0/1 and supported activations. GPU forward caches BN statistics; native backward computes input, gamma, beta, projection, self, and learned-edge gradients. Rolling mean/variance return from the device after backward using the CPU GraphConv reference's 0.9 update coefficient. Oxide actual-device parity passed for grouped learned-edge+self across SGD and Adam, including output, trainable parameters and rolling statistics (`graph_conv_batch_norm_native_training_forward_backward_sgd_adam_matches_cpu`); two-step GPU Muon parity also passes (`gpu_muon_graph_conv_batch_norm_native_training_matches_cpu`). `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain graph_conv` passed 9 tests; focused host BN inference and Muon rejection tests passed. Unsupported activations/edge modes retain fallback; other configurations, compiled-C++ golden, full-suite and performance evidence remain open.
+
+## 97. Standalone BatchNorm native GPU training
+
+- v0.2.075: standalone `[batchnorm]` training now uses native Oxide batch-statistics forward/backward, caches batch statistics, and synchronizes rolling mean plus the CPU-reference biased rolling variance after backward. Scale/bias optimizer application remains the existing host AdamW fallback. Actual-Oxide output and parameter/stat parity against CPU passed in `standalone_batch_norm_native_training_matches_cpu_adam`; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain batch_norm` passed 9 tests, including recurrent/connected/GraphConv BN regressions. This does not add compiled-C++ golden evidence, native standalone-BN optimizer updates, or full-suite/performance claims.
+
+## 98. Native Crop training geometry
+
+- v0.2.076 (`c815a081`): native Crop training supports random crop coordinates, optional horizontal flip, rotation, and the per-in-bounds-tap affine scaling with zero-valued out-of-bounds taps. Training HSV/saturation/exposure/RGB-shift augmentation remains explicitly rejected. Actual-Oxide runtime parity passes for an augmented Conv→Crop chain over SGD and Adam, comparing crop outputs and upstream Conv updates: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain crop_native_training_augmentation_and_backward_match_cpu` passed. Crop bilinear fwd/bwd primitive parity and FD pass (`oxide_pool_parity crop_bilinear_forward_backward_and_fd`), and host crop filter passed 10 tests. This is Rust CPU/Oxide parity, not compiled-C++ parity; no full-suite/performance claim.
+
+## 99. DCNv4 mixed-network backward validation
+
+- v0.2.077 (`e583f9d2`): corrected a stale mixed-network regression test that passed the GPU forward's host snapshot to CPU backward, although GPU backward caches intentionally live in `GpuForwardState`. The test now pairs the CPU forward with CPU backward and GPU forward with native GPU backward. Its focused test passes; the complete `oxide_runtime_chain` binary passes 62/62 tests (`MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain`, 1273.53 seconds). This is scoped Oxide runtime-chain evidence only—not the entire Rust suite, compiled-C++ golden, or overall objective completion.
+
+## 100. Explicit GPU rejection for GRU training
+
+- v0.2.078 (`57b00348`): added an explicit `UnsupportedLayer` GPU error for `[gru]`, replacing the misleading catch-all parameter/config mismatch. The focused Oxide training-rejection test passes. Native inference was added separately in §102; GPU training/backward remains unsupported.
+
+## 101. Region CPU forward and axis pin
+
+- v0.1.027: hand-ported the CPU portion of `Jev_laya:src-lib/region_layer.cpp:209-235`: C++ `flatten` layout (`blas.cpp:104`), objectness logistic, optional class softmax, and the exact supplied-seed adjoint. `[region] softmax` is parsed and input channels are validated against `num * (coords + classes + 1)`. Named non-square, batch-2 axis test `region_axis_layout_matches_cpp_flatten_objectness_and_classes` checks outputs and adjoints. `MEM=3G ./tools/test_host.sh axis_layout` passed 22 tests; `every_layer_kind_has_an_axis_pin_decision` passed; all 12 cfgs containing `[region]` passed isolated parse/construct/CPU-inference runs. GPU full/compact inference now rejects explicitly; Oxide rejection test passes. Truth-driven Region loss/decode, GPU kernels, and compiled-C++ golden remain open; source-derived, no compiled-C++ parity claim.
+
+## 102. Native GRU GPU inference
+
+- v0.2.079: added a native f32 GPU inference composition for `[gru]` using device connected projections, logistic gates, pointwise reset/update equations, sequence slicing and concatenation. Rolling-stat BN is folded into each projection's weights and bias; training remains explicitly rejected because no native backward/cache/update path exists. The actual Oxide tests `gru_native_inference_matches_cpu_for_multiple_steps` and `gru_native_inference_matches_cpu_with_rolling_batch_norm` compare outputs against Rust CPU, and `gru_gpu_training_path_is_rejected_as_unsupported_not_misconfigured` verifies the boundary. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gru` passed 3 tests; host axis tests passed 23. No C++ golden/parity, training parity, full-suite or performance claim.
+
+## 103. Native RNN rolling-stat BN inference
+
+- v0.2.080: native f32 RNN inference now dispatches through device recurrent projections even when batch normalization is enabled. Rolling-stat BN affine parameters are folded into each projection's weights/biases before upload, matching CPU inference. BN training continues on the existing host fallback because its batch-stat/cache semantics are separate. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain rnn` passed 6 tests, including `rnn_native_inference_matches_cpu_with_rolling_batch_norm` plus RNN/CRNN training regressions. Rust CPU reference parity only; no C++ golden, full-suite, or performance claim.
+
+## 104. Native LSTM rolling-stat BN inference
+
+- v0.2.081: native f32 LSTM inference now dispatches through device recurrent projections with rolling-stat BN folded into the four recurrent and four input projection weight/bias pairs. BN training remains on the host fallback. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain lstm` passed 4 tests, including `lstm_native_inference_matches_cpu_with_rolling_batch_norm` and existing LSTM forward/backward/Muon regressions. Rust CPU-reference parity only; no C++ golden, full-suite or performance claim.
+
+## 105. Native RNN rolling-stat BN training
+
+- v0.2.082: extended the device RNN forward to fold each rolling-stat BN affine into its projection during training as well as inference. The existing GPU recurrent backward path already handles rolling-stat BN affine/scale gradients, so BN RNN no longer needs host forward/backward fallback for supported activations. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain rnn` passed 6 tests, including `batch_normalized_rnn_device_backward_matches_cpu_on_oxide` (forward outputs, backward gradients, and parameter updates vs CPU) and existing non-BN RNN/CRNN regressions. Unsupported activations remain host fallback; no C++ golden/full-suite/performance claim.
+
+## 106. Native LSTM rolling-stat BN training
+
+- v0.2.083: routed all LSTM inference and training forwards through native recurrent projections, folding rolling-stat BN affines into each projection. The existing LSTM device backward computes rolling-stat BN gradients, so BN training no longer needs the whole-layer CPU forward/backward fallback. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain lstm` passed 4 tests, including `batch_normalized_lstm_device_backward_matches_cpu_on_oxide` (output and parameter updates vs CPU) and existing non-BN backward/Muon regressions. No C++ golden, full-suite or performance claim.
+
+## 107. Native CRNN rolling-stat BN training
+
+- v0.2.084: enabled native CRNN recurrent-convolution forward with rolling-stat BN affines folded into the three convolution projections. The existing device CRNN backward path handles BN input/beta/scale adjoints, so the training forward no longer falls back to CPU for supported activations. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain batch_normalized_crnn_device_backward_matches_cpu_on_oxide` passed on Oxide; the FakeBackend `gpu_batch_normalized_crnn_backward_matches_cpu_and_updates_rolling_stats` host test also passed. Coverage includes multi-step output, gradients, parameter updates, rolling stats, upstream convolution and finite-gradient checks. No C++ golden, full-suite or performance claim.
+
+## 108. Hybrid GPU Muon for CRNN matrices
+
+- v0.2.085: enabled CRNN convolution projection matrices in GPU Muon eligibility. Oxide performs the Newton–Schulz orthogonalization; gradients and optimizer state/final updates remain host-managed. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_muon_crnn_device_matrices_match_cpu_across_steps` passed two actual-Oxide updates against CPU Muon with BN enabled, checking forward outputs, all three projection weights/biases, and BN scales. No C++ golden, full-suite or performance claim.
+
+## 109. Native GPU `maxpool_depth`
+
+- v0.2.086: added native Oxide f32 forward and deterministic backward for depth pooling, preserving the Rust/C++-derived strided-channel grouping and first-wins ties. Full GPU runtime dispatch now supports it in training/inference; f16 remains explicitly unsupported. `MEM=3G ./tools/test_host.sh maxpool_depth` passed 2 CPU/config tests, and `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain maxpool_depth` passed 2 actual-Oxide runtime tests (native forward/backward parity plus ordinary maxpool regression). No compiled-C++ golden, full-suite or performance claim.
+
+## 110. MaxPool axis/layout contract pin
+
+- v0.1.028: pinned the MaxPool axis contract to a named non-square, batch-2 hand-computed test covering depth-channel groups, first-wins ties, NCHW batch/channel/spatial order, spatial scan/stride order and `maxpool_zero_nonmax` backward. `MEM=3G ./tools/test_host.sh axis_layout` passed 24 tests; `MEM=3G ./tools/test_host.sh every_layer_kind_has_an_axis_pin_decision` passed. The axis ledger now records 21 pinned variants / 39 open C++ variants / 5 Rust-only extensions. Hand-derived from `Jev_laya:src-lib/maxpool_layer.cpp`; no compiled-C++ golden.
+
+## 111. AvgPool axis/layout contract pin
+
+- v0.1.029: pinned the global AvgPool reduction with a hand-computed non-square B=2/C=2 fixture and supplied-seed backward. The named test verifies `[B,C]` output order, per-sample/per-channel `H*W` means, and uniform per-plane gradients; config shape and the axis registry are checked. `MEM=3G ./tools/test_host.sh axis_layout` passed 25; the standalone test and registry test passed. Hand-derived from `Jev_laya:src-lib/avgpool_layer.cpp:51`; no compiled-C++ golden.
+
+## 112. LocalAvgPool axis/layout contract pin
+
+- v0.1.030: pinned local-average pooling with a hand-computed non-square B=2/C=2 fixture covering odd window size, distinct x/y strides, partial edge windows from padding, NCHW output order, and the exact overlap-summed seeded backward. The named config also checks output geometry. `MEM=3G ./tools/test_host.sh axis_layout` passed 26; `MEM=3G ./tools/test_host.sh every_layer_kind_has_an_axis_pin_decision` passed, and the focused test passed. Hand-derived from `Jev_laya:src-lib/maxpool_layer.cpp:440`; no compiled-C++ golden.
+
+## 113. Native f16 `maxpool_depth` inference
+
+- v0.2.087: extended compact Oxide f16 inference for `[maxpool] maxpool_depth=1` with a native half-storage kernel. The channel-group scan widens for comparisons, retains the first channel on ties, and stores the selected half bits without an unnecessary round trip. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 7 tests; the new depth case matches compact f32 within the suite's 4e-3 tolerance (measured relative max error 2.488e-4). The f32 depth path and backend shape guards remain intact. No f16 training/backward or C++ golden claim.
+
+## 114. Connected axis/layout contract pin
+
+- v0.1.031: added a named non-square B=2 Connected test with C=2, H=2, W=3 and hand-set `[out][in]` weights. Hand-computed forward sentinels pin flattened NCHW features and batch-major output rows; a supplied seed pins the exact input adjoint per independent sample. Updated the exhaustive axis registry/ledger to 24 pinned and 36 open C++-backed variants. `MEM=3G ./tools/test_host.sh axis_layout` passed 27 tests; `MEM=3G ./tools/test_host.sh every_layer_kind_has_an_axis_pin_decision` passed. Hand-derived from `Jev_laya:src-lib/connected_layer.cpp:186`; no compiled-C++ golden.
+
+## 115. Native f16 SAM inference
+
+- v0.2.088: added a native Oxide f16 SAM product/activation kernel and compact-runtime dispatch for supported activations. Fixed compact GPU source-lifetime accounting to retain/release SAM's explicit source reference as well as its previous-layer input. An actual-Oxide two-convolution + non-adjacent-source SAM case matches f32 compact inference (relative max error 6.223e-4); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed all 8 tests. Inference only; SAM training remains the f32 path. No compiled-C++ golden.
+
+## 116. Native f16 channel-shuffle inference
+
+- v0.2.089: added a native Oxide half-storage channel permutation and compact f16 runtime dispatch for `[channel_shuffle]`. Actual-Oxide batch-2/channel-6 output matches f32 compact inference with relative max error 2.437e-4; the full `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` suite passed 9 tests. This is inference only; no compiled-C++ golden.
+
+## 117. Native f16 reorg inference
+
+- v0.2.090: added native Oxide f16 forward and reverse reorg permutations, reusing the checked shared reorg geometry and preserving zero-filled uncovered borders on reverse. Compact f16 dispatch now accepts Reorg. Actual-Oxide batch-2 non-square odd-size forward+reverse case matched f32 compact inference with relative max error 4.646e-4; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 10 tests before the fixture was refined, and the refined focused test passed. Inference only; no compiled-C++ golden.
+
+## 118. Native f32 Region GPU execution
+
+- v0.2.091: replaced Region's full/compact GPU hard rejection with native Oxide f32 layout/activation forward and exact Rust-forward input adjoint. Forward transposes channel-major NCHW values to spatial/anchor/entry rows, applies objectness sigmoid and optional class softmax; backward differentiates those transforms and returns NCHW gradients. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain region_native_gpu_forward_backward_matches_cpu` passed actual-Oxide CPU-reference comparisons for full training forward, compact inference and supplied-seed gradients with batch 2, non-square geometry, softmax both off/on. `MEM=3G ./tools/test_host.sh region` passed 2 tests including the hand-derived axis pin. Region truth-driven loss/decode remain absent. C++ GPU backward passes deltas through, unlike this exact derivative of the Rust forward; no compiled-C++ golden or parity claim.
+
+## 119. Native f16 Region inference
+
+- v0.2.092: added compact Oxide f16 Region inference with a half-storage channel-layout transpose, f32 objectness sigmoid/optional class softmax, and half stores. Both softmax-disabled/enabled batch-2 cases matched compact f32 (relative max errors 2.324e-4 and 2.856e-4); the full `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` suite passed 11 tests. f16 backward/training and Region truth-loss/decode remain unsupported; no compiled-C++ golden.
+
+## 120. Native f16 softmax inference
+
+- v0.2.093: added native Oxide compact f16 softmax, with per-sample equal contiguous groups, f32 max/exp/sum/normalization and one half rounding per result. Actual-Oxide group-count 1 and 2 outputs matched compact f32 (relative max errors 4.106e-4 and 5.549e-4); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 12 tests. Inference only; no f16 backward/training or compiled-C++ golden.
+
+## 121. Native f16 channel-slice inference
+
+- v0.2.094: compact f16 dispatch now handles `[channel_slice]` by selecting a source tensor and reusing the native half-storage route-concat copy. Actual-Oxide batch-2 output matched f32 compact with relative max error 2.353e-4; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 13 tests. Inference only; no compiled-C++ golden.
+
+## 122. Native f16 scale-channels inference
+
+- v0.2.095: added compact f16 ScaleChannels for both per-channel (global-average source) and per-spatial scale modes, with source activation and source-lifetime accounting. Actual-Oxide batch-2 outputs matched f32 (relative max errors 6.633e-4 and 1.701e-3); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 14 tests. Inference only; no compiled-C++ golden.
+
+## 123. Native f16 dropout inference
+
+- v0.2.096: compact f16 inference now accepts Dropout as a device-resident identity, matching inference semantics without RNG or host round-trip. Actual-Oxide output matched compact f32 (relative max error 3.890e-4); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 15 tests. Training dropout remains on existing f32 path; no compiled-C++ golden.
+
+## 124. Native f16 channel-normalization inference
+
+- v0.2.097: compact f16 convolution now supports all three convolution-only `NORM_CHAN*` activations through a native half-storage kernel with f32 reductions and half output stores. Actual-Oxide batch-2 outputs matched f32 (relative max errors 4.429e-4, 4.639e-4, 4.418e-4); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed 15 tests. Inference only; no compiled-C++ golden.
+
+## 125. Native f16 connected inference
+
+- v0.2.098: compact f16 inference now runs Connected through the existing f16 GEMM convolution epilogue after per-sample NCHW flattening. Supports folded rolling-stat BN and mapped scalar activations. Actual-Oxide batch-2 flattened inputs matched f32 for non-BN/BN (relative max errors 2.467e-4/3.655e-4); the full f16 suite passed 17 tests. Inference only; no compiled-C++ golden.
+
+## 126. Native f16 Cost identity and full ResNet101 coverage
+
+- v0.2.099: compact f16 now accepts `[cost]` as an inference identity, allowing the existing ResNet101 f16 parity fixture to run through its final Connected classifier and Cost section instead of stopping at avgpool. The full `real_cfgs_f16_matches_f32` test passed; final ResNet101 relative max error was 9.775e-4. The complete Oxide f16 suite passed 17 tests. Rust compact CPU/f32 references only; no compiled-C++ golden.
+
+## 127. Native f16 Detection and Regression identity paths
+
+- v0.2.100: compact f16 inference now retains `[detection]` and `[regression]` as device-resident identity layers, matching the current CPU/f32 forward contract. Actual-Oxide batch-2 chain parity passed against f32 compact (relative max error 2.152e-4); full Oxide f16 suite passed 18 tests. No compiled-C++ golden.
+
+## 128. Native connected-layer BN GPU backward
+
+- v0.2.101 (`c2c3acd9`): connected layers with BN no longer force whole-network CPU backward when the activation is supported. Oxide computes the activation/BN adjoint, raw connected input/weight gradients, and BN scale gradients; rolling statistics are updated from the pre-update raw output using the CPU rolling coefficient. BN scale/bias optimizer accumulation and rolling-stat synchronization remain host-managed. Actual-Oxide parity across two Muon updates passed in `gpu_muon_connected_batch_norm_matches_cpu_across_steps`; all five `gpu_muon_connected` Oxide tests and the focused host test passed. Rust CPU-reference parity only; no compiled-C++ golden or speedup claim.
+
+## 129. Connected BN GPU backward activation parity
+
+- v0.2.102 (`93c56f17`): expanded the actual-Oxide two-step connected-BN GPU Muon parity fixture to cover both `linear` and nonlinear `leaky` activation, including outputs, weights, biases, scales and rolling stats. The focused test and all five `gpu_muon_connected` runtime-chain tests passed. Rust CPU-reference parity; no compiled-C++ golden.
+
+## 130. Connected BN GPU backward SGD/Adam parity
+
+- v0.2.103 (`97374ebc`): added actual-Oxide two-step Connected BN backward and optimizer parity for both SGD and Adam with `leaky` activation. Outputs, weights, biases, BN scales, rolling means and rolling variances match the CPU reference. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain gpu_connected_bn_backward_matches_cpu_sgd_and_adam` passed. This verifies Rust CPU-reference parity only; no compiled-C++ golden.
+
+## 131. Route source/group axis pin
+
+- v0.1.032 (`6a98ce9b`): hand-derived from `Jev_laya:src-lib/route_layer.cpp:91-139`; named test `route_axis_layout_pins_named_source_order_group_slice_and_delta_scatter` uses batch-2 non-square NCHW sentinel tensors to pin relative named-source order, group selection, channel concatenation and backward delta scatter. `MEM=3G ./tools/test_host.sh route_axis_layout` passed; full `MEM=3G ./tools/test_host.sh axis_layout` passed 28 tests (945 filtered). No compiled-C++ golden.
+
+## 132. Upsample axis pin and ragged reverse extent
+
+- v0.1.033 (`f20bce66`): hand-derived from `Jev_laya:src-lib/upsample_layer.cpp:6-28` and `blas.cpp:669-695`. The named B=2 non-square axis test pins forward repeat/scale, reverse stride-block summation, adjoints, NCHW axes, integer-floor output extent and ignored ragged trailing cells. It exposed a CPU reverse-mode panic on non-divisible dimensions; forward and adjoint now process only the complete stride-covered region, leaving the ragged tail zero in the adjoint. `MEM=3G ./tools/test_host.sh upsample` passed 6 tests; `MEM=3G ./tools/test_host.sh axis_layout` passed 29. Hand-derived, no compiled-C++ golden.
+
+## 133. Reorg forward axis pin and reverse-source finding
+
+- v0.1.034 (`4842e926`): hand-derived the normal `[reorg]` forward/adjoint from `Jev_laya:src-lib/reorg_layer.cpp:112-128` and `blas.cpp:69-100`. The batch-2 NCHW fixture pins offset-channel packing and both spatial offsets with explicit sentinels; `MEM=3G ./tools/test_host.sh reorg_axis_layout` passed and `MEM=3G ./tools/test_host.sh axis_layout` passed 30 tests. C++ reverse-mode is not pinned: source inspection found its `out_c`/`in_c` divisor defect (documented as axis ledger F2). No compiled-C++ golden.
+
+## 134. ChannelShuffle axis pin
+
+- v0.1.035 (`be9738c2`): hand-derived from `Jev_laya:src-lib/channel_shuffle_layer.cpp:11-20,95-113`; named batch-2 non-square NCHW sentinel test pins the group-row/group-column transpose and exact inverse adjoint across spatial planes. `MEM=3G ./tools/test_host.sh shuffle_axis_layout` passed; full `MEM=3G ./tools/test_host.sh axis_layout` passed 31 tests. No compiled-C++ golden.
+
+## 135. Softmax grouped-reduction axis pin
+
+- v0.1.036 (`8a75e857`): hand-derived from `Jev_laya:src-lib/softmax_layer.cpp:75-85` and `blas.cpp:655-665`. The named batch-2 non-square test pins contiguous per-sample flat groups (not a whole-sample or per-channel reduction), stable probabilities, and the matching grouped adjoint. `MEM=3G ./tools/test_host.sh softmax` passed 12; `MEM=3G ./tools/test_host.sh axis_layout` passed 32. No compiled-C++ golden.
+
+## 136. Dropout element-mask layout evidence and DropBlock finding
+
+- v0.1.037 (`5b9006b5`): added a focused batch-2 non-square NCHW test for standard Dropout's per-element mask, inference identity and same-mask adjoint; `MEM=3G ./tools/test_host.sh dropout_element_mask_and_adjoint_preserve_nchw_slots` passed. This is partial axis evidence, not a closed pin. `axis-coverage.md` F3 records the unresolved DropBlock GPU index expression; no compiled-C++ golden or full DropBlock source parity is claimed.
+
+## 137. ScaleChannels source and broadcast-axis pin
+
+- v0.1.038 (`189cebae`): hand-derived from `Jev_laya:src-lib/scale_channels_layer.cpp:12-35,73-135` and `blas_kernels.cu:1664-1676`. A named `from=0` source with a batch-2 non-square NCHW sentinel pins both channel-vector broadcast (`scale_wh=0`) and spatial-plane broadcast (`scale_wh=1`), plus input/source adjoint accumulation. `MEM=3G ./tools/test_host.sh scale_channels_axis_layout` passed; full axis filter passed 33. No compiled-C++ golden.
+
+## 138. SAM elementwise axis pin
+
+- v0.1.039 (`3e674de4`): hand-derived from `Jev_laya:src-lib/sam_layer.cpp:69-105` and `blas_kernels.cu:1752-1798`. A batch-2, non-square NCHW sentinel checks the complete elementwise named-source product, input adjoint, and source adjoint at each `(n,c,h,w)`. `MEM=3G ./tools/test_host.sh sam_axis_layout` passed; full axis filter passed 34. No compiled-C++ golden.
+
+## 139. Extend native DCNv4 through 17x17
+
+- v0.2.104 (`faa9facb`): raised the fixed native point buffer and runtime gate from 225 to 289 active points. Actual Oxide composition parity now includes 17x17 across batch/group and mask variants; the two-step runtime SGD/Adam matrix covers native 17x17 SGD, while Adam remains tested through 15x15. `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (46.72 s); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (383.04 s); `MEM=3G ./tools/test_host.sh dcnv4` passed 31. The runtime suite's first attempt had a near-threshold Adam update-delta mismatch, then a rerun passed; no cause established, so this is recorded as a transient and not used to relax tolerance. Core gate tests prove 17x17 is native-eligible and 19x19 remains host fallback. No compiled-C++ golden, performance or full-suite claim.
+
+## 140. Extend native DCNv4 through 19x19
+
+- v0.2.105 (`07f48534`): raised the native DCNv4 fixed point buffer/runtime gate from 289 to 361 active points. Actual Oxide composition parity covers 19x19 across group/mask variants; the runtime two-step SGD/Adam test covers SGD through 19x19 and Adam through 15x15. The host gate suite verifies 19x19 native and 21x21 fallback. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (49.73 s); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (400.75 s); `MEM=3G ./tools/test_host.sh dcnv4` passed 31. CPU-reference parity only; no compiled-C++ golden, speedup or full-suite claim.
+
+## 141. Extend native DCNv4 through 21x21
+
+- v0.2.106 (`63a88649`): raised the native DCNv4 fixed point buffer/runtime gate from 361 to 441 active points. Oxide composition parity covers 21x21 across mask/group variants; actual-GPU two-step runtime SGD parity now extends through 21x21, while Adam remains tested through 15x15. Host gates verify 21x21 native eligibility and 23x23 fallback. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (56.07 s); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (434.42 s); `MEM=3G ./tools/test_host.sh dcnv4` passed 31. CPU-reference parity only; no compiled-C++ golden, speedup or full-suite claim.
+
+## 142. Extend native DCNv4 through 23x23
+
+- v0.2.107 (`ce2258c5`): raised the native DCNv4 point buffer/runtime gate from 441 to 529 active points. Actual-Oxide composition parity covers 23x23 across group/mask variants; actual-GPU two-step SGD runtime parity extends through 23x23, while Adam runtime parity remains through 15x15. Host gate tests confirm 23x23 is native eligible and 25x25 falls back. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (60.27 s); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (442.08 s); `MEM=3G ./tools/test_host.sh dcnv4` passed 31. CPU-reference parity only; no compiled-C++ golden, speedup or full-suite claim.
+
+## 143. Extend native DCNv4 through 25x25
+
+- v0.2.108 (`115166ac`): raised native DCNv4 fixed point buffer/runtime gate from 529 to 625 active points. Actual-Oxide composition parity covers 25x25 across group/mask variants; actual-GPU two-step SGD runtime parity extends through 25x25, while Adam runtime parity remains through 15x15. Host gates verify 25x25 is native eligible and 27x27 falls back. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (67.36 s); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (478.65 s); `MEM=3G ./tools/test_host.sh dcnv4` passed 31. Its first runtime attempt hit the previously observed near-threshold Adam offset-weight delta mismatch at size=15; rerun passed, with no tolerance change and cause still unresolved. CPU-reference parity only; no compiled-C++ golden, speedup or full-suite claim.
+
+## 144. Extend native DCNv4 through 27x27
+
+- v0.2.109 (`c1fca5bd`): raised native DCNv4 fixed point buffer/runtime gate from 625 to 729 active points. Actual-Oxide composition parity covers 27x27 across group/mask variants; two-step actual-GPU SGD runtime parity extends through 27x27, while Adam remains covered through 15x15. Host gates verify 27x27 is native eligible and 29x29 falls back. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (76.93 s); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (501.28 s); `MEM=3G ./tools/test_host.sh dcnv4` passed 31. CPU-reference parity only; no compiled-C++ golden, speedup or full-suite claim.
+
+## 145. Extend native DCNv4 through 29x29
+
+- v0.2.110 (`ce04496e`): raised native DCNv4 fixed point buffer/runtime gate from 729 to 841 active points. Actual-Oxide composition parity covers 29x29 across group/mask variants; two-step actual-GPU SGD runtime parity extends through 29x29, while Adam remains covered through 15x15. Host gates verify 29x29 is native eligible and 31x31 falls back. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (89.26 s); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (518.97 s); `MEM=3G ./tools/test_host.sh dcnv4` passed 31. CPU-reference parity only; no compiled-C++ golden, speedup or full-suite claim.
+
+## 146. Extend native DCNv4 through 31x31
+
+- v0.2.111 (`4b2761ff`): raised native DCNv4 fixed point buffer/runtime gate from 841 to 961 active points. Actual-Oxide composition parity covers 31x31 across group/mask variants; two-step actual-GPU SGD runtime parity extends through 31x31, while Adam remains covered through 15x15. Host gates verify 31x31 is native eligible and 33x33 falls back. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dcnv4_chain` passed 3 tests (103.05 s); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` passed 1 actual-GPU test (557.47 s); `MEM=3G ./tools/test_host.sh dcnv4` passed 31. CPU-reference parity only; no compiled-C++ golden, speedup or full-suite claim.
+
+## 147. Native GPU Crop RGB-shift augmentation
+
+- v0.2.112 (`4c0c422f`): native Crop GPU training now applies the seeded per-channel RGB shifts for the first three channels while preserving per-batch affine scaling and zero-padding; channels beyond RGB receive no shift. Saturation/exposure HSV adjustments remain explicitly rejected. Actual-Oxide Conv→Crop CPU-reference parity now uses three input channels and nonzero shift, including backward and SGD/Adam updates. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain crop_native_training_augmentation_and_backward_match_cpu`, `MEM=3G ./tools/test_oxide.sh --test oxide_pool_parity crop_bilinear_forward_backward_and_fd`, and `MEM=3G ./tools/test_host.sh crop` passed (1, 1, and 10 tests). No compiled-C++ golden, full-suite, or performance claim. `cargo fmt --all -- --check` could not complete: it reported unrelated pre-existing formatting diffs and then exhausted memory (~10.1 GB allocation); no formatting changes were applied by that check.
+
+## 148. Native GPU Crop HSV saturation/exposure
+
+- v0.2.113 (`e9205b1d`): Oxide Crop now performs the seeded per-tap RGB→HSV saturation/exposure transform and HSV→RGB clamp on device, matching the CPU reference for RGB inputs. Non-RGB channels retain the existing affine/shift behavior. The Crop runtime parity test covers non-default saturation, exposure, RGB shift, geometry, backward, and SGD/Adam updates; standalone primitive parity/FD and host crop tests also pass. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain -- crop_native_training_augmentation_and_backward_match_cpu` passed 1, `MEM=3G ./tools/test_oxide.sh --test oxide_pool_parity crop_bilinear_forward_backward_and_fd` passed 1, and `MEM=3G ./tools/test_host.sh crop` passed 10. No compiled-C++ golden, full-suite, or performance claim.
+
+## 149. Extend DCNv4 Adam runtime parity through 17x17
+
+- v0.2.114 (`239348ce`): expanded `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` to include 17x17 Adam runtime parity without BN. The full focused test passed (1 test; 562.82 s), including existing SGD sizes through 31x31 and Adam through 17x17 for non-BN; BN Adam remains covered through 15x15. CPU-reference parity only; no compiled-C++ golden or full-suite claim.
+
+## 150. Extend DCNv4 Adam runtime parity through 19x19
+
+- v0.2.115 (`057f905e`): expanded `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` to include non-BN 19x19 Adam runtime parity. The full focused test passed (1 test; 571.59 s), including SGD through 31x31, non-BN Adam through 19x19, and BN Adam through 15x15. CPU-reference parity only; no compiled-C++ golden or full-suite claim.
+
+## 151. Extend DCNv4 Adam runtime parity through 21x21
+
+- v0.2.116 (`47361cee`): expanded `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` to include non-BN 21x21 Adam runtime parity. The focused test passed (1 test; 584.18 s), including SGD through 31x31, non-BN Adam through 21x21, and BN Adam through 15x15. CPU-reference parity only; no compiled-C++ golden or full-suite claim.
+
+## 152. Extend DCNv4 Adam runtime parity through 23x23
+
+- v0.2.117 (`7653d08f`): expanded `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` to include non-BN 23x23 Adam runtime parity. The focused test passed on rerun (1 test; 593.08 s), including SGD through 31x31, non-BN Adam through 23x23, and BN Adam through 15x15. The initial attempt repeated the known near-threshold size=15 Adam offset-weight delta mismatch; rerun passed with unchanged tolerance. A later full `oxide_runtime_chain` run and targeted rerun both reproduced that size=15 non-BN Adam mismatch, so the passing bound is currently unstable pending cause/fix and clean rerun. Cause remains unresolved. CPU-reference parity only; no compiled-C++ golden or full-suite claim.
+
+## 153. Extend DCNv4 BN Adam runtime parity through 17x17
+
+- v0.2.118 (`d95ed8d8`): extended `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` to include 17x17 Adam with batch normalization. The focused test passed (1 test; 603.29 s), with non-BN Adam through 23x23 and SGD through 31x31. BN Adam beyond 17x17 remains unclaimed. CPU-reference parity only; no compiled-C++ golden or full-suite claim.
+
+## 154. Extend DCNv4 BN Adam runtime parity through 19x19
+
+- v0.2.119 (`6a92ce33`): expanded `dcnv4_native_runtime_two_step_sgd_and_adam_match_cpu` to include 19x19 Adam with batch normalization. The focused test passed (1 test; 626.18 s), with non-BN Adam through 23x23 and SGD through 31x31. BN Adam beyond 19x19 remains unclaimed. CPU-reference parity only; no compiled-C++ golden or full-suite claim.
+
+## 155. Crop batch/spatial axis contract
+
+- v0.1.040 (`9ff0411f`): added `crop_axis_layout_maps_batches_channels_and_center_window`, a hand-computed batch-2, two-channel, non-square center-window fixture. It asserts NCHW sample/channel ordering, output indices, and cached source coordinates. `MEM=3G ./tools/test_host.sh axis_layout` passed 35 tests; the focused test passed. This pins the Rust Crop contract only; no compiled-C++ golden or C++ parity claim.
+
+## 156. FoveationFilm axis/layout pin
+
+- v0.1.041 (`83fd1625`): made `foveation_film_axis_layout_maps_batch_hf_embedding_and_channel_affines` part of the `axis_layout` filter. Its hand-computed NCHW fixture exercises distinct batch HF embeddings and channel-specific gamma/beta projections. `MEM=3G ./tools/test_host.sh axis_layout` passed 36 tests. Derived from `Jev_laya:src-lib/foveation_film_layer.cpp:160-222`; no compiled-C++ golden or parity claim.
+
+## 157. Native FoveationFilm affine GPU primitive
+
+- v0.2.120 (`6433e4a3`): added native Oxide f32 per-sample/per-channel FiLM affine application and its exact input, gamma, and beta adjoints. The primitive preserves `[B,C]` parameters over NCHW spatial planes. Host-reference test passes; `MEM=3G ./tools/test_oxide.sh --test oxide_foveation_film` passed 1 actual-device test covering batch-2 parity and finite differences for input/gamma/beta. Runtime projection, HF-source integration, layer dispatch, and full backward remain open; `layer-support.md` correctly remains GPU `none`. No compiled-C++ golden or full layer claim.
+
+## 158. Native FoveationFilm full forward primitive
+
+- v0.2.121 (`8b07d40f`): added a backend `foveation_film_forward_f32` operation composing native Oxide HF embedding/ReLU, gamma/beta projections, and the per-sample NCHW affine primitive. Host reference and actual-device CPU-reference parity cover a batch-2 non-square tensor with distinct HF and channel values. `MEM=3G ./tools/test_oxide.sh --test oxide_foveation_film` passed 2 tests, including the affine adjoint finite differences. Runtime HF-source extraction/dispatch and full backward remain open; no native layer-path or compiled-C++ claim.
+
+## 159. Native FoveationFilm full adjoint primitive
+
+- v0.2.122 (`e97bac10`): added native Oxide full FiLM backward primitives for input, HF-source, embedding, gamma, and beta gradients; spatial/batch reductions use fixed-order, one-owner kernels. `MEM=3G ./tools/test_oxide.sh --test oxide_foveation_film` passed 2 actual-device tests covering forward/backward parity against the host reference and affine finite differences; `MEM=3G cargo test -p lightnet-cuda --lib foveation_film` passed the batch/channel host-reference test. This remains primitive-only; runtime source-cache transfer and layer dispatch are still open. No compiled-C++ golden or complete-layer claim.
+
+## 160. FoveationFilm runtime native forward
+
+- v0.2.123: full GPU runtime now accepts `[hyperbolic_foveation]` as a host fallback source, retains its per-batch HF cache, transfers those parameters to the backend, and dispatches `[foveation_film]` through `foveation_film_forward_f32`. The HF and FiLM backward path is explicitly CPU-fallback gated, and GPU optimizer updates, compact inference, and f16 inference still reject these layers. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_native_forward_uses_host_hf_source_cache` passed on actual Oxide: all layer outputs match the CPU runtime and the backward fallback succeeds. `MEM=3G ./tools/test_host.sh foveation_film` passed all 12 focused tests, including the hybrid runtime boundary. No compiled-C++ golden or complete native layer-training claim; `layer-support.md` remains GPU `none`.
+
+## 161. FoveationFilm projection-adjoint finite differences
+
+- v0.2.124 (`8b421a9e`): extended the actual-Oxide full FiLM projection test to finite-difference every HF-source, embedding, gamma, and beta gradient element against the host forward objective; all 2 `oxide_foveation_film` tests pass. This validates the primitive composition, not a native runtime backward path or compiled-C++ parity.
+
+## 162. FoveationFilm native runtime backward
+
+- v0.2.125: wired the native Oxide FiLM adjoint into runtime backward for input and all six FiLM parameter blocks; source-HF gradients are routed to a host HyperbolicFoveation backward helper, which also accumulates warp/predictor-source gradients. GPU optimizer updates for networks containing these layers remain explicitly rejected. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_native_forward_backward_uses_host_hf_source_cache` passed on actual Oxide; `MEM=3G ./tools/test_host.sh foveation_film` passed all 12 focused tests, including exact train-buffer parity through the hybrid dispatch. Primitive actual-device gradient parity/finite differences remain in `oxide_foveation_film`. No compiled-C++ golden or completed-layer claim; `layer-support.md` remains GPU `none` until optimizer and fallback gates are fully verified.
+
+## 163. FoveationFilm/HF SGD and Adam runtime updates
+
+- v0.2.126 (`fb841ac1`): GPU runtime optimizer updates now route host-resident HyperbolicFoveation and FoveationFilm buffers through existing CPU SGD/Adam implementations; GPU Muon remains explicitly rejected for these layers. Added actual-Oxide single-step CPU parity for hybrid SGD (including upstream native convolution) and Adam (HF/FiLM params), plus FakeBackend exact train-buffer/update parity and Muon rejection. `MEM=3G ./tools/test_host.sh foveation_film` passed 12 tests; focused actual-device `oxide_runtime_chain` SGD and Adam tests each pass. No compiled-C++ golden; two-step native runtime coverage and native HF kernels remain open.
+
+## 164. FoveationFilm/HF two-step GPU runtime parity
+
+- v0.2.127 (`2792f881`): extended actual-Oxide runtime SGD and Adam tests to two complete forward/backward/update cycles each. Outputs are compared after each forward; HF/FiLM and upstream convolution parameter blocks are compared after updates. Both focused runtime tests passed. v0.2.128 (`01b761b5`) adds actual-Oxide rejection tests for compact f32, compact f16, and GPU Muon. Direct actual-runtime input-gradient/train-buffer inspection and SGD/Adam gate coverage remain open. No compiled-C++ golden.
+
+## 165. FoveationFilm actual-Oxide SGD gate
+
+- v0.2.129 (`a704ede6`): an actual-Oxide runtime test exercises `dont_update` at iteration 0 and verifies that the same layer updates at iteration 1. CPU/GPU parameters match at both iterations; the test passed. Adam/burn-in/train-only-BN actual-runtime gate coverage and direct gradient-buffer inspection remain open. No compiled-C++ golden.
+
+## 166. FoveationFilm actual-Oxide Adam burn-in gate
+
+- v0.2.130 (`2b2154f5`): actual-Oxide Adam runtime coverage exercises `burnin_update=1` with `burn_in=2`; iteration 0 leaves FiLM parameters unchanged, iteration 1 updates them, and CPU/GPU parameter parity holds at both iterations. The focused test passed. `train_only_bn` actual-runtime coverage and direct gradient-buffer inspection remain open. HF has independent train gates, so the assertion is limited to FiLM parameters. No compiled-C++ golden.
+
+## 167. FoveationFilm actual-Oxide train-only-BN gate
+
+- v0.2.131 (`9b8f2dcc`): actual-Oxide runtime test verifies `train_only_bn=1` suppresses FiLM parameter updates, with CPU/GPU parameter parity after SGD. Test passed. The gate suite now covers compact f32/f16 and Muon rejection, SGD `dont_update`, Adam `burnin_update`, and SGD `train_only_bn`; direct input-gradient/train-buffer inspection remains open. No compiled-C++ golden.
+
+## 168. FoveationFilm actual-Oxide train-buffer parity
+
+- v0.2.132 (`23d789af`): exposed a read-only snapshot borrow for GPU-runtime host-fallback train buffers and used it to compare every HF and FiLM parameter-gradient buffer against CPU during both actual-Oxide SGD and Adam steps. Both two-step runtime tests pass at `3e-5`; native convolution buffers are intentionally excluded from this accessor and are validated through upstream parameter parity. Direct input-gradient inspection remains open. No compiled-C++ golden.
+
+## 169. Native HyperbolicFoveation bilinear warp
+
+- v0.2.133 (`daef7b6a`): added a native Oxide NCHW bilinear-grid gather with zero-padded taps and wired GPU runtime HF forward to use it. HF predictor evaluation and inverse-grid generation remain host-managed; runtime still retains the host CPU forward/cache for HF backward and FiLM source gradients. The actual GPU HF and FiLM outputs match CPU over two-step SGD/Adam runtime tests. `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 2 primitive/shape tests; focused runtime SGD and Adam tests passed, as did `MEM=3G ./tools/test_host.sh foveation_film` (12). No compiled-C++ or performance claim.
+
+## 170. Native isotropic fixed-point HF grid
+
+- v0.2.134 (`b67db3c0`): added native Oxide fixed-point inverse-grid generation for isotropic HF configs and selected it in GPU runtime forward; Newton and anisotropic configs still upload the host-generated grid. Actual Oxide parity covers a learned HF predictor feeding native grid+warp over two SGD steps. `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 3 primitive/guard tests; focused runtime SGD passed; `MEM=3G ./tools/test_host.sh foveation_film` passed 12. Native predictor MLP, Newton/anisotropic grid, backward, and direct input-gradient paths remain open. No compiled-C++ or performance claim.
+
+## 171. Native HF predictor MLP for fixed-point isotropic mode
+
+- v0.2.135 (`8dd1ae53`): added Oxide tile-average pooling, batched first/second linear projections, ReLU, and source-compatible predictor constraints. GPU runtime uses the native predictor for learned isotropic fixed-point HF; its parameters feed native inverse-grid and warp ops. Other predictor/grid modes retain host calculations, and the CPU-generated forward cache remains for backward. Actual-device learned-HF two-step SGD output/gradient/update parity passed; `oxide_hyperbolic_foveation` passed 4 tests and `MEM=3G ./tools/test_host.sh foveation_film` passed 12. No compiled-C++ or performance claim.
+
+## 172. Native isotropic Newton HF grid
+
+- v0.2.136 (`2231b346`): added native Oxide isotropic Newton inverse-grid generation with analytic Jacobian and singular-determinant fallback, and dispatched isotropic Newton configs in GPU runtime. The host cache now stores the downloaded native grid for HF backward consistency. Actual-Oxide fixed-HF Adam runtime parity passed; the Newton grid primitive passes its 2-batch CPU-formula comparison. `oxide_hyperbolic_foveation` passed 5 tests and focused `MEM=3G ./tools/test_host.sh foveation_film` passed 12. Anisotropic grids, warp adjoints, and direct input-gradient parity remain open. No compiled-C++ or performance claim.
+
+## 173. Native anisotropic HF predictor and inverse grids
+
+- v0.2.137 (`3ec9d833`): extended native Oxide fixed-point and Newton inverse-grid kernels to accept anisotropic HF parameters and apply the source-compatible smooth-max effective radius. GPU runtime now dispatches native predictor, grid, and warp forward for both radius modes. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 5 tests including the anisotropic fixed-point CPU-formula comparison; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_native_forward_backward_uses_host_hf_source_cache` passed two-step learned-anisotropic fixed-point SGD CPU parity; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_runtime_adam_updates_match_cpu` passed anisotropic Newton Adam parity; `MEM=3G ./tools/test_host.sh foveation_film` passed 12 tests. HF predictor/warp adjoints and direct runtime input-gradient inspection remain host-managed/open. No compiled-C++ or performance claim.
+
+## 174. Learned anisotropic Newton Adam runtime parity
+
+- v0.2.138 (`f20078f0`): strengthened the actual-Oxide Newton Adam runtime test to use a learned anisotropic HF predictor and compare all predictor parameter blocks, HF parameters, and FiLM parameters after each of two updates. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_runtime_adam_updates_match_cpu` passed. This validates native predictor + anisotropic Newton forward with CPU-reference optimizer/backward parity; HF warp/predictor adjoints remain host-managed. No compiled-C++ or performance claim.
+
+## 175. Native HF warp adjoints
+
+- v0.2.139 (`e4aed189`): added Oxide input-scatter and shared-grid-reduction adjoints for HF bilinear warp; GPU runtime now uses the native input gradient when propagating through HF. `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 6 tests, including CPU-formula comparisons and selected input/grid finite differences. Actual-Oxide learned-anisotropic fixed-point SGD and learned-anisotropic Newton Adam two-step runtime parity passed; focused host FoveationFilm tests passed 12. Runtime still computes HF parameter/predictor adjoints through the host reference and currently does not consume the returned native grid adjoint; direct inspection of runtime input-gradient tensors remains open. No compiled-C++ or performance claim.
+
+## 176. Native HF grid-adjoint consumption
+
+- v0.2.140 (`9cbe1220`): GPU runtime now downloads the native warp grid adjoint and feeds it to the exact Rust inverse-point parameter Jacobian, avoiding a duplicate host bilinear-warp backward for parameter gradients. HF predictor-source backward and direct runtime input-gradient inspection remain open. Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_native_forward_backward_uses_host_hf_source_cache` and `... foveation_film_runtime_adam_updates_match_cpu` passed; `MEM=3G ./tools/test_host.sh hyperbolic_foveation` passed 30 tests after replacing a stale GPU-rejection assertion with forward/backward/update coverage; `MEM=3G ./tools/test_host.sh foveation_film` passed 12. No compiled-C++ or performance claim.
+
+## 177. Direct HF runtime input-gradient parity
+
+- v0.2.141 (`94a23a2a`): added opt-in `backward_accumulate_seeded_gpu_with_input_gradient`, which captures and downloads the accumulated network-input gradient without adding transfers to ordinary training calls. Actual-Oxide tests now compare this tensor directly to CPU after each of two learned-anisotropic fixed-point SGD updates and two learned-anisotropic Newton Adam updates. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_native_forward_backward_uses_host_hf_source_cache` and `... foveation_film_runtime_adam_updates_match_cpu` passed; `MEM=3G ./tools/test_host.sh hyperbolic_foveation` passed 30 tests. Native inverse-point parameter-Jacobian and predictor-source backward remain open. No compiled-C++ or performance claim.
+
+## 178. Native HF predictor backward
+
+- v0.2.142 (`c234a612`): added native Oxide adjoints for predictor output constraints, the second and first MLP projections/ReLU, and the average-pooling source scatter. Runtime now uses native predictor-source and MLP parameter gradients; the inverse-point parameter Jacobian remains a Rust host operation. Actual-Oxide learned-anisotropic fixed-point SGD parity directly checks runtime input gradients and train-buffer/updated parameter parity with `downsample=2` and a non-divisible width; learned-anisotropic Newton Adam parity checks the native predictor backward with two updates. `MEM=3G ./tools/test_host.sh hyperbolic_foveation` passed 30 tests and `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 6. No compiled-C++ or performance claim.
+
+## 179. HF predictor adjoint finite differences
+
+- v0.2.143 (`07e22b5b`): added actual-Oxide finite-difference checks for predictor source, W1/B1 and W2/B2 gradients, using a learned two-batch anisotropic-compatible layout with `downsample=2` and an incomplete pooling edge. `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed all 7 tests. This strengthens primitive evidence; runtime CPU parity and host inverse-point parameter Jacobian scope remain as documented in §178. No compiled-C++ or performance claim.
+
+## 180. Native HF fixed-point parameter adjoint
+
+- v0.2.144 (`64fd3da7`): added an Oxide forward-dual fixed-point inverse-iteration parameter Jacobian for isotropic and anisotropic radii. Runtime consumes it when the native backend implements the optional operation; unsupported backends and Newton mode retain the host reference. Actual-Oxide finite differences cover each packed parameter across two batches for both radius modes; learned-anisotropic fixed-point runtime SGD parity also passes, along with the existing Newton Adam fallback parity. `MEM=3G ./tools/test_host.sh hyperbolic_foveation` passed 30 tests; `MEM=3G ./tools/test_oxide.sh --test oxide_hyperbolic_foveation` passed 8; both focused runtime tests passed. Newton parameter Jacobian remains host-managed; no compiled-C++ or performance claim.
+
+## 181. Native HF Newton parameter adjoint
+
+- v0.2.145 (`9b915184`): extended the Oxide dual-number inverse parameter adjoint through the configured Newton update, including derivatives of the analytic spatial Jacobian and the singular-determinant fixed-point fallback. Runtime now dispatches native parameter adjoints for both fixed-point and Newton methods; unsupported backends retain the host reference. Actual-Oxide finite differences cover every packed parameter for isotropic and anisotropic modes across two batches. Both learned-anisotropic fixed-point SGD and Newton Adam runtime parity tests pass; all 30 focused host HF tests and 8 Oxide HF primitive tests pass. No compiled-C++ or performance claim.
+
+## 182. GPU Muon for HF/FiLM matrices
+
+- v0.2.146 (`f462adad`): removed the GPU-Muon rejection for `[hyperbolic_foveation]` and `[foveation_film]`; their eligible 2-D predictors/projections now use the existing native Oxide orthogonalizer, while non-matrix parameters retain AdamW fallback and momentum/final updates remain host-managed. Added actual-Oxide two-step runtime parity for learned anisotropic HF plus FiLM, checking direct input gradients, every HF/FiLM gradient buffer, and all matrix/bias parameter blocks. The existing compact/f16 rejections remain. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_and_hf_gpu_muon_match_cpu_across_steps` and `... foveation_film_gpu_compact_f16_rejection_and_muon_support_are_explicit` passed. No compiled-C++ or performance claim.
+
+## 183. HF/FiLM GPU Muon update gate
+
+- v0.2.147 (`ff29e118`): added actual-Oxide two-step learned-anisotropic HF/FiLM Muon parity with FiLM `dont_update=1`; the first gated step preserves FiLM parameters, then the next update applies. CPU/GPU parameter equality is checked at both steps. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_gpu_muon_dont_update_gate_matches_cpu` passed. This adds gate evidence, not a new native kernel or C++ golden.
+
+## 184. HF/FiLM GPU Muon sidecar resume
+
+- v0.2.148 (`3db27bd9`): actual-Oxide sidecar round-trip test saves after one learned-anisotropic HF/FiLM Muon update, restores into fresh CPU/GPU networks, and checks the resumed GPU update against an uninterrupted CPU continuation. It compares HF global/predictor matrices and biases plus every FiLM projection matrix/bias, so both Muon momentum and AdamW fallback state must survive. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain foveation_film_gpu_muon_state_round_trip_matches_cpu` passed. No compiled-C++ or performance claim.
+
+## 185. HyperbolicFoveation axis/layout pin
+
+- v0.1.027 (`pending`): added `hyperbolic_foveation_axis_layout_keeps_batch_channel_hw_and_grid_xy`, a named source-derived pin using B=2, C=2, H=2, W=3 and unique N/C/H/W sentinels. It hand-computes bilinear outputs from the C++ `map_x/map_y` indexing and NCHW per-channel `cv::remap` loop at `Jev_laya:src-lib/hyperbolic_foveation_layer.cpp:1341-1441`; a probe explicitly distinguishes x/y transposition. `MEM=3G ./tools/test_host.sh hyperbolic_foveation_axis_layout` passed, and `MEM=3G ./tools/test_host.sh axis_layout` passed all 37 tests. Hand-derived from source; no compiled-C++ golden.
+
+## 186. HF axis fixture matches OpenCV interpolation taps
+
+- v0.1.028 (`42cfdaf3`): refined the HF axis fixture coordinates to exact multiples of OpenCV `INTER_LINEAR`'s 1/32 interpolation table, preventing the hand-computed bilinear expectations from relying on non-table fractions. The updated `MEM=3G ./tools/test_host.sh axis_layout` passed all 37 tests. This is a fixture precision correction; no compiled-C++ golden is available.
+
+## 187. Logistic NCHW/batch axis pin
+
+- v0.1.029 (`pending`): added `runtime::tests::logistic_axis_layout_keeps_batch_channel_hw_order`, a hand-computed `B=2,C=2,H=2,W=3` sigmoid fixture. The expected values follow the flat `batch*inputs` copy plus elementwise activation in `raptor:src-lib/logistic_layer.cpp:72-77` and `activations.cpp:127-143`; `MEM=3G ./tools/test_host.sh logistic_axis_layout` passed, then `MEM=3G ./tools/test_host.sh axis_layout` passed all 38 tests. Source-derived, not a compiled-C++ golden.
+
+## 188. Compact f16 Logistic inference
+
+- v0.2.149 (`pending`): added `[logistic]` to the compact f16 allowlist and dispatches its sigmoid through the native half-storage channel-affine activation kernel with a zero bias. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16 logistic_f16_inference_matches_f32` passed (relative max error `3.592e-4`); the full `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` suite passed all 19 tests. Inference only; f16 training/backward remains unsupported. Rust compact-f32 parity, no compiled-C++ golden.
+
+## 189. Logistic f16 direct CPU-reference parity
+
+- v0.2.150 (`1f77db57`): strengthened `logistic_f16_inference_matches_f32` to compare the actual-Oxide compact f16 result directly with `ExecutableNetwork::forward`, alongside the compact-f32 comparison. Focused verification: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16 logistic_f16_inference_matches_f32` passed. This closes CPU-reference evidence for this inference slice only; no compiled-C++ golden or f16 training/backward claim.
+
+## 190. OMD loss compact f16 inference pass-through
+
+- v0.2.151 (`pending`): added `[omd_loss]` to compact f16's allowlist and device-resident identity dispatch. C++ `forward_omd_loss_layer` copies input to output and returns before training-only work when `state.train` is false (`Jev_laya:src-lib/omd_loss_layer.cpp:554-568`). `omd_loss_f16_inference_is_device_identity_and_matches_cpu` compares actual-Oxide f16 directly with `ExecutableNetwork::forward`; the focused test passed, and `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed all 20 tests. Inference only; Rust's OMD training head is still incomplete; no compiled-C++ golden.
+
+## 191. JevCe group-major compact f16 inference
+
+- v0.2.152 (`pending`): added group-major `[jev_ce]` compact-f16 inference using native half-storage temperature scaling followed by the existing f32-accumulation group softmax. Actual-Oxide output matches `ExecutableNetwork::forward` for `B=2`, 2 groups, 3 candidates, temperature 1.5 (relative max error `4.633e-4`); `layout=cm` rejects explicitly. `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed all 21 tests. Inference only; truth-driven CE loss/backward remain host/head limitations. No compiled-C++ golden.
+
+## 192. JevCe channel-major compact f16 inference
+
+- v0.2.153 (`pending`): added a native Oxide NCHW channel-major group-softmax kernel and routed f16 JevCe `layout=cm` through it, alongside existing group-major support. Actual-Oxide output matches the CPU inference reference for both layouts with 2 groups, 3 candidates, temperature 1.5 (relative max errors `4.633e-4` / `3.765e-4`); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed all 21 tests. Inference only; CE loss/backward remain outside this path. No compiled-C++ golden.
+
+## 193. LAYA act-head compact f16 inference
+
+- v0.2.154 (`pending`): added native Oxide half-storage LAYA feature extraction and exact-erf GELU, composing the existing f16 connected operation for both MLP layers in compact inference. Actual-Oxide final output matches the CPU reference (relative max error `7.436e-5`); `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_f16` passed all 22 tests, and `oxide_laya_act_forward` passed both tests. Inference only; act-head backward/update and weight-file loading gaps remain open. No compiled-C++ golden.
+
+## 194. LayaHead masked attention primitive
+
+- v0.2.155 (`pending`): added `F32TensorOpsBackend::laya_head_attention_f32` with a native Oxide online-softmax kernel for fused QKV and key-padding masks. Actual-Oxide parity against a direct CPU formula covers mixed masks and all-masked rows; shape-extent rejection passes (`oxide_laya_head_attention`: 2 tests). The `LayaHead` runtime remains host-fallback; type embedding, LayerNorm, projections, residuals, FFN, and runtime dispatch are still open. Source audit: Rust `laya_head::head_forward` and `Jev_laya:src-lib/laya_head_layer.cpp`; no compiled-C++ golden.
+
+## 195. LayaHead native f32 forward
+
+- v0.2.156 (`pending`): composed native Oxide type-embedding/unpack, LayerNorm, QKV/output/FFN projections, mask-aware online attention, residuals, ReLU, and channel-major pack into both full and compact f32 runtime paths. Actual-Oxide output matches the CPU reference for fixed and input-carried qtype, two heads/two blocks, mixed masks and all-masked rows; malformed weight extents reject. `oxide_laya_head_forward`: 3 passed; `oxide_laya_head_attention`: 2 passed; `MEM=3G ./tools/test_host.sh laya_head`: 9 passed. The layer is frozen, so backward remains no-input-gradient/no-update; compact f16 is still rejected. Source-derived Rust-reference parity only; no compiled-C++ golden.
+
+## 196. LayaScorer native f32 forward
+
+- v0.2.157 (`c31c616d`): native Oxide full and compact f32 composition for channel-major option unpack, biased LayerNorm, H→H connected, exact-erf GELU, H→1 connected and output packing. Actual-device outputs match the Rust CPU reference across two batches and three options; malformed weight extents reject (`oxide_laya_scorer_forward`: 2 passed). `MEM=3G ./tools/test_host.sh laya_scorer`: 16 passed, including existing FakeBackend runtime forward/backward tests. Backward remains CPU-computed; no f16 or training/update path. No local C++ source or compiled-C++ golden; do not claim C++ parity.
+
+## 197. LayaScorer native f32 input adjoint
+
+- v0.2.158 (`0cd19320`): replaced the GPU runtime's scorer input/seed host round trip with Oxide connected, exact-erf GELU, and LayerNorm input adjoints, including native seed reshape and channel-major input-gradient scatter. Actual-device input gradients match CPU through a preceding convolution with two batches/three options; `oxide_laya_scorer_forward`: 3 passed. `MEM=3G ./tools/test_host.sh laya_scorer`: 16 passed, including the FakeBackend runtime regression. Scorer is frozen: FC/norm parameter gradients remain unused and updates are not enabled. No f16 or compiled-C++ parity.
+
+## 198. LayaEncoder native f32 inference
+
+- v0.2.159 (`e10642c0`): composed native Oxide embedding gather/mask extraction, bias-free LayerNorm, fused-QKV RoPE attention (alternating full/sliding key masks with online softmax), residual projections, exact-erf GeGLU, final normalization, and NCHW packing into both full and compact f32 runtime paths. Actual-device CPU-reference parity covers two batches, three blocks, local-window edges, masked/fully masked rows, and out-of-range IDs; malformed embedding extents reject (`oxide_laya_encoder_forward`: 2 passed). `MEM=3G ./tools/test_host.sh laya_encoder`: 10 passed. Frozen backward remains no-input-gradient; compact f16 unsupported. C++ source audit via `Jev_laya:src-lib/laya_encoder_kernels.cu`; no compiled-C++ golden, no speedup claim.
+
+## 199. Dilated DeformConv native predictors and runtime coverage
+
+- v0.2.160: extended the native deform-convolution offset/mask predictors to use DeformConv's explicitly supplied output extent when `dilation > 1`, without changing ordinary convolution `Geom`. Added an Oxide direct predictor kernel and a host-reference backend default; runtime dispatch now keeps non-BN dilated variants on the device forward/backward path. BN variants remain host-routed. `MEM=3G ./tools/test_host.sh deform_conv` passed 23; `MEM=3G ./tools/test_oxide.sh --test oxide_deform_envelope` passed 14, `oxide_deform_conv_chain` passed 3 (including real CPU-runtime parity for dilation), and focused `oxide_runtime_chain deform_conv_dilated_device_path_matches_cpu_and_updates` passed 1. This verifies Rust CPU-reference/Oxide agreement and one SGD update only; one host normalization-Jacobian hop remains, and there is no compiled-C++ golden, f16 support, full-suite or performance claim.
+
+## 200. DSConv native f32 runtime integration
+
+- Added optional `F32TensorOpsBackend` contracts for native single-template DSConv f32 forward/backward and implemented them with the existing Oxide compositions. `GpuExecutableNetwork` now dispatches runtime f32 forward/backward for supported activations and `templates=1`; backward recomputes rather than retaining forward intermediates. Compact f16 remains rejected. Multi-template morph 0/1 remains unsupported.
+- Runtime backward gradients stage into existing DSConv host train buffers. GPU optimizer routing applies source-rate groups for SGD/Adam; hybrid GPU Muon handles the collapse and offset matrices while biases use the AdamW fallback (see §201).
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_dsconv` passed 11 tests; `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain dsconv_native_runtime` passed 2 tests: `dsconv_native_runtime_training_matches_cpu_and_updates` (morph 2, SGD, outputs/gradients/updates) and `dsconv_native_runtime_adam_update_matches_cpu` (morph 1, Adam). `MEM=3G ./tools/test_host.sh dsconv` passed 12 tests after these changes. Rust CPU-reference agreement only; no compiled-C++ golden, benchmark, f16 path, or full-suite claim.
+
+## 201. DSConv hybrid GPU Muon
+
+- Enabled DSConv in the GPU Muon eligibility contract. The existing generic matrix visitor stages the collapse matrix (`[filters, channels*kernel]`) and shared offset predictor (`[2*kernel, channels*9]`) through native Oxide momentum/lookahead and Newton–Schulz orthogonalization; non-matrix biases retain the AdamW fallback. Gradient/state/final parameter handling remains hybrid/host-managed.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain dsconv_gpu_muon_two_step_update_matches_cpu` passed. Actual-device test covers two update steps, matching CPU forward outputs and all DSConv parameter blocks under Muon+AdamW. No compiled-C++ golden or speedup claim; multi-template DSConv remains unsupported.
+
+## 202. DSConv C++-source axis/layout pin
+
+- Added `dsconv_axis_layout_pins_cpp_snake_branches_batch_channels_and_nchw_outputs`, a named `axis_layout` test using the shared `B=2, C=2, H=2, W=3` sentinel fixture. Saturated offset biases make the source's `morph=0`/`morph=1` sample coordinates exact; the independent hand calculation pins NCHW input/output, batch/channel separation, x/y snake coordinate order, and `morph=2`'s floor/remainder output-filter split.
+- Source contract: `Jev_laya:src-lib/dsconv_layer.cpp:103-167,223-247,324-336`; hand-derived from source, no compiled-C++ golden. `MEM=3G ./tools/test_host.sh dsconv_axis_layout` passed 1 test; `MEM=3G ./tools/test_host.sh dsconv` passed 13 tests; `MEM=3G ./tools/test_host.sh axis_layout` passed 39 tests (946 filtered out).
+
+## 203. DeformConv C++-source axis/layout pin
+
+- Added `deform_conv_axis_layout_pins_cpp_offset_mask_groups_and_batch_nchw` using `B=2,C=2,H=2,W=3`, groups=2, and a masked 3x3 kernel. The independent hand calculation follows C++ offset plane order `(dy,dx)` per kernel point, one mask plane per point, shared predictors across groups, and NCHW batch/filter/spatial output order. Small symmetric offset biases avoid the conditional normalization branch while making x/y order observable; distinct mask logits and sparse main weights expose kernel-point swaps.
+- Source contract: `Jev_laya:src-lib/deform_conv_layer.cpp:518-560,834-852`; hand-derived from source, no compiled-C++ golden. `MEM=3G ./tools/test_host.sh deform_conv_axis_layout` passed 1 test; `MEM=3G ./tools/test_host.sh deform_conv` passed 24 tests; `MEM=3G ./tools/test_host.sh axis_layout` passed 40 tests (946 filtered out).
+
+## 204. GraphConv C++-source axis/layout pin
+
+- Added `graph_conv_axis_layout_pins_cpp_batch_group_neighbor_raster_and_nchw`: a learned-edge softmax fixture with `B=2,C=2,H=2,W=3`, `groups=2`, and distinct per-neighbor/per-group logits. The independent calculation checks row-major `k -> (ky,kx)` neighbor mapping, boundary masking/renormalization, group-specific channels and projections, and NCHW batch/output axes.
+- Source contract: `Jev_laya:src-lib/graph_conv_layer.cpp:55-83,215-224,621-808,823-855`; hand-derived from source, no compiled-C++ golden. `MEM=3G ./tools/test_host.sh graph_conv_axis_layout` passed 1 test; `MEM=3G ./tools/test_host.sh axis_layout` passed 41 tests (946 filtered out).
+
+## 205. WMHF C++-source axis/layout pin
+
+- Added `wmhf_axis_layout_pins_cpp_batch_channel_spatial_and_subband_order`, with a shared `B=2,C=2,H=2,W=3` sentinel fixture. It independently calculates C++ Haar formulas for LL/LH/HL/HH over each NCHW batch/channel/tile position, pinning the four sub-band arrays and their flattened order.
+- Source contract: `Jev_laya:src-lib/wmhf_layer.cpp:274-303` (`dwt_cpu`); hand-derived from source, no compiled-C++ golden. `MEM=3G ./tools/test_host.sh wmhf_axis_layout` passed 1; `MEM=3G ./tools/test_host.sh wmhf` passed 18; `MEM=3G ./tools/test_host.sh axis_layout` passed 42 (946 filtered out).
+
+## 206. Clifford C++-source axis/layout pin
+
+- Added `clifford_axis_layout_pins_cpp_nchw_token_channel_normalization`, checking that channel mean/variance are reduced independently at each `(batch, spatial-token)` and that gamma/beta map by channel in NCHW layout. The fixture uses `B=2,C=2,H=2,W=3` and independently computes the C++ normalization formula.
+- Source contract: `Jev_laya:src-lib/clifford_layer.cpp:311-346,1578-1580`; hand-derived from source, no compiled-C++ golden. `MEM=3G ./tools/test_host.sh clifford_axis_layout` passed 1; `MEM=3G ./tools/test_host.sh clifford` passed 14; `MEM=3G ./tools/test_host.sh axis_layout` passed 43 (946 filtered out).
+
+## 207. Native Oxide WMHF Haar DWT primitive
+
+- Added native Oxide Haar DWT and IWT with both adjoints. DWT produces LL/LH/HL/HH buffers and its adjoint gathers odd-edge corner collisions without atomics; IWT reuses the exact dual pair. These are reusable primitives only; runtime dispatch, high-frequency runtime integration, and the seven-convolution WMHF path remain unsupported on GPU. Scan forward is tracked separately in §208, and high-frequency primitives in §209.
+- Evidence: actual-device parity against independently calculated NCHW formulas for all four operations passed in `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` (1 test), covering `B=2,C=3,H=3,W=5`. No compiled-C++ golden, runtime CPU/GPU parity, or performance claim.
+
+## 208. Native Oxide WMHF four-direction scan forward
+
+- Added `OxideBackend::wmhf_scan4_forward_f32`: native Oxide math implements source `stable_sigmoid`, the `0.98*sigmoid(raw_a)` recurrence coefficient, four independent horizontal/vertical forward/reverse scans, and the `0.25*(C*state+D*x)` output contribution. No host fallback or runtime dispatch was added.
+- Evidence: actual-device parity against an independent C++-ordered CPU recurrence passed in `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` (2 tests including Haar DWT/IWT), with batch-2 NCHW data and independently varied channel weights. Scan backward and parameter gradients were still open at this increment; native primitives are now recorded in §211. Performance and compiled-C++ parity remain unverified.
+
+## 209. Native Oxide WMHF high-frequency branch
+
+- Added native f32 `wmhf_high_frequency_forward_f32` and its exact gather adjoint `wmhf_high_frequency_backward_f32`. Forward computes `abs(LH)+abs(HL)+abs(HH)` with nearest 2x tile upsampling; backward reduces all mapped output seeds per coefficient and applies the source `sign_no_zero` convention (zero maps to zero). No atomics, host fallback, or runtime dispatch.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed 3 actual-device tests, including odd non-square batched HF forward/backward parity. These remain primitives, not WMHF runtime support; no compiled-C++ golden or performance claim.
+
+## 210. DepthAnything axis pin and explicit GPU rejection
+
+- Added `depth_anything_axis_layout_pins_cpp_patch_tokens_cls_and_nchw_batches`, using `B=2,H=2,W=4,patch_size=2,dim=2`. Its asymmetric projections and distinct positional values verify NCHW channel-major patch extraction, batch-major row-raster patch tokens after CLS, and separate CLS/patch positional embeddings. Existing type-major array-layout and external/sequential weight tests complete the related source-order evidence.
+- Unified Stage-1 GPU rejection messages for DepthAnything/DPT/Yolo3d across GPU execution, backward and optimizer updates. This avoids a generic forward error and prevents backward from proceeding with a fabricated unsupported forward state.
+- Evidence: source references `Jev_laya:src-lib/depth_anything_layer.cpp:300-339` and `src-lib/weights.cpp:1433-1464`; no compiled-C++ golden. `MEM=3G ./tools/test_host.sh depth_anything` passed 18 tests; `MEM=3G ./tools/test_host.sh axis_layout` passed 44 tests (946 filtered out).
+
+## 211. Native Oxide WMHF scan backward
+
+- Added `OxideBackend::wmhf_scan4_backward_f32` with native input and parameter gradient contributions, an input-gradient direction reduction, and `[4,C]` weight-gradient reduction. It differentiates the exact forward recurrence, including the raw sigmoid parameterization and the `0.25` output scale, without atomics. The initial implementation used per-pixel prefix/suffix recomputation; §214 records the sequence-owned rewrite.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed 3 actual-device tests. The scan fixture compares forward, input gradients and all channel parameter gradients against independent source-ordered CPU calculations. No scan performance, runtime dispatch, or compiled-C++ golden claim.
+
+## 212. Generic backend contracts for WMHF primitives
+
+- Exposed Oxide WMHF Haar DWT/IWT and adjoints, four-direction scan forward/backward, and high-frequency forward/backward through `F32TensorOpsBackend`. Unsupported backends retain explicit panic defaults; Oxide trait methods dispatch to the already tested native kernels. This provides the generic seam needed for runtime composition but does not add a WMHF runtime arm or change its hard rejection.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed 3 tests; high-frequency forward/backward are invoked through fully qualified trait methods in the integration test. No full GPU runtime parity or performance claim.
+
+## 213. WMHF scan-forward sequence ownership
+
+- Reworked the Oxide scan-forward kernel from one thread per direction/pixel (which recomputed the prefix) to one thread per whole row/column sequence. Each thread writes its exclusive direction-plane positions through a raw device pointer; the launch invariant gives each output exactly one writer. The scan recurrence and combine pass are unchanged.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed all 3 actual-device formula tests after the rewrite. This is an algorithmic work reduction, not a measured speedup; no performance or compiled-C++ parity claim. WMHF runtime remains open.
+
+## 214. WMHF scan-backward sequence ownership
+
+- Replaced per-pixel prefix/suffix recomputation in scan backward with two sequence-owned kernels: one writes each recurrence state once, then one walks the adjoint recurrence in reverse and writes disjoint per-direction input/parameter partials. Existing reductions combine direction overlaps and channel parameter gradients.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed all 3 actual-device formula tests after the rewrite, including scan input and raw-parameter gradients. This removes redundant recurrence work but is not a measured speedup; no performance or compiled-C++ parity claim. WMHF runtime remains open.
+
+## 215. WMHF gated fusion primitive
+
+- Added native Oxide f32 WMHF gated residual fusion and its adjoint: `fuse + freq_scale * gate * projected + optional_shortcut`, with gradients for fuse, gate, projected, and shortcut. Both operations are exposed through `F32TensorOpsBackend`; unsupported backends keep explicit panic defaults.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed 4 actual-device tests. The new test invokes trait dispatch for forward/backward and checks both shortcut modes against independent formulas. This is a primitive only, not runtime WMHF integration or performance/C++-parity evidence.
+
+## 216. WMHF channel-split primitive
+
+- Added native Oxide `wmhf_split_channels_f32`, gathering a contiguous channel interval from batched NCHW input into the corresponding `[B,count,H,W]` branch tensor. Exposed through `F32TensorOpsBackend`, with explicit unsupported defaults for other backends.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed 5 actual-device tests. The channel-split test uses `B=2,C=4,H=3,W=5`, a nonzero begin channel, and fully qualified trait dispatch against an independent NCHW slice. This is a primitive only; runtime integration remains open.
+
+## 217. WMHF local-branch concatenation primitive
+
+- Added native Oxide `wmhf_concat_local_f32`, joining the 3x/5x/7x depthwise branch tensors along channels as `[B,3C,H,W]` in source order. Exposed through `F32TensorOpsBackend`; unsupported backends retain explicit panic defaults.
+- Evidence: `MEM=3G ./tools/test_oxide.sh --test oxide_wmhf` passed 6 actual-device tests. The new test checks batch-major/channel-major branch blocks for `B=2,C=2,H=3,W=5` through trait dispatch. This remains a primitive, not the complete WMHF runtime path.
+
+## 218. RNN C++-source axis pin
+
+- Added `rnn_axis_layout_pins_cpp_step_batch_and_input_channels`, a two-step, two-sample fixture with three input features, two hidden values, and three outputs. It independently computes `[step][sample][feature]` inputs and `[step][sample][output]` order, including sample-local recurrent state and `[out][in]` projections.
+- Source contract: `Jev_laya:src-lib/rnn_layer.cpp:92-133` (`state.input` step advance, state rows, and output-layer slices). Evidence: `MEM=3G ./tools/test_host.sh rnn_axis_layout` passed; `MEM=3G ./tools/test_host.sh axis_layout` passed 45 tests (946 filtered out). Hand-derived from source; no compiled-C++ golden. The pin is unversioned in the current dirty worktree.
+
+## 219. LSTM C++-source axis pin
+
+- Added `lstm_axis_layout_pins_cpp_gate_blocks_steps_and_samples` with two steps, two samples, three input features, and two hidden/cell outputs. Independent formulas exercise separate f/i/g/o input projection blocks, recurrent-cell carry per sample, and time-major output slots.
+- Source contract: `Jev_laya:src-lib/lstm_layer.cpp:46-83,177-260` (separate gate layers, projection combination, cell update, state/output storage). `MEM=3G ./tools/test_host.sh lstm_axis_layout` passed. Hand-derived from source; no compiled-C++ golden; the pin is unversioned in the dirty worktree.
+
+## 220. CRNN C++-source axis pin
+
+- Added `crnn_axis_layout_pins_cpp_spatial_step_and_sample_order`, using `B=2,T=2,C=1,H=2,W=3`, two hidden channels and two output channels. Independent formulas pin per-step NCHW input slicing, per-spatial hidden-state carry, input/self/output convolution channel order, and time-major output storage.
+- Source contract: `Jev_laya:src-lib/crnn_layer.cpp:28-83,165-218` (sub-convolution construction, per-step forward sequence and pointer advancement). `MEM=3G ./tools/test_host.sh crnn_axis_layout` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 221. Contrastive C++-source axis pin
+
+- Added `contrastive_axis_layout_pins_cpp_batch_rows_and_embedding_features` with four three-feature embeddings, truth labels in sample-row order, and an independent source-order cosine/probability/delta calculation. Asymmetric vectors make a batch-feature transpose change pair similarities and the resulting sample deltas.
+- Source contract: `Jev_laya:src-lib/softmax_layer.cpp:265-430` (per-sample labels, `get_embedding`, pair loops and batch/time-step exclusion); probability/helper equations are hand-derived from the same branch. `MEM=3G ./tools/test_host.sh contrastive_axis_layout` passed. No compiled-C++ golden; unversioned in the dirty worktree.
+
+## 222. JevCe C++-source axis pin
+
+- Added `jev_ce_axis_layout_pins_cpp_batch_group_candidate_and_layout_order` for two samples, two groups and three candidates in both row-major and channel-major storage. Hand-calculated softmax probabilities and normalized deltas pin sample spans, group/candidate indexing, and empty-group masking.
+- Source contract: `Jev_laya:src-lib/jev_ce_layer.cpp:177-183,311-323` (`at(base,g,i)`, per-group softmax/loss and sample loop). `MEM=3G ./tools/test_host.sh jev_ce_axis_layout` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 223. OmdLoss C++-source axis pin
+
+- Added `omd_axis_layout_pins_cpp_nchw_sample_rows_pairs_and_scatter` with two batches, two channels, a non-square 2x3 plane, distinct object pixels and independently checked NCHW feature extraction, sample ordering, pair count and delta scatter. Existing `max_delta_clips_the_injected_delta` checks finite clipping; the sentinel path is `clip_delta`'s `max_delta >= FLT_MAX` branch.
+- Source contract: `Jev_laya:src-lib/omd_loss_layer.cpp:86-95,143-185,189-260`. `MEM=3G ./tools/test_host.sh omd_axis_layout` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 224. Native CenterNet GPU forward
+
+- Added `F32TensorOpsBackend::centernet_forward_f32`, an Oxide NCHW kernel applying sigmoid to the first `classes` channels, copying regression planes, and sanitizing non-finite results. Wired both full and compact f32 GPU-runtime arms, replacing full-path host activation and eliminating compact's unsupported-layer gap. Full CenterNet head loss/backward remains host-owned; this is not complete layer GPU support.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_centernet` passed 2 actual-device tests (formula/edge values and malformed shapes). `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain centernet_native_runtime_forward_matches_cpu` passed full and compact actual-runtime CPU-reference parity; `MEM=3G ./tools/test_host.sh centernet` passed 14 host tests. Rustfmt passed for touched Rust files. Hand-derived from source; no compiled-C++ golden; unversioned in dirty worktree.
+
+## 225. Native modern-YOLO GPU activation forward
+
+- Added the shared `F32TensorOpsBackend::modern_yolo_forward_f32` contract and Oxide NCHW kernel: sanitize every value and apply the source's clamped sigmoid only to the trailing objectness/class channels. Wired YOLOX, PP-YOLOE and YOLO-NAS full and compact f32 runtime dispatch; previously these full paths downloaded to host and compact paths passed raw YOLOX through or rejected the other heads. Assignment/loss/backward remains host-owned; this is not full GPU layer completion.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain modern_yolo_native_full_and_compact_forward_match_cpu` passed actual-device batch-2 CPU-reference parity for all three head types in both full and compact execution. `MEM=3G ./tools/test_host.sh modern_yolo` passed 24 tests; `MEM=3G ./tools/test_host.sh gpu_yolox_head` passed the generic CPU-reference backward test. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 226. Native Segmentation GPU activation forward
+
+- Added a generic `segmentation_forward_f32` contract and Oxide kernel. Binary mode sanitizes each scalar then applies sigmoid; multiclass mode computes stable softmax over the channel axis at each NCHW pixel using `temperature`. Wired full and compact f32 GPU runtime, replacing the full path's host download/activation/upload and compact path's CPU fallback. Loss, correct-pixel gate, and training seed remain host-owned; this is partial GPU support.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain segmentation_native_full_and_compact_forward_match_cpu` passed actual-device CPU-reference parity for binary and three-class heads in full and compact paths; host `MEM=3G ./tools/test_host.sh segmentation` passed 18 tests. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 227. Native JevCe GPU softmax forward
+
+- Added `jev_ce_forward_f32` to the generic backend contract and a native Oxide group-owned softmax kernel supporting both C++ layouts (`group` and `channel`), per-group temperature scaling, and batch-local spans. Wired full and compact f32 runtime, replacing the host softmax path and compact fallback. Head loss/label smoothing/delta remain host-owned; this is partial GPU support.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain jev_ce_native_full_and_compact_forward_match_cpu_for_both_layouts` passed actual-device batch-2 CPU-reference parity in both layouts and both runtime paths. `MEM=3G ./tools/test_host.sh jev_ce` passed 8 tests, including the existing CPU axis pin. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 228. Native LayaLoss GPU softmax forward
+
+- Added `laya_loss_forward_f32` to the generic backend and native Oxide contracts. One device thread owns a sample row and computes the stable all-valid K-option softmax with f64 accumulation, matching the CPU helper. Wired full and compact f32 runtime, replacing host probability computation and compact fallback. Truth masking, CE/RLCD loss, seed, and TD(lambda) remain host-owned; partial GPU support only.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain laya_loss_native_full_and_compact_forward_matches_cpu` passed actual-device batch-2 CPU-reference parity in full and compact paths plus the seeded pass-through input-gradient check. `MEM=3G ./tools/test_host.sh laya_loss` passed 11 tests. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 229. Native compact identity heads
+
+- Removed `OmdLoss` and `Regression` from the f32 compact GPU CPU-fallback allowlist and routed them through the device-resident identity arm, matching their full-runtime pass-through semantics. No kernel is required for these identity heads.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain compact_identity_heads_omd_loss_and_regression_match_cpu` passed actual-device CPU-reference output parity for both. `MEM=3G ./tools/test_host.sh omd_loss` passed 15 tests and `MEM=3G ./tools/test_host.sh regression` passed 1. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 230. Native compact Logistic and Softmax
+
+- Removed Logistic and grouped Softmax from the f32 compact host-fallback allowlist and added compact dispatch through native `activation_f32(Logistic)` / `softmax_f32`, preserving batch/group geometry. Compact paths had previously routed through `forward_with_state` or an identity arm; these now stay on the compact device path.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain compact_logistic_and_softmax_forward_match_cpu` passed actual-device CPU-reference parity for batch-2 Logistic and grouped Softmax. `MEM=3G ./tools/test_host.sh logistic` passed 7 tests; `MEM=3G ./tools/test_host.sh softmax` passed 12. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 231. Native compact Reorg and channel routing
+
+- Removed Reorg, ChannelShuffle and ChannelSlice from the f32 compact GPU CPU-fallback allowlist and added compact dispatch through their existing native `reorg_f32`, `channel_shuffle_f32`, and `route_concat_f32` operations. ChannelSlice resolves its source-layer output on device and preserves the configured channel range.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain compact_reorg_shuffle_and_channel_slice_match_cpu` passed actual-device batch-2 CPU-reference parity for all three (including ChannelSlice after a convolution). `MEM=3G ./tools/test_host.sh channel_slice` passed 4 host tests. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 232. Native compact ScaleChannels
+
+- Removed `ScaleChannels` from the generic f32 compact fallback list and added device dispatch through the existing native `scale_channels_f32` and activation ops. Compact preflight still routes unsupported activations through full runtime; supported modes retain the direct device path and source-layer use accounting.
+- `MEM=3G ./tools/test_oxide.sh --test oxide_runtime_chain compact_reorg_shuffle_channel_slice_and_scale_match_cpu` passed actual-device batch-2 CPU-reference parity for ScaleChannels using a pooled source, together with compact Reorg/ChannelShuffle/ChannelSlice. `MEM=3G ./tools/test_host.sh scale_channels` passed 3 tests. Rustfmt and `git diff --check` passed. Hand-derived from source; no compiled-C++ golden; unversioned in the dirty worktree.
+
+## 233. Dynamic mixed-precision loss scaler
+
+- v0.2.161 adds public `runtime::LossScaler` and `ScaleStep` for the fp16 training hardening path. Non-finite gradients halve the scale with a 1.0 floor, reset growth, and return `Skip`; finite gradients return `Apply` and double every 1000 steps up to 65,536. Constructor and growth caps are enforced; finite updates at the cap reset the growth counter without overflow. CLI integration, overflow-detection coverage and xtask scaler defaults were added in v0.2.162–v0.2.164; only Task 5 convergence evidence remains user-gated in `plan_fp16.md`.
+- Evidence: `PKGS=lightnet-core cargo xtask test loss_scaler` passed all 8 focused tests after temporarily adding `use super::*;` to `runtime/tests/mod.rs` to satisfy existing sibling test imports; that test-harness-only edit was removed afterward. Without the temporary import, the existing test module fails to compile on missing imports before tests run. No training/convergence or C++ parity claim.
+
+## 234. CLI loss-scale option and LossScaler integration
+
+- v0.2.162 adds `TrainOptions.loss_scale` with `-loss_scale` / `--loss_scale` parsing and finite-positive validation. GPU training applies the configured value and the `LossScaler` cap before its first step; dynamic mode reuses the scaler for overflow skip/halving and finite-step growth, while `-loss_scale` without `-dyn_scale` remains static.
+- Evidence: `PKGS=lightnet-cli cargo xtask test parse_train` passed the 3 new parse tests; `cargo xtask check` passed for `lightnet-cli` and `lightnet-core`. The default test package set still fails before test execution on pre-existing `lightnet-core` runtime test import errors; the focused CLI tests were run with `PKGS=lightnet-cli`. GPT-6-luna review: OK. No training/convergence claim.
+
+## 235. FP16 overflow detection for convolution and BN gradients
+
+- v0.2.163 adds focused coverage for the existing `GpuExecutableNetwork::gradients_non_finite()` scan of convolution weights, BN bias, and BN scale gradients; no `gpu_state.rs` change was needed. Each test performs finite backward on the small convolution + BN network, then injects infinity into exactly one target buffer before checking detection.
+- Evidence: `PKGS=lightnet-core cargo xtask test gradients_non_finite` passed all 3 focused tests twice. Both runs used the permitted temporary `use super::*;` import in `runtime/tests/mod.rs` to bypass pre-existing sibling-test import errors; the shim was removed after each run. The final `git diff --check` passed. The tests were uncapped because `systemd-run --user` was unavailable. Fresh GPT-6-luna review accepted the coverage. No full core-suite or training/convergence claim.
+
+## 236. xtask fp16 enables dynamic loss scaling
+
+- v0.2.164 updates `precision_env` and the `train_legogears` arm so `-fp16` enables `LIGHTNET_OXIDE_AMP=1` and appends `-dyn_scale` and `-loss_scale 1024` unless each was supplied by the user. User scaler flags remain in pass-through arguments; fp8 adds no scaler arguments. The xtask help and `CLAUDE.md` Commands table document the defaults.
+- Evidence: test-first `PKGS=xtask cargo xtask test` failed with the expected tuple-shape compile errors; after implementation the command passed all 4 new tests. `cargo xtask help` displayed the updated flags, `git diff --check` passed, and fresh GPT-6-luna review accepted the diff. No training run was started.
+
+## 237. xtask precision environment clippy cleanup
+
+- v0.2.165 names the existing three-part `precision_env` result with a local `PrecisionEnv` alias, removing the new `type_complexity` warning without changing behavior or return element order.
+- Evidence: `cargo xtask clippy xtask` passed without warnings, `PKGS=xtask cargo xtask test` passed all 4 fp16/fp8 scaler-flag tests, and `git diff --check` passed. Fresh GPT-6-luna review accepted the change. The default `cargo xtask clippy` remains blocked by three pre-existing `approx_constant` errors in untouched `vc_attention.rs`; default `cargo xtask test` remains blocked by 77 existing core runtime test-harness errors. No training run was started.
+
+## 238. fp8 cached weight operands
+
+- v0.2.166 quantises the weight operand of the fp8 conv forward and dgrad once per weight tensor. The copy is keyed on the weight buffer identity and format, with a weak key and the `W16_CACHE_MAX` cap, and refreshes when the optimizer returns a new tensor. Activations are still quantised per call. The cache is reachable only through the weight seams (`gemm_weights_a`, `backward_gemm_weights_a`), never through the generic `gemm_f32`, because pooled activation buffers reuse addresses.
+- Evidence: `cargo xtask oxide --test oxide_gemm_f8` passed 24 of 24 (three new: `fp8_weight_cache_hits_on_second_forward`, `fp8_weight_cache_refreshes_after_update`, `fp8_cached_weights_serve_forward_and_transposed_dgrad`). `gemm_bench_lego` (uncached tensor path) gave fp32 2.04 ms and fp8 18.27 ms over the 21 convs in the same run. That bench cannot show the cache gain; a conv-level measurement is still open. No training run was started.
+
+## 239. fp8 overhead: pooled temporaries, fused scale and A+B quantise
+
+- v0.2.167 takes the fp8 amax slot, scale pair and quantised bytes from the buffer pool (new u8 free list `PooledBuf8`, sharing the byte cap) instead of allocating per operand. The amax slot is an f32 buffer that the kernel reads as `u32` bits.
+- v0.2.168 drops `fp8_scale_kernel`: `fp8_quantize_kernel` derives `factor = max_finite / amax` from the amax slot and writes the `[factor, 1 / factor]` scale pair itself. `fp8_scale_dev` and `fp8_quantize_buffer` became `fp8_quantize_operand`; the host-side `quantize_f32_to_fp8` keeps an explicit-scale kernel (`fp8_quantize_scaled_kernel`).
+- v0.2.169 fuses A and B: `fp8_amax_pair_kernel` (per-block shared-memory reduction, one atomic per block, A and B slots 128 bytes apart) and `fp8_quantize_pair_kernel`. Per GEMM 7 host calls became 4. The first fused attempt (one atomic per element) was slower (lego 5.89 ms) and was reworked after a `gpt-6-sol` review, which also found the operand split used buffer length instead of GEMM extent (out-of-bounds write); pinned by `fp8_pair_quantise_ignores_elements_beyond_the_gemm_extent`.
+- Evidence: `oxide_gemm_f8` 25 of 25 after v0.2.169 (24 after v0.2.167 and v0.2.168). `gemm_bench_precisions` `prec-lego` fp8 total: 21.97 ms before, 3.84 ms after pooling, 2.95 ms after the scale fusion, 2.23 ms after the A+B fusion (fp32 0.98 to 1.12 ms in the same runs). Square total 4.16 ms against fp32 4.21 ms. `nsys` after v0.2.168: 14022 launches and 4906 memsets for 2402 GEMMs, launch-bound (see `plan_fp8.md`, "Overhead optimisation"). No training run was started.
+
+## 240. HalfFormat and GemmMode::Bf16
+
+- v0.2.170 (`plan_bf16.md` Task 1) adds `HalfFormat { F16, Bf16 }`, `parse_amp_format`, `OxideBackend::with_amp_format` and `half_format`, and `GemmMode::Bf16` (`LIGHTNET_OXIDE_GEMM=bf16`). `LIGHTNET_OXIDE_AMP` now accepts `bf16`/`bfloat16` as well as the old f16 spellings; garbage and empty mean AMP off. `GemmMode::Bf16` in the f32 API rounds both operands to bf16 and runs the 16-bit tensor-core GEMM with f32 output (`gemm_f32_operands_as_half`).
+- Only the GEMM path is format-aware: the AMP activation kernels still read and write f16, so `LIGHTNET_OXIDE_AMP=bf16` is not usable for training until `plan_bf16.md` Tasks 4 to 6. `cargo xtask train_legogears -bf16` is still rejected.
+- Evidence: `oxide_amp` 15 of 15 (four new: format parsing, garbage rejection, `with_amp_format` mode selection, `bf16_gemm_mode_tracks_the_f32_gemm_in_the_f32_api`), `oxide_gemm_f8` 26 of 26 (new `gemm_mode_from_env_parses_bf16`). No training run was started.
+
+## 241. fp8 byte im2col (conv forward and wgrad)
+
+- v0.2.171 adds `im2col_fp8` (`kernels/im2col.rs`): one pass gathers the image and writes e4m3 bytes using `factor = 448 / amax(x)`, and block 0 writes the `[factor, 1 / factor]` scale pair. The image amax comes from one `fp8_amax_slot` launch over `x`; the column has the same amax as the image (it repeats image values and adds zero padding), so no amax or quantise pass runs over the column and the column write is 4x smaller. `conv_forward` (weights come from the cache, so only the column is byte) and `conv_backward_weights` (`dy` is quantised as A, the column is B) use it when `GemmMode::Fp8` is on (wgrad also needs `bwd_fp8` unset). `conv_backward_input` is unchanged (its column is a GEMM output, then `col2im`).
+- Profile that motivated it (`nsys`, `bench-train`, batch 16, 21 steps, before): the real step is GPU-bound, not launch-bound as the GEMM-bench profile suggested. fp8 `sgemm_fp8_mma` 374 ms plus amax and quantise kernels 243 ms (about 11.6 ms per step) against fp32 `sgemm_tiled` 499 ms; `im2col` 171 ms in both.
+- Evidence: `oxide_gemm_f8` 26 of 26 (existing conv fp8 vs fp32 tests cover the new path). `bench-train` batch 16, 30 steps, 3 interleaved rounds, medians: fp32 51.1 / 49.8 / 52.4 ms, fp8 50.1 / 50.1 / 50.3 ms (fp8 was about 57 to 60 ms before). Full `cargo xtask train_legogears` seed 42, 3000 iterations (`bench/results_train.csv`): fp32 160.9 s total, median 53.4 ms, final avg loss 0.0597, mAP@0.50 99.55%, F1 0.9935; fp8 before 171.5 s, 57.0 ms, 0.0585, 99.50%, 0.9902; fp8 after 153.7 s, 50.5 ms, 0.0594, 99.74%, 0.9935. The 88.2 s of the target chart is not reached (that chart is not a Rust fp32 or fp8 run, see `docs/OXIDE_BENCH.md` section 10). Margin over fp32 is about 4 to 6%, single run each; the fp32 column drifts by up to 20%.
+
+## 242. fp8 amax ring and bf16 mixed-precision training
+
+- v0.2.172 (`57c36cb`): fp8 amax slots come from a ring of 256 pre-zeroed 64-word slots (`Fp8Ring`, `fp8_next_slot`), zero-filled with one memset per lap instead of one `cuMemsetD8Async` per operand (about 124 memsets per training step before). The amax, quantise, pair and `im2col_fp8` kernels take a slot word offset. `fp8_amax_f32_kernel` is block-reduced (shared-memory max, one atomic per block) like the pair kernel. `bench-train` batch 16, 5 interleaved rounds: fp8 49.0 ms (48.0 to 49.6) against fp32 50.9 ms (49.8 to 51.1).
+- v0.2.173 to v0.2.176 (plan_bf16 Tasks 2 to 7; not chronological with v0.2.172, the numbers follow the commit messages): v0.2.173 format-aware conversions (`half_bits_to_f32`, `f32_to_half_bits`, `to_half`, `from_half`; `f983c8e`); v0.2.174 bf16 output from the 16-bit GEMM epilogue and split-K reduce (`hgemm_ex` accepts bf16 with a 16-bit output, `gemm_bf16_out16`; `c51d5b9`); v0.2.175 bf16 AMP mode (`dedebb2`): every `amp_*` kernel, `maxpool_f16` and `upsample_nearest_f16` take a `fmt` argument, AMP storage, weight copies and `hgemm` follow `half_format()`, `conv_weights_half`, and f16-only inference ops (`require_f16`) return an error in bf16 mode (`im2col_f16` and `route_copy_f16` are pure bit copies and needed no change); v0.2.176 `cargo xtask train_legogears -bf16` sets `LIGHTNET_OXIDE_AMP=bf16` with no loss scaling, and the training build default is 4 threads (`7ef8322`).
+- Evidence: `oxide_half` 17 of 17 (new `gemm_bf16_with_bf16_output_matches_reference`, `bf16_mode_rejects_f16_only_inference_ops`, conversion tests), `oxide_amp` 15 of 15 in both formats (`LIGHTNET_TEST_AMP_FMT=bf16` runs the whole suite in bf16 with every bound 8x the f16 bound, named `bf16_gradient_bounds_are_8x_f16`), `oxide_runtime_f16` 22 of 22, `oxide_gemm_f8` 26 of 26, xtask 6 of 6. Training, seed 42, 3000 iterations, interleaved, two rounds (`docs/OXIDE_BENCH.md` section 10): fp32 147.1 s, fp8 142.9 s, bf16 138.6 s; mAP@0.50 99.55%, 99.55%, 99.63%; F1 0.9935, 0.9902, 0.9935. The 88.2 s of the reference chart is a C++ Darknet figure and is not reached. Open: fp8 on bf16 storage (plan_fp8 Task 6), delayed scaling, `dy` quantise pass, fp8 kernel tuning.
+
+## 243. fp8 wgrad byte column with the e5m2 gradient recipe
+
+- v0.2.177: `conv_backward_weights` keeps the byte im2col whenever `GemmMode::Fp8` is on; with `LIGHTNET_OXIDE_GEMM_BWD=fp8` the column is quantised to the recipe's first format (e4m3, activations) and `dy` to the second (e5m2, gradient). Before, the recipe fed `dy` to wgrad as e4m3 and the column as e5m2 and dropped the byte path (153.1 s). `launch_im2col_fp8` and `gemm_fp8_b_bytes` take the formats. `cargo xtask train_legogears -fp8` now sets `LIGHTNET_OXIDE_GEMM_BWD=fp8` as well as `LIGHTNET_OXIDE_GEMM=fp8`.
+- Evidence: `oxide_gemm_f8` 26 of 26, xtask 6 of 6. Training, seed 42, 3000 iterations: fp8 142.9 s and 142.1 s (47.2 ms), loss 0.0578, mAP 99.80%, F1 0.9902; fp32 146.4 s (48.7 ms) in the same session; fp16 AMP 208.8 s (67.5 ms), mAP 99.63%, F1 0.9902; table in `docs/OXIDE_BENCH.md` section 10. fp8's F1 is one false positive below fp32's 0.9935 (the chart's), and fp16 lands on the same value.
+
+## 244. Delayed fp8 scaling
+
+- v0.2.178: `Fp8Scaling { Current, Delayed }` (`LIGHTNET_OXIDE_FP8_SCALING`, `with_fp8_scaling`; default `Current`). Delayed keeps a 16-slot f32 amax history per key (source device address, length, format) in one zeroed buffer. `fp8_quantize_delayed_kernel` takes the factor from the history max (slots `w = n % 16` and `z = (n + 2) % 16` excluded, so no read/write race), quantises with saturation, writes the `[factor, 1/factor]` pair, block-reduces its own amax into slot `w` (one atomic per block) and zeroes slot `z`. Call 0 of a key uses the two-pass current path with the amax landing in its slot. Applies to `fp8_quantize_operand` and `fp8_quantize_pair` (pair runs the operand path twice); cached weights and the byte im2col amax stay on current scaling. A full history (4096 keys) falls back to current scaling.
+- Evidence: `oxide_gemm_f8` 31 of 31 (new: `delayed_scaling_matches_current_scaling_on_stationary_data`, `delayed_scaling_saturates_on_a_spike`, `delayed_scaling_first_call_uses_current_amax`, a weights and 16-call ageing test, env parsing). No speed or training measurement.
+
+## 245. fp8 backward quantises dy once
+
+- v0.2.179: dgrad (weights e4m3 x `dy` e5m2, `dy` = operand B) and wgrad (`dy` e5m2 x byte column e4m3, `dy` = operand A) read the same f32 buffer in the same format, and the bytes are elementwise so one buffer serves both layouts (the transposes live in `GemmArgs`). `OxideBackend::fp8_dy` quantises the whole `dy` through `fp8_quantize_operand` and keeps the latest result (bytes + scale pair) in a one-entry cache keyed on the `Arc` identity (a live `Weak` pins the address), length and format; `backward_gemm_weights_dy` and `gemm_fp8_dy_a_bytes` replace `backward_gemm_weights_a` and `gemm_fp8_b_bytes`. Delayed scaling goes through the same keyed path once per backward. Difference: wgrad used to quantise a prefix of `dy` per image chunk (scale from the prefix amax); it now uses the whole-tensor amax. Single-chunk results are bitwise unchanged; multi-chunk results differ at fp8 rounding level. The f32 wgrad fallback (`GemmMode` not fp8, pair quantise with the column) is unchanged.
+- Evidence: `oxide_gemm_f8` 33 of 33 (new: `fp8_backward_quantises_dy_once`, `fp8_backward_shares_dy_under_delayed_scaling`), `oxide_amp` 15 of 15, `oxide_half` 17 of 17. Quantise launches per dgrad+wgrad (weights cached): 2 before, 1 after; dx and dw bitwise equal to the separate-copy reference.
+
+## 246. fp8 quantisation from 16-bit storage
+
+- v0.2.180: `fp8_amax_half_kernel` and `fp8_quantize_half_kernel` take `&[u16]` and `hfmt` (0 = f16, 1 = bf16) and widen with `half_bits_to_f32`, so the factor, scale pair and bytes equal what the f32 kernels give on the widened tensor (the widening is exact). `fp8_quantize_half` (current scaling), `gemm_fp8_half_operands(a, b, c, g, fa, fb, hfmt)`, test seams `fp8_quantize_half_probe` and `gemm_fp8_half`. Delayed scaling does not cover 16-bit operands.
+- Evidence: `oxide_gemm_f8` 35 of 35 (new: `fp8_from_f16_matches_fp8_from_widened_f32`, `fp8_from_bf16_matches_fp8_from_widened_f32`: byte-identical output, equal scale pair for e4m3 and e5m2 on data with a zero run, a tiny value and an f16-overflowing spike; GEMM bit-equal to the f32 fp8 selector on the widened operands for all four transposes).
+
+## 247. fp8 conv GEMMs under mixed-precision storage
+
+- v0.2.181: AMP with the fp8 GEMM mode: `with_amp_format` and the constructor keep `GemmMode::Fp8`. Forward (`conv_forward_amp_fp8`): cached e4m3 weights from the f32 master, columns quantised from the 16-bit im2col, f32 accumulate, one rounding into the AMP format; 1x1 stride-1 convs skip im2col. dgrad and wgrad use `bwd_fp8` or e4m3 x e4m3, with `dy` quantised once for both (`fp8_dy_half`, one-entry cache on the half buffer identity, length and formats). With AMP + fp8 the f32 GEMM seam keeps the 16-bit compute path, so non-conv ops are unchanged.
+- Evidence: `oxide_amp` 18 of 18, also with `LIGHTNET_TEST_AMP_FMT=bf16` (new: `amp_conv_with_fp8_gemm_tracks_f32_reference` runs f16 and bf16, with and without the e5m2 gradient recipe, seven conv shapes incl. groups and 1x1: nerr 3e-2 to 7e-2, bound 0.1, and the result differs from the 16-bit GEMM; `amp_fp8_weight_copy_is_refreshed_after_an_update`: second forward saves exactly the weight quantise, an updated tensor is quantised again; `amp_without_fp8_env_still_uses_fp16_gemm`: no fp8 launches). `oxide_gemm_f8` 35 of 35, `oxide_half` 17 of 17 (1 ignored), `oxide_runtime_f16` 22 of 22. No speed measurement.
+
+## 248. xtask -fp8 -fp16 / -fp8 -bf16
+
+- v0.2.182: `precision_env` accepts `-fp8` plus one 16-bit flag in either order: `LIGHTNET_OXIDE_GEMM=fp8`, `LIGHTNET_OXIDE_GEMM_BWD=fp8` and the AMP switch of that flag (the `-fp16` `-dyn_scale -loss_scale 1024` rule applies, bf16 adds no flags). Plain `-fp8` is unchanged (f32 storage, the benchmark config).
+- Evidence: `PKGS=xtask cargo xtask test` 11 of 11 (five new).
+
+## 249. fp8 + bf16 master-weight test
+
+- v0.2.183: `amp_fp8_bf16_masters_stay_f32_and_change_after_a_step`: weights, weight gradient and SGD result are f32 (`is_half()` false), the master changes, the fp8 weight copy is refreshed from the updated master. Optimizer ops only accept f32 tensors; the bf16 weight copy and fp8 bytes are caches keyed on the master buffer. Evidence: `oxide_amp` fp8 filter 4 of 4.
+
+## 250. fp8 kernel tuning (plan_fp8 Task 5)
+
+- v0.2.184 (`87ae104`): `sgemm_fp8_mma` stages a `[k][n]` operand (NN and TN B) as one 4 (k) x 4 (n) byte block per thread: four aligned word loads, a register byte transpose (`fp8_stage_t4`), four K-contiguous word stores into the `[n][k]` shared tile. Edge, unaligned and non-NN blocks keep the old guarded paths. Accumulation order is unchanged.
+- v0.2.185 (`01ae58f`): two shared stages per operand, one `sync_threads` per K step, 16-byte `cp.async` with zero fill for K-contiguous A (`fp8_issue16`; register path otherwise), B loaded before the mma of the current tile and stored into the next stage after it. A pitch 48 bytes. The same change on the old kernel was 9% slower and was reverted first.
+- v0.2.186 (`b690fb9`): `sgemm_fp8_mma_e4m3` (copy of the body with `mma_f8_k32_e4m3`), launched by `gemm_fp8_args` when both operands are e4m3; `OxideBackend::set_fp8_generic_kernel` is a test seam. `cuda_module` does not see kernels produced by `macro_rules!`, hence the copy.
+- Rejected: `ldmatrix.x4` for A and B (correct, 14% slower; two 8-bit values are one b16 element in the m16n8k32 layout, so the old header claim that `ldmatrix` cannot be used was wrong).
+- Numbers (2048^3 kernel-only): 2.46 ms, then 1.26, 0.991, 0.613 ms = 7000 to 28000 GF/s (fp16 kernel 13485, fp32 4946). 21 LegoGears GEMMs kernel-only fp8 / fp32: 1.00 to 0.72-0.75. `prec-sq` fp8 4.4 to 1.87 ms. Full table and rejected rows in `plan_fp8.md` (Kernel experiment log).
+- Evidence: `oxide_gemm_f8` 38 of 38 (new: `gemm_fp8_transposed_large_k_matches_reference`, `gemm_fp8_nn_is_bitwise_equal_to_nt_on_the_same_data`, `fp8_e4m3_specialised_kernel_matches_generic`). `oxide_amp` 19 of 19 (fp8 conv paths use the new kernels). Not measured: training step (user-gated), ncu stall counters, `oxide_half`.
+
+## 251. Delayed fp8 scaling on 16-bit sources (plan_fp8 Tasks 3/4/6 follow-up)
+
+- v0.2.187 (`8056b16`): `fp8_quantize_delayed_half_kernel` is `fp8_quantize_delayed_kernel` reading `&[u16]` through `half_bits_to_f32(x[i], hfmt)`: same history protocol (write slot `w = n % 16`, zero slot `z = (n + 2) % 16`, factor from the max of the other 14, saturating quantise, scale pair, block-reduced amax into slot `w`). `fp8_quantize_half` now goes through the delayed path under `LIGHTNET_OXIDE_FP8_SCALING=delayed`: `fp8_quantize_delayed` takes a source enum (f32 buffer, or 16-bit buffer plus `HalfFormat`). Key is (device pointer of the source buffer, length, format code); a 16-bit source adds `(hfmt + 1) << 8` to the code so it never shares a history with an f32 buffer at the same address. Call 0 of a key runs `fp8_amax_half_kernel` into the history slot, then `fp8_quantize_half_kernel` (two passes, as the f32 path); later calls are one launch.
+- Applies to the AMP activation columns, 1x1 activations and `dy` (`fp8_dy_half` still shares one quantise between dgrad and wgrad). Weights are untouched (`fp8_weights`, current scaling from the f32 master). Default (`current`) path is the same kernels in the same order as before.
+- New seams: `OxideBackend::fp8_amax_passes()` (counts stand-alone amax passes of the 16-bit quantiser; `fp8_quantize_launches` counts one per quantise either way so it cannot tell the two paths apart) and `fp8_quantize_half_probe_keyed` (key override).
+- Evidence: `oxide_gemm_f8` 46 of 46 (eight new, f16 and bf16 each: `delayed_half_matches_current_on_stationary_data`, `delayed_half_saturates_on_a_spike`, `delayed_half_first_call_uses_current_amax`, `delayed_half_quantises_in_one_launch`); `oxide_amp` 20 of 20 in f16 and in bf16 (new `amp_conv_with_delayed_fp8_scaling_tracks_f32_reference`: fwd, dgrad, wgrad within 0.1 of the f64 reference over 4 rounds; stand-alone amax passes 14 against 84 for current scaling); `oxide_half` 17 of 17 (1 ignored). Not measured: training step speed or accuracy (user-gated, Task 9).
+
+## 252. fp8 conv review fixes (codex review of the 16-bit fp8 path)
+
+Four findings, each reproduced on the GPU by a failing test first, then fixed (one commit each). All in `src/lightnet-cuda-oxide` unless noted; training effect not measured.
+
+- v0.2.188 (`5b31be2`): the fp8 amax, quantise and delayed kernels take the logical element count `len` (`bounded_len(len, x.len())`). The AMP im2col workspace (`half_col`) only grows and is reused across chunks and convs, and the amax launch rounds the logical length up to a multiple of 256, so the last block read stale columns past the logical end (only up to 255 of them, and only when `nb * img_col` is not a multiple of 256). A stale spike set the scale and the real activations rounded to zero (reproduced: forward nerr 1.0). Test `amp_fp8_conv_amax_ignores_stale_workspace_tail` (f16, bf16, current and delayed scaling; geometry 1x7x7, k = 3, so the column is 896 elements): call A runs batch 3 with spike activations, call B runs batch 1 with small ones. It reproduces the same condition as a short final chunk without needing `LIGHTNET_OXIDE_CONV_CHUNK` (a process-wide `OnceLock`, so it cannot be set per test); a test with a forced chunk of 2 was not written.
+- v0.2.189 (`d9b1734`): `quantize_nan_f32` (non-finite input becomes the NaN byte `0x7f`, finite input unchanged, so finite overflow still saturates) is used by every GEMM operand quantiser: current, delayed, half, pair and the byte im2col. The raw cast `quantize_f32_to_fp8` and amax semantics are unchanged (`amax_ignores_non_finite_values` passes). Before, Inf saturated to max finite, so an all-Inf `dy` over finite activations gave a finite `dw` (reproduced: `-403817.75`, ...) and the loss scaler never saw the overflow. Tests: `amp_fp8_conv_overflowing_gradients_become_nonfinite` (wgrad, dgrad, forward; f16 and bf16), `fp8_quantisers_propagate_non_finite_input`, `fp8_gemm_with_inf_operand_is_non_finite`. `delayed_*_saturates_on_a_spike` still passes.
+- v0.2.190 (`ce1e7da`): `fp8_factor` clamps to `FP8_FACTOR_MAX = 2^120`; `fp8_quantize_kernel` uses it instead of its own copy of the formula. Before, amax below ~1e-36 gave an Inf factor (reproduced: `factor inf`, reciprocal 0, GEMM result 0). The host `fp8::amax_to_scale` divides (`amax / max_finite`), so it has no such hole and was left alone. Tests: `tiny_amax_gives_finite_scale_pair_{bf16,f16}`, `fp8_gemm_with_tiny_operands_is_finite`. Tensors with amax below ~3.4e-34 are no longer stretched to the full fp8 range.
+- `8f02e02` (`xtask`, no version number): `cargo xtask train` removes `LIGHTNET_OXIDE_AMP` from the child env unless a 16-bit flag sets it, so an inherited `LIGHTNET_OXIDE_AMP=bf16` no longer turns bare `-fp8` (or the no-flag default) into AMP storage. The old comment named `LIGHTNET_OXIDE_AMP` as an override of the xtask; it no longer is (the script run directly still honours it). Tests `bare_fp8_and_default_drop_an_inherited_amp` (failed before) and `sixteen_bit_flags_override_an_inherited_amp`; `CLAUDE.md` row updated.
+- Evidence: `oxide_gemm_f8` 51 of 51 (46 + 5 new), `oxide_amp` 22 of 22 in f16 and in bf16 (20 + 2 new), `oxide_half` 17 passed, 1 ignored, `oxide_runtime_f16` 22 of 22, `PKGS=xtask cargo xtask test` 13 of 13, `cargo xtask gpu-check` clean. Not run: the rest of the `oxide_*` test files, host core/cli tests, training (user-gated). `systemd-run --user` was unavailable in this session, so the runs were uncapped (thread limit 4 held).
+- Not fixed here: the delayed-scaling history is keyed on the source buffer's device pointer (see `plan_fp8.md`, Open issues).
+
+## Not implemented / open (pointer)
+
+See `tasks/rust/todo.md` for the deduplicated open list (P8/P9 follow-ups,
+fp16 remainder, hardware-blocked wgmma/tcgen05/NVFP4/multi-GPU, and Stage-2 GPU
+Muon), `layers.md` for Phases 1b–4 (remaining layers),
+`layer-support.md` for the per-`LayerKind` CPU/GPU/f16/axis matrix and the
+current gap lists (GPU hard rejections, forward-but-CPU-backward layers,
+partial device paths), `fp8_fp4.md` for FP8 step 5, and `gui_plan.md` for the
+GUI plan (partly implemented in v0.1.019–v0.1.021); ONNX export is complete.
+
+## 253. CPU language-model Phase 1 (plan_llm_decoder Tasks 1-7)
+
+v0.1.042. CPU reference path for the Latin decoder. Crate `src/lightnet-lm`: `config`/`types` (strict
+`[transformer]` geometry and token batches), `tokenizer` (byte-fallback BPE,
+optional u/v-i/j folding before NFC, SHA-256 artifact), `ops`/`attention`
+(RMSNorm, embedding, RoPE, SwiGLU, sparse CE, causal GQA; all adjoints),
+`decoder` (pre-RMSNorm blocks, tied head, seeded dropout, exact backward),
+`data` (v1 token shards, manifest, resumable packing), `optim` (token warmup +
+cosine, global clip), `train` (`CpuEngine`, `Trainer`, AdamW decay groups,
+pending accumulation), `checkpoint` (versioned, checksummed, atomic), `cache`
+(prefill/decode KV cache with revision invalidation), and `sampling`
+(greedy/temperature/top-k/top-p, EOS). CLI: `lightnet-rs lm
+{tokenizer,shards,train,resume,eval,generate}` in `src/lightnet-cli/src/lm.rs`.
+Docs: `tasks/rust/03_plans/llm/llm_data.md`, `src/lightnet-lm/CONTEXT.md`.
+
+Evidence: `PKGS=lightnet-lm cargo xtask test lm_` 52 of 52 (contract 6,
+tokenizer 7, ops 8, decoder 7, data 6, train 10, generate 8);
+`cargo xtask test lm_cli_` 4 of 4; `cargo xtask check lightnet-cli` clean;
+`cargo xtask clippy lightnet-lm` clean for this crate and the new `lm.rs` has
+no warnings. `systemd-run --user` was unavailable, so the runs were uncapped;
+`-j 2` held. The red phase was not observed per test (Tasks 1-5 were first
+compiled together); only the final green runs are evidence. No corpus
+training, evaluation, generation quality, or performance number was measured.
+
+Deviation from the plan text: no `cargo xtask lm` wrapper was added (the plan
+calls it proposed), so `xtask/src/main.rs` and `CLAUDE.md` are unchanged; the
+engine/trainer file is `train.rs` as named by the plan after an initial
+`engine.rs`; and `KvCache` keeps `batch` as a scalar constrained to one, so its
+buffers are `[kv_heads, context, head_dim]`. The plan's Task 10 pilot counts
+were wrong: the registry gives 41,955,840 parameters at vocabulary 8192 and
+46,150,144 at 16384, and the plan now records those derived values.
+
+## 254. fp16 convergence verdict (plan_fp16 Task 5)
+
+Docs-only record; no new training run. Seed 42, 3000 iterations, batch 16,
+release build, same session (`v0.2.171-7`): fp32 step 48.7 ms / 146.4 s, final
+avg loss 0.059712, mAP@0.50 99.55%, F1 0.9935; fp16 AMP step 67.5 ms /
+208.8 s, loss 0.052513, mAP 99.63%, F1 0.9902.
+
+Accuracy gate passes: fp16's loss is 12.1% lower (favorable, not a degradation)
+and mAP is 0.08 points higher; F1 is one false positive lower. Speed does not:
+fp16 is 38% slower than fp32, so it is an accuracy-equivalent mode, not a speed
+feature on this build. The sparse `non-finite gradients` skip count was not
+retained after log cleanup. Full table: `docs/OXIDE_BENCH.md` §7.2.1.
+
+## 255. FP8 delayed-history pool-incarnation fix
+
+v0.2.191. The delayed-scaling amax history is keyed by `(device pointer,
+pool incarnation, length, format)`. `BufPool` now tracks an incarnation per
+address and bumps it in `PooledBuf::new` / `PooledBuf16::new`; a recycled
+address therefore starts a fresh history instead of inheriting the previous
+owner's amax. Explicit test keys use incarnation 0, so the existing
+one-call-site tests still share history across different buffers.
+
+Root cause: the old key was only `(pointer, length, format)`, and the pool
+deliberately recycles buffers of the same length. A new tensor could land on an
+old address and make every delayed call look like call `n > 0`; saturation
+masked it, but the scale was stale.
+
+Evidence: `cargo xtask oxide --test oxide_gemm_f8` 54 of 54 (two new
+pool-recycle tests for f16 and bf16); `cargo xtask gpu-check` clean. Both
+uncapped (`systemd-run --user` unavailable), `-j 2`. No training run. Tag
+`v0.2.191`.
+
+## 256. Stable FP8 delayed-history site keys
+
+v0.2.192. Production quantisers now pass a stable per-role key instead of
+falling back to the source buffer address: forward A/B, dgrad A/B, wgrad A/B,
+weights B, dy, and half A/B. The history key is `(site, length, format)`, so it
+survives buffer-pool reallocation and keeps accumulating across training steps,
+while different operand roles can never inherit each other's amax. The
+`v0.2.191` pool incarnation remains as the fallback for unkeyed probe/test
+callers.
+
+Limitation: the key identifies an operand role and length, not an individual
+layer. Layers that share a role and length share one history. This is the
+call-site semantics the plan asked for; per-layer histories would need a layer
+identity carried through the runtime.
+
+Evidence: `cargo xtask oxide --test oxide_gemm_f8` 54 of 54; `cargo xtask
+gpu-check` clean. Both uncapped (`systemd-run --user` unavailable), `-j 2`. No
+training run. Tag `v0.2.192`.
+
+## 257. Native deconvolution channel normalization
+
+v0.2.193. `[deconvolutional]` now accepts `normalize_channels`,
+`normalize_channels_softmax`, and `normalize_channels_softmax_maxval` and keeps
+them on the native f32 path. The CPU reference applies the same tensor-level
+normalization used by convolution and computes its exact backward Jacobian,
+honouring `GradMode::Cpp`; the GPU forward uses `normalize_channels_f32` after
+the bias add, and the GPU backward uses `normalize_channels_backward_f32` with
+the cached pre-activation and the layer output. The whole-network CPU fallback
+now triggers only for unmapped `Other` activations, which config parsing
+rejects; every parsed deconvolution activation is native.
+
+Known limits at that increment: f16 deconvolution was still unsupported
+(compact f32 landed in v0.2.194, §258), optimizer parameters and gradients
+remain host-staged, and no compiled-C++ golden exists.
+
+Evidence: `cargo xtask test deconvolutional` 9 of 9; the
+channel-normalization config test passes; `cargo xtask oxide --test
+oxide_runtime_chain deconvolution` 3 of 3, including the new two-step
+channel-normalization SGD parity for all three modes; `cargo xtask gpu-check`
+clean; `cargo xtask clippy` completed with pre-existing warnings only. Runs
+were uncapped (`systemd-run --user` unavailable), `-j 2`. No training run and no
+full-suite claim. Tag `v0.2.193`.
+
+## 258. Deconvolution in compact inference
+
+v0.2.194. `forward_compact` now executes `[deconvolutional]` on the native f32
+path instead of rejecting it. The compact arm uploads the layer weights, runs
+the transposed convolution, adds the filter biases, then applies either the
+activation or the matching channel-normalization kernel. It shares the existing
+f32 deconvolution and normalization primitives with the full forward, so all
+parsed activations, including `NormalizeChannels*`, stay on the device.
+
+Known limits at that increment: compact f16 deconvolution was still unsupported
+(landed in v0.2.195, §259), optimizer parameters and gradients remain
+host-staged, and no compiled-C++ golden exists.
+
+Evidence: the new actual-Oxide `compact_deconvolution_matches_cpu` test passes
+for `linear`, `leaky`, and all three channel-normalization modes;
+`cargo xtask test deconvolutional` 9 of 9; `cargo xtask gpu-check` clean;
+`cargo xtask clippy` completed with pre-existing warnings only. Runs were
+uncapped (`systemd-run --user` unavailable), `-j 2`. No training run and no
+full-suite claim. Tag `v0.2.194`.
+
+## 259. Deconvolution in compact f16 inference
+
+v0.2.195. `forward_compact_f16` now accepts `[deconvolutional]`. The new
+`deconv_bias_act_f16` kernel accumulates in f32 over half-storage input and
+weights, adds the f32 bias, applies the activation, and rounds once to half;
+the matching `NormalizeChannels*` modes run through the existing
+`normalize_channels_f16` kernel. Half weights use the plain
+`[channels, filters, k, k]` layout and are cached per layer like convolution
+weights, so repeated calls do not re-upload them.
+
+Known limits: deconvolution training and backward remain f32-only, optimizer
+parameters and gradients remain host-staged, and no compiled-C++ golden exists.
+
+Evidence: the new actual-Oxide `deconvolution_f16_inference_matches_f32` test
+passes for `linear`, `leaky`, and all three channel-normalization modes (worst
+relative error 1.71e-3 against the 4e-3 gate); `cargo xtask gpu-check` clean;
+`cargo xtask clippy` completed with pre-existing warnings only. Runs were
+uncapped (`systemd-run --user` unavailable), `-j 2`. No training run and no
+full-suite claim. Tag `v0.2.195`.
+
+## 260. Native JevCe loss and delta
+
+v0.2.196. Added `DenseLossBackend` plus a device `[jev_ce]` loss kernel and
+`GpuExecutableNetwork::compute_jev_ce_training_loss_gpu`. One thread owns a
+sample/group, computes the temperature softmax, soft-target cross-entropy with
+label smoothing, the masked-empty-group rule, per-sample normalization, and the
+scaled descent direction. Losses and active flags come back in small host
+vectors so the mean matches the CPU `active` count; the delta stays a device
+tensor until the runtime downloads it as the backward seed. Both `layout=group`
+and `layout=cm` are covered.
+
+Known limits: only JevCe is native; CenterNet, modern-YOLO, Segmentation and
+LayaLoss still use the host dense-loss path. The CLI's dense-head training
+entry points are not wired to the new method yet, and no compiled-C++ golden
+exists.
+
+Evidence: `cargo xtask oxide --test oxide_runtime_chain jev_ce_native` 3 of 3,
+including loss/delta parity for both layouts and a seeded-backward weight/bias
+gradient parity check; `cargo xtask gpu-check` clean; `cargo xtask clippy`
+completed with pre-existing warnings only. Runs were uncapped
+(`systemd-run --user` unavailable), `-j 2`. No training run and no full-suite
+claim. Tag `v0.2.196`.
+
+## 261. Native Segmentation loss and delta
+
+v0.2.197. Added `DenseLossBackend::segmentation_loss_f32` and
+`GpuExecutableNetwork::compute_segmentation_training_loss_gpu`. The first kernel
+runs one thread per sample, computing per-pixel binary or softmax
+cross-entropy, the `truth - prediction` delta, `lambda_ce * ce_normalizer *
+cls_normalizer`, and the correct-pixel gate weight; it also writes per-sample
+loss and suppressed-pixel counts. The host sums those small vectors to get the
+mean loss and the gate compensation `min(total / active,
+gate_max_compensation)`. A second device kernel applies compensation and
+`max_delta` clipping to the delta. Both `classes=1` BCE and `classes>1`
+softmax CE are covered, with and without gating.
+
+Known limits: only JevCe and Segmentation are native; CenterNet, modern-YOLO
+and LayaLoss still use the host dense-loss path. The CLI's dense-head training
+entry points are not wired to the new methods yet, and no compiled-C++ golden
+exists.
+
+Evidence: `cargo xtask oxide --test oxide_runtime_chain segmentation_native`
+3 of 3, including gated binary loss/delta and seeded-backward weight/bias
+gradient parity, plus gated softmax loss/delta parity; `cargo xtask gpu-check`
+clean; `cargo xtask clippy` completed with pre-existing warnings only. Runs were
+uncapped (`systemd-run --user` unavailable), `-j 2`. No training run and no
+full-suite claim. Tag `v0.2.197`.
+
+## 262. Native ViT inference forward
+
+v0.2.198. Added five Oxide kernels in `kernels/layers_extra.rs` (`vit_patchify`,
+`vit_add_pos_embed`, `vit_clamp_feature`, `vit_mhc_residual`,
+`vit_tokens_to_nchw`), their `OxideBackend` methods and `F32TensorOpsBackend`
+entries (trait defaults are host references in `host_ops`), and
+`runtime/vit_gpu.rs`, which composes patchify, linear, LayerNorm, flash
+attention, mHC residual, clamped FFN activation and the NCHW transpose. The
+`gpu_forward.rs` arm takes it only when `!training`, no MSA, no VC attention,
+head_dim <= 128 and the activation maps to a device kind; otherwise the host
+arm runs unchanged and fills `VitForwardCache`.
+
+Known limits: no device ViT backward, no compact (`forward_compact`) arm, the
+native path leaves `vit_cache` empty so backward needs a training forward, and
+no compiled-C++ golden exists.
+
+Evidence: `cargo xtask oxide --test oxide_vit` 3 of 3 (patchify pad/stride,
+elementwise kernels incl. NaN/inf, native forward vs CPU for 5 configs at rel
+tol 2e-4); `cargo xtask test vit` 33 passed after two host tests were updated
+(inference compared with tolerance, backward test uses
+`forward_training_with_state`). Runs uncapped (`systemd-run --user`
+unavailable). No training run, no full-suite claim. Tag `v0.2.198`.
+
+## 263. Native Swin Revleaky training forward and backward
+
+v0.2.199 (`204424c69058c421b5c514f9c44d93e530a0641a`). `swin/gpu.rs`
+maps `Activation::Revleaky` to the device Leaky operation, allowing native Swin
+training forward and backward for this activation. The
+`swin_revleaky_native_training_backward_and_update_match_cpu` test compares
+forward output, gradients and updated parameters with the Rust CPU reference.
+
+Evidence: `cargo xtask check` and `cargo xtask gpu-check` passed;
+`cargo xtask test swin` passed 28 tests and `cargo xtask oxide --test
+oxide_swin` passed 5 tests. Tolerances were 2e-4 for forward and 5e-4 for
+gradients and parameters. The reference is hand-derived from source; no
+compiled-C++ golden exists. Tag `v0.2.199`.
+
+## 264. Native Clifford Fourier forward and backward
+
+v0.2.200 (`44aebc0e1b4795b540ef820d4e4a5b7b110fe005`) adds a direct
+truncated Fourier transform with Oxide coefficient, synthesis and parameter-gradient
+kernels; `clifford/gpu.rs` selects the native path.
+
+Evidence: `clifford_fourier_native_forward_and_gradients_match_cpu` compares
+forward and gradients with CPU at tolerances 2e-4 and 5e-4 respectively.
+`cargo xtask check` and `cargo xtask gpu-check` passed; `cargo xtask test
+clifford` passed 14 tests and `cargo xtask oxide --test oxide_clifford` passed
+5. Hand-derived from source; no compiled-C++ golden. The network-wide CPU
+backward fallback is unchanged. Tag `v0.2.200`.
+
+## 265. Native RecursiveBlock channel shuffle forward and backward
+
+v0.2.201 (`74db0cb95b131a47bf558dc0eee8232d8f1245d3`) adds native
+`recursive_block` forward and backward for static bodies containing
+`channel_shuffle`. `recursive_block/gpu.rs` uses the existing shuffle kernel
+and its inverse for backward. Other variants remain on the host.
+
+Evidence: `recursive_channel_shuffle_native_forward_and_gradients_match_cpu`
+compares CPU forward and gradients at tolerances 2e-4 and 5e-4 respectively.
+`cargo xtask check` and `cargo xtask gpu-check` passed; `cargo xtask test
+recursive_block` passed 11 tests and `cargo xtask oxide --test
+oxide_recursive_block` passed 2. Hand-derived from source; no compiled-C++
+golden. Tag `v0.2.201`.
+
+## 266. Native DCNv4 for kernels above 961 points
+
+v0.2.202 (`eeb6db6d00ec9d189331060755c87b62fb40d6f0`) replaces the
+fixed 961-entry mask and mask-gradient arrays with per-thread device scratch,
+preserving reduction order. `needs_host` no longer rejects by point count;
+scratch memory grows with the number of points.
+
+Evidence: `device_aggregation_large_kernel_matches_host` and
+`native_large_composition_matches_cpu_parameter_gradients` compare large-kernel
+aggregation and composition with the Rust CPU reference. `cargo xtask check`
+and `cargo xtask gpu-check` passed; `cargo xtask test dcnv4` passed 31;
+Oxide suites `oxide_dcnv4_aggregate`, `oxide_dcnv4_chain`, and
+`oxide_dcnv4_bn` passed 7, 4, and 2 tests respectively; the `dcnv4` filter
+of `oxide_runtime_chain` passed 4. Hand-derived from source, no compiled-C++
+golden. Tag `v0.2.202`.
+
+## 267. CPU GRU batch-normalization training backward
+
+v0.1.043 (`7ccfe000ce8be7c24fc0319d21ca5a56cf691ea4`) implements the exact adjoint of the Rust forward for all six GRU projections with batch normalization. As in RNN, LSTM and CRNN, forward uses rolling statistics and backward treats them as constants. `runtime/exec_accumulate.rs` accumulates BN scale gradients; `runtime/forward_layers.rs` updates rolling statistics after backward in timestep order with EMA keep 0.9. The separate BN bias array has zero gradient. GPU GRU BN training still rejects; the native GPU path is open.
+
+Evidence: `gru_bn_adjoint_each_timestep_and_three_step_bptt`, `gru_bn_rejects_inconsistent_projection_and_preserves_gpu_rejection`, and `gru_bn_accumulation_updates_stats_after_backward_and_optimizers`. `cargo xtask check` and `cargo xtask gpu-check` passed; host filters `gru`, `lstm`, `rnn`, `crnn` and `recurrent` passed 7, 4, 9, 4 and 2 tests; Oxide regression `oxide_gru_training` passed 1 and `oxide_runtime_chain` filtered by `gru` passed 3. A separate `.weights` round-trip test was not run. Hand-derived from the Rust forward, no compiled-C++ golden. Tag `v0.1.043`.
+
+## 268. DSConv multi-template CPU forward and backward
+
+v0.1.044 (`b82fdab5e67b707f29f4788d699b875e87c31ba9`, tag `v0.1.044`; built over WIP commits `a2701ed`, `6b844a1`, `1417865`) implements CPU forward and exact Rust-forward backward for `dsc_templates>1`, `morph=0/1`. There are `2*templates` views: slots 0/1 use primary offsets with `morph` and `1-morph`; slots >=2 use the extra `dsc_offset_weights` arrays, with `2*(templates-1)` arrays matching C++ allocation. Training uses the repository's seeded dropout counter hash; C++ uses `rand()`, so sequences differ. If every view is dropped, slot 0 stays active. Inference uses all views. Output is the sum of active views scaled by `1/n_active`, plus one bias; the active mask is cached for backward. C++ backward is a stub.
+
+`.weights` order is collapse biases, collapse weights, primary offset weights, shared offset biases, then extra offset arrays in index order; legacy single-template bytes are unchanged. SGD and Adam update the extra arrays, and Adam supports DNOPT sidecar resume. Muon on extra arrays remains open and explicitly errors; its matrix visitor in `muon_runtime.rs` is user WIP. Multi-template GPU execution is explicitly rejected and remains open.
+
+Evidence provided for this version: `cargo xtask check` and `cargo xtask gpu-check` passed; `cargo xtask test dsconv` passed 22 and `cargo xtask test axis_layout` passed 52. Named tests: `dsconv_multi_template_forward_matches_single_view_sum_and_inference_uses_all_views`, `dsconv_multi_template_mask_reuse_and_seeded_fallback`, `dsconv_multi_template_runtime_finite_differences_all_parameters_and_input`, `dsconv_multi_template_end_to_end_sgd_and_adam_update_every_extra_array`, `dsconv_multi_template_adam_sidecar_resume_matches_uninterrupted_update`, and `dsconv_multi_template_axis_layout_pins_view_order_and_nchw`. Hand-derived from `Jev_laya:src-lib/dsconv_layer.cpp`, no compiled-C++ golden.
+
+## 269. Swin resident Muon
+
+v0.2.203 (`4fd83e4ae576b610869bf09fe128a461296bee9f`, tag `v0.2.203`) keeps Swin's resident parameter bank under Muon instead of retiring it to the host. `serialized_mixer_muon_layout` maps the QKV, optional residual projection and FFN pair to matrix views over the serialized blob. The device update applies the layer-wide sanitize/clip policy, resident Muon momentum and orthogonalization, the AdamW fallback for non-matrix parameters, and the mHC suffix clamp. Deferred updates leave the host mirror unchanged until synchronization, and a stale tape is rejected after the update. The shared residency files also carry the ViT layout/policy arm, which is exercised by v0.2.204.
+
+Evidence: `cargo xtask check` and `cargo xtask gpu-check` passed; `cargo xtask test swin` passed 28; `cargo xtask oxide --test oxide_swin` passed 9 (529.87 s), including `swin_resident_muon_deferred_updates_and_resume_match_cpu` and `swin_deferred_sgd_to_muon_keeps_resident_weights`. The reference is the Rust CPU path; hand-derived from source, no compiled-C++ golden.
+
+## 270. ViT native training, resident Muon and block-sparse MSA
+
+v0.2.204 (`dcda301cf0e0703640da4996084a661070e1cd45`, tag `v0.2.204`) keeps ViT's f32 master bank under Muon and runs block-sparse MSA on the device. Serialized matrix views follow the five matrices of the CPU Muon path; the device update applies ViT's layer-wide sanitize/clip, resident momentum and orthogonalization, the AdamW fallback, and mHC's 0.1 learning-rate/clamp policy. The forward records an attention tape that is either flash (row log-sum-exp) or sparse (probabilities plus active mask), and backward consumes the same tape; `msa` no longer forces the host path. VC attention, head_dim > 128 and unmapped activations stay on the host.
+
+Evidence: `cargo xtask check` and `cargo xtask gpu-check` passed; `cargo xtask test vit` passed 33; `cargo xtask oxide --test oxide_vit` passed 10 (429.66 s), including `vit_sparse_msa_native_training_matches_cpu`, `vit_sparse_msa_ties_clamps_and_backward_match_reference`, `vit_gpu_resident_muon_backward_and_adamw_update_match_cpu` and `vit_resident_deferred_sgd_adam_and_adamw_match_cpu_and_resume`. The reference is the Rust CPU path; hand-derived from source, no compiled-C++ golden.
+
+## 271. TuckerAttention validation
+
+v0.2.205 (`4e31459eaf11a683b111615b526938721bb781bb`, tag `v0.2.205`) records the pass for the source-wired native TuckerAttention path: native f32 forward, compact f32 and backward, resident SGD/Adam, with Muon staying hybrid. The layer code is unchanged from the WIP history (last touched by `627d115`); this version tags the tree the gates ran on and adds no code diff.
+
+Evidence: `cargo xtask test tucker` passed 15; `cargo xtask oxide --test oxide_tucker_attention` passed 3 (176.63 s), including `tucker_resident_factor_permutations_backward_and_deferred_optimizers` and `compact_tucker_padded_windows_dense_and_sparse_match_cpu`. The reference is the Rust CPU path; hand-derived from source, no compiled-C++ golden.
+
+## 272. MambaVision validation
+
+v0.2.206 (`4eaa51fbf86a333aed2f3e1afc88b7646833632d`, tag `v0.2.206`) records the pass for the source-wired native MambaVision path: native f32 forward, compact f32 and backward, resident SGD/Adam, with Muon staying hybrid. The layer code is unchanged from the WIP history; this version tags the tree the gates ran on and adds no code diff.
+
+Evidence: `cargo xtask test mamba` passed 19; `cargo xtask oxide --test oxide_mambavision` passed 2 (103.63 s), including `mambavision_native_runtime_accumulation_and_two_updates_match_cpu` and `selective_scan_nonzero_state_and_final_state_adjoint_match_reference`. The reference is the Rust CPU path; hand-derived from source, no compiled-C++ golden.
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              

@@ -25,9 +25,9 @@ Whole-repo map: [CONTEXT.md](CONTEXT.md).
 
 ## Which file for which task
 
-- Port or change a layer: `src/lightnet-core/src/layers/CONTEXT.md` (layout, wiring, recipe), then `tasks/rust/AGENTS.md`, then `tasks/rust/layer-support.md` and `tasks/rust/layers.md`.
-- GPU layer work: `tasks/rust/gpu_layers_plan.md`.
-- Current state after a context reset: `tasks/rust/STATUS.md`.
+- Port or change a layer: `src/lightnet-core/src/layers/CONTEXT.md` (layout, wiring, recipe), then `tasks/rust/AGENTS.md`, then `tasks/rust/02_state/layer-support.md` and `tasks/rust/04_reference/layers.md`.
+- GPU layer work: `tasks/rust/03_plans/gpu/gpu_layers_plan.md`.
+- Current state after a context reset: `tasks/rust/02_state/STATUS.md`.
 - Touch a crate: its `CONTEXT.md` first.
 - Touch cuda-oxide: read `third_party/CONTEXT.md` first; it is a pinned submodule, not editable here.
 

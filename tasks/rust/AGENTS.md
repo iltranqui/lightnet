@@ -1,236 +1,187 @@
 # Rust Port — Agent Handbook
 
-Entry point for any agent working in `tasks/rust/` (branch `rust`). Read this first; open other files only when the map below says to.
+Entry point and ordered work list for any agent working in `tasks/rust/` (branch `rust`). Rules, state and plans live on the shelves it links to; this file says what to do next and how to know it is done.
 
 ## Table of Contents
 
 - [Goal](#goal)
-  - [Running this file as a goal](#running-this-file-as-a-goal)
-- [Rules](#rules)
-- [Layer Layout and Completion](#layer-layout-and-completion)
-  - [Layout](#layout)
-  - [Layer Completion Contract](#layer-completion-contract)
-  - [Layout Move Queue](#layout-move-queue)
-- [Commands](#commands)
-- [Versioning](#versioning)
-- [File Map](#file-map)
-- [Current State](#current-state)
-- [Open Work](#open-work)
-- [Lessons](#lessons)
-- [Doc Hygiene](#doc-hygiene)
+- [State snapshot](#state-snapshot)
+- [Where to go](#where-to-go)
+- [Running this file as a goal](#running-this-file-as-a-goal)
+  - [Loop](#loop)
+  - [Definition of done for one item](#definition-of-done-for-one-item)
+  - [Stop conditions](#stop-conditions)
+- [Agent Todo](#agent-todo)
+  - [Phase 0: Baseline](#phase-0-baseline)
+  - [Phase 1: Validate and version the source-wired GPU layers](#phase-1-validate-and-version-the-source-wired-gpu-layers)
+  - [Phase 2: Layout refactor leftovers](#phase-2-layout-refactor-leftovers)
+  - [Phase 3: Finish the GPU paths](#phase-3-finish-the-gpu-paths)
+  - [Phase 4: CPU gaps](#phase-4-cpu-gaps)
+  - [Phase 5: Sparse MoE](#phase-5-sparse-moe)
+  - [Stop and ask the user](#stop-and-ask-the-user)
+- [Keeping this file current](#keeping-this-file-current)
 
 ## Goal
 
-Reach full Rust parity with every C++ layer (branch `rust`), in three release lines (see [Versioning](#versioning)):
+Full Rust parity with every C++ layer, in three release lines:
 
-1. `v0.1.NNN`: every missing layer (`deform_conv`, `dsconv`, `graph_conv`, `wmhf`, `clifford`, `recursive_block`, `hyperbolic_foveation`, `foveation_film`, `depth_anything`, `dpt_head`, plus `yolo_3d` if `depth_3d` confirms scope) ported on CPU under the Layer Port Contract, with SGD, Adam and Muon arms, and every layer's axis/layout semantics pinned to the C++ source by a named test.
+1. `v0.1.NNN`: CPU parity. Every layer ported on the CPU with SGD, Adam and Muon arms, and axis/layout semantics pinned to the C++ source by a named test.
 2. `v0.2.NNN`: every layer has a native GPU path with a CPU-parity test, host-fallback layers included, plus GPU Muon.
-3. `v0.3.NNN`: opt-in true sparse MoE per `MOE.md`, inference first, never slower than dense.
+3. `v0.3.NNN`: opt-in true sparse MoE, inference first, never slower than dense.
 
-Both halves of every layer must be complete: the host code (CPU reference) and the device code (native GPU runtime glue plus Oxide kernels). A layer counts as finished only when it meets the [Layer Completion Contract](#layer-completion-contract), and its host and device code live together in one folder ([Layout](#layout)).
+A layer is finished only when it meets the [Layer Completion Contract](01_rules/layer-contract.md): host and device code both complete, living together in `src/lightnet-core/src/layers/<layer>/`, with named tests and updated docs.
 
-Done when all three lines are complete, each version has its tests passing and its docs updated (`implemented.md`, `STATUS.md`, `todo.md`, `version-map.tsv`), and no parity is claimed without a C++ golden. Default sequencing starts each line after the previous one is complete. **Current operator override: focus on GPU layers now, directly without subagents, while preserving all open CPU requirements.** Follow `gpu_layers_plan.md`; native GPU work is authorized before CPU completion, not evidence that CPU is complete. Details: [Open Work](#open-work).
+Current operator override: GPU layers first, edited directly in the main session without subagents, while every open CPU requirement stays open. Native GPU work is authorized before CPU completion; it does not close a CPU gap. No parity claim without a compiled-C++ golden: write "hand-derived from source, no compiled-C++ golden".
 
-### Running this file as a goal
+## State snapshot
 
-Use it as `/goal tasks/rust/AGENTS.md`. When an agent is given this file as its goal, the goal is: make the host and the device code of every layer complete under the [Layer Completion Contract](#layer-completion-contract), in the [Layout](#layout), following [Open Work](#open-work). The agent loops until the stop conditions below hold:
+State on 2026-10-27, from a static audit of source against the docs (no cargo run):
 
-1. Read `lessons.md`, `git status` and `git log -5`, then `STATUS.md` (top) and `layer-support.md` to see the current state.
-2. Pick the first unfinished item: the [Layout Move Queue](#layout-move-queue) while it has open items, then the completion queue in [Open Work](#open-work). Work one layer or one slice at a time.
-3. Write the change, then run, one command at a time, `JOBS=4 MEM=4G cargo xtask check`, `gpu-check`, the layer's test filter and, for device work, `cargo xtask oxide --test <suite>`.
-4. When the covered tests pass, commit and tag as described in [Versioning](#versioning) ("Commit and tag on green") and update the docs in the same pass. A refactor move gets a `refactor(rust): ...` commit with no tag.
-5. Go back to step 2.
+- Latest versions: `v0.1.044` (CPU, DSConv multi-template) and `v0.2.202` (GPU, native DCNv4 large kernels). Next free numbers: `v0.1.045`, `v0.2.203`. Never reuse a number; confirm in `02_state/version-map.tsv`.
+- 23 commits sit after `v0.2.202`: layout refactors, `v0.1.043`, `v0.1.044`, the dcnv4 test fix (`a62e123`) and the Swin residency WIP (`0362bea`).
+- Wired in the runtime with no recorded pass: native GPU forward, backward and compact f32 for `wmhf`, `vit` training, `tucker_attention`, `mambavision`, `kimi_kda`, `depth_anything`, `dpt_head`. They come from WIP commits with no version. Only the Swin resident slice has results (`oxide_swin` 8/8, host `swin` 28/28).
+- No GPU arm: `yolo_3d`, `obb_refine`, GRU training with batch norm. Host-only on GPU: `vc_attention`, `recursive_block` variants other than static `channel_shuffle`, the `clifford` network-wide backward.
+- Host suite baseline is not green: four `cfg_corpus` cases are unresolved (two OOM at about 7 GiB, two 300 s timeouts). Do not claim a green host suite.
+- Details: [02_state/STATUS.md](02_state/STATUS.md) "Audit 2026-10-27", [02_state/layer-support.md](02_state/layer-support.md).
 
-Stop and report to the user, without continuing, when any of these happens:
-- every layer meets the Completion Contract (done), or the next item needs a decision that is not in this file;
+## Where to go
+
+| Task | Read |
+|---|---|
+| Any build, edit or commit | [01_rules/rules.md](01_rules/rules.md), [01_rules/commands.md](01_rules/commands.md) |
+| Cut a version, commit, tag | [01_rules/versioning.md](01_rules/versioning.md) |
+| Port or finish a layer | [01_rules/layer-contract.md](01_rules/layer-contract.md), `src/lightnet-core/src/layers/CONTEXT.md`, [02_state/layer-support.md](02_state/layer-support.md) |
+| Resume after a context reset | [02_state/STATUS.md](02_state/STATUS.md) (top), [02_state/open-work.md](02_state/open-work.md) |
+| Long backlog by area, with history | [todo.md](todo.md) |
+| Check whether X exists | [02_state/implemented.md](02_state/implemented.md), [02_state/layer-map.md](02_state/layer-map.md) |
+| GPU layer work | [03_plans/gpu/gpu_layers_plan.md](03_plans/gpu/gpu_layers_plan.md) |
+| Low-precision work | [03_plans/lowprec/AGENTS_fp8.md](03_plans/lowprec/AGENTS_fp8.md) |
+| LLM work | [03_plans/llm/AGENTS_LLM.md](03_plans/llm/AGENTS_LLM.md) |
+| Any other plan | [03_plans/CONTEXT.md](03_plans/CONTEXT.md) |
+| Layer Port Contract, TDD recipe, source notes | [04_reference/CONTEXT.md](04_reference/CONTEXT.md) |
+| Past corrections | [lessons.md](lessons.md) |
+
+Full folder map: [CONTEXT.md](CONTEXT.md).
+
+## Running this file as a goal
+
+Use it as `/goal tasks/rust/AGENTS.md`.
+
+### Loop
+
+1. Read `lessons.md`, `git status`, `git log -5`, the top of `02_state/STATUS.md` and `02_state/layer-support.md`.
+2. Take the first unchecked, unblocked item in [Agent Todo](#agent-todo). One layer or slice at a time. An item marked blocked is skipped, not worked around.
+3. Edit in the main session with shell tools, `Edit` and `Write`; no subagents, no Python scripts. Run one command at a time, at most 4 threads: `JOBS=4 MEM=4G cargo xtask check`, then `gpu-check`, the layer's test filter and, for device work, `cargo xtask oxide --test <suite>`. Never run two builds in parallel.
+4. On green, commit and tag per [01_rules/versioning.md](01_rules/versioning.md) and update the docs in the same pass. A refactor move is `refactor(rust): ...` with no tag.
+5. Tick the item below, then go back to step 2.
+
+### Definition of done for one item
+
+An item is done only when all of these hold:
+
+1. The item's "Done when" line is true, with a named test that ran and passed. A timeout, a filtered-out test or a test that did not run is not a pass; say which ran and which did not.
+2. `cargo xtask check` and `gpu-check` pass after the change.
+3. The code commit is `v0.M.NNN: <what>` with the tests and results in the body, followed by a local lightweight tag `v0.M.NNN`. Commit only the files the item names, never `git add -A`. Leave the user's uncommitted edits alone.
+4. The docs commit `docs(rust): <what>` updates `02_state/implemented.md` (one line with evidence), `02_state/STATUS.md` ("Latest increments"), `02_state/layer-support.md` (the layer's row), `02_state/version-map.tsv` (`git rev-parse v0.M.NNN` as `new_sha`) and `todo.md`.
+5. The item is ticked here.
+6. Nothing claims C++ parity without a compiled-C++ golden.
+
+Revert `src/lightnet-cuda-oxide/Cargo.lock` before committing: `cargo xtask oxide` rewrites it. Do not run `cargo xtask fmt`; format edited code by hand. After each finished step, delete big files nothing references (`.weights`, `.backup`, `.onnx`, sidecars, logs, A/B build trees).
+
+### Stop conditions
+
+Stop and report, without continuing, when:
+
+- every layer meets the Completion Contract, or the next item needs a decision not written down here;
 - a covered test fails, times out or cannot run (for example no GPU), and the cause is not clear after one root-cause pass;
-- an action would be hard to reverse or outward-facing: pushing, pull requests, history rewrites, deleting data, training runs, anything in [Open Work](#open-work) marked as needing the user.
+- an action is hard to reverse or outward-facing: push, pull request, history rewrite, deleting data, training run, anything under [Stop and ask the user](#stop-and-ask-the-user).
 
-Never report a layer as complete from a primitive, a forward-only path or a passing subset; name the tests that ran and the ones that did not.
+If something goes sideways, stop and re-plan; do not keep pushing. Never report a layer complete from a primitive, a forward-only path or a passing subset.
 
-## Rules
+## Agent Todo
 
-- Max 4 build threads (`JOBS=4`; repo scripts use `-j 2`). One build/test command at a time, never two in parallel.
-- Cap memory: `systemd-run --user --scope -p MemoryHigh=4G <cmd>` (scripts and `cargo xtask` take `MEM=4G`). If no user systemd bus, run uncapped and say so.
-- Make code edits and refactors in the main session with shell tools, `Edit` and `Write`: no Python scripts and no subagents unless the user asks.
-- When moving layer code, run `JOBS=4 MEM=4G cargo xtask check` after each layer, not only at the end, and `gpu-check` plus the layer's test filter before each commit. Before replacing a line range in a large dispatcher, confirm the line after the range starts the next arm.
-- `src/lightnet-cuda-oxide` is not a workspace member: build/test it only via `./tools/test_oxide.sh` (`cargo oxide`).
-- Backward = exact derivative of the Rust forward. C++ deviations only under `GradMode::Cpp`.
-- Unknown config = error, never silent identity.
-- Never claim C++ parity: no compiled C++ exists here. Write "hand-derived from source, no compiled-C++ golden".
-- Reference C++ branches (`raptor*`, `Jev_laya`, `fog`, `v6-dev-*`) are readable in sibling repo `/home/kerrigan/src/DarkSuite/darknet`: use `git -C /home/kerrigan/src/DarkSuite/darknet show <branch>:<path>` and `git -C /home/kerrigan/src/DarkSuite/darknet grep` first, since plan paths go stale.
-- No training runs unless the user asks.
-- Commit only files the task names, never `git add -A`. Message `v0.M.NNN: <what>` (see [Versioning](#versioning)). Leave the user's `.gitignore` edit alone.
-- Commit and tag on green: when an agent (Claude or Codex) has implemented a feature and its named tests pass, it commits and tags it right away, without asking. Details in [Versioning](#versioning), "Commit and tag on green".
-- `tasks/` is not uniformly excluded: most files are tracked. Check with `git ls-files tasks/rust/<file>`; only an untracked file needs `git add -f`.
-- Do not run `cargo xtask fmt`: it reformats unrelated files. Format edited code by hand.
-- `cargo xtask oxide` rewrites `src/lightnet-cuda-oxide/Cargo.lock`; revert that file before committing.
-- Each edited `.md` needs a TOC.
-- Clean up after each completed step: delete `.weights`, `.backup`, `.onnx`, optimizer sidecars, logs, A/B build trees (e.g. `build/base`, `build/cur`), and other big files once nothing needs them. Keep any file a doc or test still references, and record the evidence in the docs before deleting. `build/` is gitignored, so deleting there is safe, but look at the target first; if unsure, ask.
+Ordered checklist. Each item starts with the version it will ship as. `--` means no release (a check or an investigation); `refactor` means a `refactor(rust): ...` commit with no tag. Planned numbers are provisional: at commit time take the next free number in `02_state/version-map.tsv`, never reuse one, and fix the number here if it moved. Take the first unchecked item whose gate is not blocked. Rules: [01_rules/rules.md](01_rules/rules.md); commands: [01_rules/commands.md](01_rules/commands.md).
 
-## Layer Layout and Completion
+### Phase 0: Baseline
 
-This section defines where each layer's code lives and when a layer is finished. It applies to every layer, and the moves it describes are the first part of the current work; the completion work in [Open Work](#open-work) builds on it.
+- [ ] -- Read `lessons.md`, `git status`, `git log -5`, and the top of `02_state/STATUS.md`.
+- [ ] -- `JOBS=4 MEM=4G cargo xtask check`, then `cargo xtask gpu-check`. Done when both pass. If either fails, fix the cause before any other item.
+- [ ] -- Note which files are the user's uncommitted work (`git status`: `muon_runtime.rs`, `gpu_resident_params.rs`, `yolo_3d*.rs`, `vit/gpu.rs`, `swin/gpu.rs`, oxide tests). Do not stage them unless an item names them.
 
-### Layout
+### Phase 1: Validate and version the source-wired GPU layers
 
-The layout contract (folder shape, where each piece plugs in, the add-or-finish recipe and the verify commands) lives in `src/lightnet-core/src/layers/CONTEXT.md`. Read it before touching a layer; it is not repeated here.
+The runtime already dispatches native forward, backward and compact f32 for these layers, but no pass is recorded. For each item: run the Oxide suite and the host filter, fix failures at the root cause, then commit, tag and document. Layer files live in `src/lightnet-core/src/layers/<layer>/`; run a suite with `cargo xtask oxide --test <suite>`.
 
-- `tasks/rust/layer-map.md` lists, per layer, its CPU file, GPU glue, kernel file and parity test.
+- [ ] v0.2.203 `swin`: version the resident SGD/Adam/AdamW slice (WIP `0362bea`). Run `oxide_swin` and host filter `swin`. Done when both pass and the version row exists.
+- [ ] v0.2.204 `vit`: native training forward/backward, compact f32, resident parameters. Run `oxide_vit` and host filter `vit`. Done when native training matches the CPU result and the host fallback is not used for supported variants.
+- [ ] v0.2.205 `tucker_attention`: run `oxide_tucker_attention`, host filter `tucker`.
+- [ ] v0.2.206 `mambavision`: run `oxide_mambavision`, host filter `mamba`.
+- [ ] v0.2.207 `kimi_kda`: run `oxide_kimi_kda`, host filter `kimi`.
+- [ ] v0.2.208 Resident parameters for v0.2.205 to v0.2.207: run `oxide_resident_params`.
+- [ ] v0.2.209 `depth_anything`: run `oxide_depth_anything`, host filter `depth_anything`. Head dimension above 128 stays on the CPU; say so in the docs.
+- [ ] v0.2.210 `dpt_head`: run `oxide_dpt_head`, host filter `dpt`.
+- [ ] v0.2.211 `wmhf`: run `oxide_wmhf`, host filter `wmhf`. Done when the `needs_host` cases are listed in `02_state/layer-support.md`.
+- [ ] -- Run the host `runtime::` filter once after v0.2.203 to v0.2.211. Done when it passes (332 passed at the last record).
 
-### Layer Completion Contract
+### Phase 2: Layout refactor leftovers
 
-A layer is complete only when all of the following hold, with a named test or documented evidence for each:
+Each move is a `refactor(rust): ...` commit with no version tag. A move changes no behaviour; a behaviour change is a separate versioned commit. Run `cargo xtask check` after each move and the layer's Oxide suite before committing. Status: [02_state/layout-move-queue.md](02_state/layout-move-queue.md).
 
-1. Host: config and shape, `.weights` round trip, CPU forward, exact CPU backward, SGD and Adam arms, Muon where the layer has eligible matrices, and a named `axis_layout` test.
-2. Device: native full forward and, where the f16 inference list includes the layer, native compact forward; native backward; native parameter update; no host round trip inside the arm, except a documented, tested fallback for variants the kernel cannot cover.
-3. Parity: an Oxide test compares the device forward, backward and update with the CPU result within a stated tolerance, run through `cargo xtask oxide --test <suite>`.
-4. Layout: the code lives in `layers/<layer>/` and has a row in `layer-support.md` and `layer-map.md`.
-5. Docs: the version commit, `implemented.md`, `STATUS.md`, `todo.md` and `version-map.tsv` are updated, and nothing claims C++ parity without a compiled-C++ golden.
+- [ ] refactor Move the eight `muon_*` methods and `fp4_quantize_1x16` out of `src/lightnet-cuda-oxide/src/lib.rs`. Blocked until the user's Muon residency edits (`muon_runtime.rs`, `gpu_resident_params.rs`) are committed.
+- [ ] refactor Move the remaining thin compact arms into `layers/<layer>/gpu.rs` (`runtime/gpu_forward_compact.rs`).
+- [ ] refactor Regenerate `02_state/layer-map.md` from the file tree after the moves.
 
-Native primitives or a native forward alone do not make a layer complete. `layer-support.md` records which parts exist today.
+### Phase 3: Finish the GPU paths
 
-### Layout Move Queue
+Each item ends with the layer meeting the [Layer Completion Contract](01_rules/layer-contract.md). Plan: [03_plans/gpu/gpu_layers_plan.md](03_plans/gpu/gpu_layers_plan.md). Host fallbacks are interim until the layer passes the contract.
 
-Status on 2026-10-24, each move a refactor commit without a version tag (`refactor(rust): ...`):
+- [ ] v0.2.212 `recursive_block`: native forward/backward for variants other than static `channel_shuffle` bodies (BN, controllers, lattice). Suite `oxide_recursive_block`.
+- [ ] v0.2.213 `clifford`: remove the network-wide CPU backward fallback. Suite `oxide_clifford`.
+- [ ] v0.2.214 GRU with batch norm: native GPU training (CPU reference is v0.1.043). Suite `oxide_gru_training`.
+- [ ] v0.2.215 `deform_conv` with batch norm: native path, including the batch-serial normalization Jacobian. Suite `oxide_deform_conv_chain`.
+- [ ] v0.2.216 `graph_conv`: unsupported variants. Suite `oxide_graph_conv`.
+- [ ] v0.2.217 `hyperbolic_foveation` and `foveation_film`: move the HF source and cache off the host; native SGD/Adam updates. Suites `oxide_hyperbolic_foveation`, `oxide_foveation_film`.
+- [ ] v0.2.218 `dcnv4`: unsupported activations and mixed fallback networks. Suites `oxide_dcnv4_*`.
+- [ ] v0.2.219 `dsconv`: multi-template GPU path (CPU landed in v0.1.044). Suite `oxide_dsconv`.
+- [ ] v0.2.220 Dense-head loss on the device for CenterNet, modern-YOLO and LayaLoss. Suite `oxide_centernet` and the matching dense-loss tests.
+- [ ] v0.2.221 GPU Muon for the remaining matrix families, and native update plus residency where parameters are still host-staged (connected, deconvolutional, deform_conv, recurrent, weighted shortcut, HF/FiLM). Suites `oxide_muon`, `oxide_resident_params`.
+- [ ] v0.2.222 `vc_attention`: native kernel (host-only today).
+- [ ] v0.2.223 Native half-storage arithmetic for the transformer family (today: device f32 islands between half boundaries).
 
-- Done, host code: every layer module that was in `lightnet-core/src` is under `layers/<layer>/cpu.rs`.
-- Done, device glue in `layers/<layer>/gpu.rs`: `dcnv4`, `hyperbolic_foveation`, `laya_act_head`, `laya_encoder`, `laya_head`, `laya_scorer`, `vit`, `swin`, `tucker_attention`, `mambavision`, `kimi_kda`, `laya_marker_gather`, `channel_slice`, `channel_shuffle`, `route`, `pool` (max, local average, average), `upsample`, `reorg`, `softmax`, `scale_channels`, `sam`, `shortcut`, `crop`, `local`, `connected`, `deconvolutional`, `eml_convolutional`, `moe`, `foveation_film`, `dsconv`, `deform_conv`, `graph_conv`, `rnn`, `lstm`, `crnn`, `gru`, `convolutional` and `batch_norm` (with the shared batch-norm helpers). For the five transformer layers and `vit`, only the host-fallback forward arm and, for `vit`, the native inference path have moved so far.
-- Done: no full forward arm remains inline in `runtime/gpu_forward.rs` except pass-throughs. The `yolo` family (`yolo`, `obb_yolo`, `gaussian_yolo`, `detection`, `cost`, `regression`, `omd_loss`, `contrastive`) has no forward arm to move: it is a pass-through.
-- Done, compact arms in `runtime/gpu_forward_compact.rs` (`gpu.rs` `forward_<layer>_compact_gpu`): `convolutional`, `deconvolutional`, `graph_conv`, `connected`, `route`, `scale_channels`, `channel_slice`, `reorg`, `laya_marker_gather`, `laya_act_head`, `shortcut`, `sam`; the pool and `upsample` compact arms reuse the f32 methods. Open: the other compact arms (thin delegations). Done, backward arms (`backward_<layer>_gpu`): `batch_norm`, `maxpool`, `local_avgpool`, `avgpool`, `crop`, `route`, `laya_marker_gather`, `upsample`, `softmax`, `channel_slice`, `channel_shuffle`, `reorg`, `sam`, `scale_channels`, `rnn`, `lstm`, `crnn`, `dcnv4`, `dsconv`, `local`, `deconvolutional`, `connected`, `eml_convolutional`, `graph_conv`, `shortcut` (weighted and plain), `moe`, `convolutional`, `deform_conv`, `foveation_film`, `hyperbolic_foveation`, `region`, `dropout`. No backward arm remains open in `runtime/gpu_backward.rs`. Move backward one layer per commit and run that layer's Oxide parity suite before committing.
-- Done, device kernels: `kernels/layers_extra.rs` is split per layer into `kernels/*.rs` (wmhf, vit, attention, moe, laya, dense_loss, softmax, reorg, channel_shuffle, dropout, scale_channels, shortcut, recurrent, eml, normalize_channels), kernel names and signatures unchanged.
-- Open, backend methods: split the `OxideBackend` methods in `lightnet-cuda-oxide/src/lib.rs` per layer. Done slices: `dcnv4` aggregation, deconvolutional, ViT, channel_shuffle, gelu_erf, softmax, reorg (`reorg_f32` and `reorg_backward_f32`), crop, local, pooling (six methods; `maxpool_depth_*` stay inline), graph_conv, clifford, tucker_attention, kimi_kda, mambavision, swin, route, upsample, connected, eml_convolutional, batch_norm training. Each lives in `lightnet-cuda-oxide/src/<layer>_backend.rs` (or the existing layer module) with delegating trait methods in `lib.rs`; the Oxide parity suite passed for each. Also done (each with its Oxide suite green): dense-head losses (`dense_loss_backend.rs`), laya_act, depth (`depth_tap_clamp_f32`, `maxpool_depth_*`), wmhf, dsconv, deform_conv, foveation_film, hyperbolic_foveation, laya_encoder, laya_scorer, laya_head; `lib.rs` went from about 15,000 to 8,630 lines. Also moved, each with its Oxide suites green: `moe_router_*`/`moe_gate_*`, `flash_attention_*`, `conv2d_*`, `marker_gather_*`, `dropout_*`/`dropblock_*`, `scale_channels_*`, `shortcut_*`, `lstm_gate_*`/`sequence_*`, bias/activation/normalize helpers (`elementwise_backend.rs`), `linear_*`/`layernorm_*` (`transformer_backend.rs`), `sgd_*`/`adam_*` (`optimizer_backend.rs`), `fp8_*` (`fp8_backend.rs`) and `gemm_*` (`gemm_backend.rs`); `lib.rs` is about 5,285 lines. What stays in `lib.rs` is the backend core (`with_device`, `Default`, error conversions, the `gemm` launch seam, shared layout helpers) and the trait delegates. Not moved: the eight `muon_*` methods and `fp4_quantize_1x16`, left alone because Muon residency is in uncommitted user WIP (`muon_runtime.rs`, `gpu_resident_params.rs`); move them after that WIP lands. Treat this item as done except for those.
-- Done, `layer-map.md`: written (layout only; regenerate from the file tree when layers move).
+### Phase 4: CPU gaps
 
-Order of work: finish the moves first, then work through the completion queue in [Open Work](#open-work). A move changes no behaviour; if a move needs a behaviour change, make it a separate versioned commit.
+Kept open under the GPU-first override. Plans: [03_plans/cpu-layers/](03_plans/cpu-layers/CONTEXT.md). Backward is the exact derivative of the Rust forward; C++ deviations only under `GradMode::Cpp`. Unknown config is an error, never a silent identity.
 
-## Commands
+- [ ] v0.1.045 `yolo_3d` projected math and assignments. Plan: `03_plans/cpu-layers/yolo_3d_plan.md`. Filter `yolo_3d`.
+- [ ] v0.1.046 `yolo_3d` loss with exact Rust derivatives and `GradMode::Cpp` deltas.
+- [ ] v0.1.047 `yolo_3d` standalone and mixed training APIs consuming the truth helpers.
+- [ ] v0.1.048 `yolo_3d` decode and evaluator.
+- [ ] v0.1.049 `yolo_3d` A2 output-axis pin (`axis_layout`).
+- [ ] v0.1.050 to v0.1.063 (one per open variant) Axis pins: the 14 open C++-backed variants in `02_state/axis-coverage.md`. One named test each; a behaviour fix gets its own version. Never weaken a pin to match the code. Filter `axis_layout`.
+- [ ] v0.1.064 `dsconv` multi-template: Muon for the extra offset arrays (explicit error today). Blocked until the user's matrix visitor edit in `muon_runtime.rs` lands.
+- [ ] v0.1.065 `[region]` truth loss and decode; `[detection]` completeness.
+- [ ] v0.1.066 `obb_refine`/CARPN: CPU training first, then GPU.
+- [ ] -- `cfg_corpus`: investigate the four residuals. Run it alone: `cargo test -p lightnet-core --test cfg_corpus -j 2`. A timeout is neither a pass nor a failure.
 
-```
-cargo xtask check [pkg...]                  # default: lightnet-cli, lightnet-core
-cargo xtask gpu-check                       # lightnet-cli with oxide
-cargo xtask test [filter]                   # host tests; filter is much faster
-cargo xtask oxide --test <name> [filter]    # one oxide suite
-cargo xtask clippy [pkg...]
-cargo xtask build [pkg...]
-cargo test -p lightnet-core --test cfg_corpus -j 2   # run alone; >1 h under load
-```
+### Phase 5: Sparse MoE
 
-`cargo xtask` applies the memory and thread caps, and warns and runs uncapped when there is no user systemd bus. A `cfg_corpus` timeout is neither a pass nor a failure.
+- [ ] v0.3.001 Opt-in true sparse `[moe_convolutional]` on the CPU, dense-masked result as the oracle. Plan file `MOE.md` is referenced by older docs but does not exist in the repo: write the plan first and get the user to review it. Start only when Phases 1 and 3 are complete.
+- [ ] v0.3.002 Sparse `[moe_convolutional]` on the GPU, equal to the dense-masked result within a stated tolerance.
 
-## Versioning
+### Stop and ask the user
 
-- Version lines: `v0.0.NNN` is closed at `v0.0.274`. New work uses minor lines, each numbered from 1 in three digits:
-  - `v0.1.NNN`: Stage 1, CPU parity of all layers (missing layers, axis alignment, CPU Muon). Incomplete; latest `v0.1.044`, so the next free number is `v0.1.045`.
-  - `v0.2.NNN`: Stage 2, all GPU paths complete (native kernels for every layer, GPU Muon). Active under the GPU-priority override; latest `v0.2.202`, so the next free number is `v0.2.203`.
-  - `v0.3.NNN`: sparse MoE, CPU and GPU (`MOE.md`). Unstarted; default sequencing starts it only when `v0.2` is complete.
-  Next version = highest number in `version-map.tsv` + 1; never reuse a number.
-- Code commits are `v0.M.NNN: <what>`. Docs-only commits are `docs(rust): <what>` and take no number.
-- Per version, append a `version-map.tsv` row (`idx<TAB>version<TAB>old_sha<TAB>new_sha`; `old_sha` is `-` when there is no pre-rewrite sha; `new_sha` is the full commit sha).
-- Per version, also add one line with evidence to `implemented.md`, an entry to `STATUS.md` "Latest increments", and tick `todo.md`.
-- Gap: `v0.0.248` (`2941a2ee`, CUDA toolkit path in `.cargo/config.toml`) was out of plan. Gaps in numbering are allowed; never reuse a number.
-- Version commits are `git add`ed by path. Tracked files commit normally; local-only files in `tasks/` need `git add -f`.
-- **Commit and tag on green.** This is a standing authorization for every agent (Claude or Codex) working here; do not ask first. It applies when a new feature is implemented and the tests that cover it were run and passed. Then, in this order:
-  1. Commit the code files the task names (by path, never `git add -A`) with the message `v0.M.NNN: <what>`, using the next free number from `version-map.tsv`. Put the tests that were run and their result in the commit body. Comment-only source updates may go with the docs commit.
-  2. Tag that code commit with the version, `git tag v0.M.NNN <sha>` (lightweight, local). Never reuse, move or delete a tag; if the tag already exists, stop and re-check the number.
-  3. Commit the docs (`implemented.md`, `STATUS.md`, `todo.md`, `layer-support.md`, `gpu_layers_plan.md`, and `version-map.tsv`) as `docs(rust): <what>` after the tag. The version-map row uses `git rev-parse v0.M.NNN` as `new_sha`.
-  Do not commit or tag when any covered test fails, times out (a `cfg_corpus` timeout is neither pass nor fail), or was not run; report it instead. Docs-only changes are committed as `docs(rust): <what>` with no tag. Commits and tags stay local: pushing, pull requests and history rewrites still need the user's approval.
+Stop and report, without continuing, for:
 
-## File Map
+- the act-head training fix (executable C++ updates four parameter blocks, Rust uses only the CLS adjoint): the operator question is unanswered;
+- any push, pull request, history rewrite, or deletion of data;
+- any training run, convergence run, or the FP8 default decision (`03_plans/lowprec/AGENTS_fp8.md`);
+- a failing test whose cause is unclear after one root-cause pass;
+- work outside this list: GUI, CARPN Stage-2 training, OBB GPU training, CUDA graph capture, `dcnv3` (no reference numerics), `detr_decoder` (C++ broken).
 
-| File | LOC | Role | Open when |
-|---|---|---|---|
-| `STATUS.md` | 1046 | Resume point: ground rules, per-version "Implemented" log, evidence gaps | Need history of a version or an evidence gap |
-| `layer-support.md` | 363 | Per-`LayerKind` CPU/GPU/f16/axis matrix + gap lists; derived from code, not prose | Checking whether a layer has a CPU port, a GPU path, or an axis pin |
-| `todo.md` | 808 | Deduplicated open items by area | Choosing next work |
-| `implemented.md` | 2745 | Consolidated done ledger (sections 1–268) | Checking whether X exists |
-| `plan-open-items.md` | 292 | Waves 0–2 done; remaining scope = layer parity + axis alignment (checklist, backlog) | Dispatching the next layer task |
-| `layers.md` | 3396 | Layer Port Contract (lines 61–97) + Phase 0 TDD recipe + phase tables (end of file) | Porting a layer: read the contract and the tail only |
-| `onnx.md` | 1238 | 21-step ONNX export plan, complete (Rust-runtime numeric checks passed) | Evidence/history for `export-onnx` |
-| `carpn_map_plan.md` | 84 | CARPN sample-level mAP dispatch plan; API implementation complete | Evidence for caller-supplied sample behavior |
-| `carpn_network_map_plan.md` | 134 | CARPN CPU network inference, `detect-image`, and direct `detector map`; shipped in v0.0.259; CARPN training/`train -map` deferred | CARPN training work |
-| `gui_plan.md` | 265 | Merged egui GUI plan (M0–M6); partly implemented in v0.1.019 (JSON+txt sidecars, scan/filter/nav/undo, edit model, actions, project creation, class remap, `detect-server` + worker, launcher/canvas/views/class-editor/overlay). Open: class add/delete dialog, mapped-but-unimplemented hotkeys, train runner, DarkMark file diff | GUI work |
-| `archive/` | - | Superseded `gui_iced_plan.md`, `gui_code_phase_plan.md`; the latter holds DarkMark ground-truth tables G1–G17/D1–D16 | Citing `Gn`/`Dn` |
-| `MOE.md` | 150 | True sparse `[moe_convolutional]` plan (opt-in, CPU then GPU, dense-masked as oracle), literature, open questions | Sparse MoE work |
-| `gpu_layers_plan.md` | 673 | Operator-authorized GPU-first continuation; progress through v0.2.202 includes native large-kernel DCNv4; remaining DCNv4 variants, GPU Muon and native updates/residency open; current resume point at top | GPU layer work and resume |
-| `AGENTS_fp8.md` | 105 | Low-precision fp16/bf16/fp8 goal, plans, delegation and user gates | Low-precision work |
-| `fp8_fp4.md` | 157 | FP8 GEMM / FP4 emulation design, sm_89 | FP8/FP4 design history |
-| `vit_plan.md`, `vit_notes.md` | 71 | `[vit]` subplan and source audit | ViT / attention work |
-| `augmentation-audit.md` | 59 | C++ detector augmentation semantics | Augmentation work |
-| `carpn_task_plan.md`, `carpn_notes.md` | 812 | v65–v70 per-milestone plans and notes (`NORM_CHAN*` etc.), superseded by `implemented.md` | Almost never |
-| `lessons.md` | 18 | Rules from past corrections | Session start |
-| `version-map.tsv` | 517 | idx, version, old sha, new sha (`-` = none) | Mapping version to commit |
+## Keeping this file current
 
-## Current State
-
-- The active line is `v0.2` under the GPU-priority override. Latest version is `v0.2.202` (native DCNv4 above 961 points, `implemented.md` §266); `v0.2.201` added native RecursiveBlock static-body channel shuffle forward/backward (§265), `v0.2.200` added native Clifford Fourier forward/backward (§264), `v0.2.199` added native Swin Revleaky training forward/backward (§263), `v0.2.198` added native f32 ViT inference forward, `v0.2.197` added native Segmentation loss/delta, `v0.2.196` native JevCe loss/delta, and `v0.2.193`–`v0.2.195` finished deconvolution channel normalization plus compact f32/f16 inference. Next free is `v0.2.203`.
-- The layer-layout move is in progress: host code and most small device arms are under `lightnet-core/src/layers/<layer>/`; see the [Layout Move Queue](#layout-move-queue) for what is done and open. These moves are `refactor(rust):` commits with no version number.
-- Per-kind CPU/GPU/f16/axis status is tabulated in `layer-support.md`; use it instead of re-deriving from plan prose.
-- Waves 0–2 of `plan-open-items.md` are complete: Waves 0–1 (v0.0.247–253) closed the OBB CPU training gaps; Wave 2 implemented ONNX export (`v0.0.254`–`v0.0.257`) and completed docs as `2b998051`; v0.0.258 adds caller-supplied CARPN mAP dispatch.
-- ONNX evidence: `MEM=3G ./tools/test_host.sh onnx` passed 11 core tests; `MEM=3G ./tools/test_host.sh export_onnx_args` passed 1 CLI test; CLI build passed. ONNX Runtime worst relative errors were `3.257e-06` fused, `3.908e-05` unfused, and `3.831e-06` Mish, all under `1e-4`. Rust-runtime parity only, not compiled-C++ parity.
-- `MEM=3G` host tests ran in a user systemd scope. Full baseline remains non-green: four known `cfg_corpus` OOM/timeout cases remain unresolved (CSPX p7-mish and p7-mish_hp SIGKILL/OOM at ~7 GiB; `lstm.train.cfg` and `rnn.train.cfg` hit the 300 s CPU timeout). Do not claim a green host suite.
-- Canonical LegoGears dataset assets used by the original ONNX plan are absent; checks used local matching cfg/weights and artwork. ONNX Runtime is installed, but Python `onnx` package is not required by the checker and is absent.
-- Scope narrowed to layer parity and axis alignment; non-layer open items are not dispatched from the plan.
-- The working tree currently has only the untracked `plan_deeplsd.md` and `plan_llm_recursive.md`; leave them alone unless a task names them. Check `git status` before staging.
-
-## Open Work
-
-The [Goal](#goal) is parity with every C++ `ELayerType` (compared on `Jev_laya`; the other branches add no kinds), axis/layout pinned by tests, and GPU support for every layer. Nothing else is in scope (`plan-open-items.md`, "Scope"). Each backlog stub must be expanded into its own plan before dispatch; each layer's Definition of Done includes the axis checklist.
-
-Default order across release lines (the current GPU-priority operator override above supersedes the no-interleaving gate):
-
-1. **v0.1 / Stage 1, CPU for all:** finish every required CPU layer/config/source variant (config, shape, `.weights`, forward, exact backward, axis tests) and CPU Muon before starting Stage 2.
-2. **v0.2 / Stage 2, GPU for all:** give every layer a native GPU path, including layers that currently only have a host round-trip fallback (`swin`, `tucker_attention`, `mambavision`, `kimi_kda`, `dcnv4`, `laya_*`, ...), plus GPU Muon. A host fallback is only interim; completion requires native cuda-oxide kernels with CPU-parity tests (`./tools/test_oxide.sh`). Mark each layer's GPU status (native / host fallback / none) in `implemented.md`.
-3. **v0.3 / Stage 3, sparse MoE:** implement the opt-in true sparse path per `MOE.md`, CPU then GPU, after v0.2 is complete.
-
-Stage 1 remains incomplete; the latest version-mapped CPU increment is v0.1.044. The operator explicitly authorized GPU priority: continue bounded native work per `gpu_layers_plan.md`, retaining CPU gaps and leaving v0.3 unstarted. The latest version-mapped GPU increment is v0.2.202. Recent versioned work: v0.2.194 compact f32 deconvolution, v0.2.195 compact f16 deconvolution, v0.2.196 native JevCe loss/delta, v0.2.197 native Segmentation loss/delta, v0.2.198 native f32 ViT inference forward, v0.2.199 native Swin Revleaky training forward/backward, v0.2.200 native Clifford Fourier forward/backward (network-wide CPU backward fallback unchanged), and v0.2.201 native RecursiveBlock static-body channel shuffle forward/backward; other RecursiveBlock variants remain host. The WMHF primitives are not a runtime GPU path; keep its GPU support marked incomplete.
-
-**Device completion queue.** Work through this list in order, after the open items in the [Layout Move Queue](#layout-move-queue). Each item ends with the layer meeting the [Layer Completion Contract](#layer-completion-contract). The current state of each layer is in `layer-support.md`.
-
-1. Transformer family, which shares kernels (LayerNorm, GEMM, flash attention, mHC residual):
-   - `vit`: device backward (flash dQ/dK/dV primitives exist), a `forward_compact` arm, and a training path that fills the cache natively, so the host fallback is no longer needed for training.
-   - `swin`: extend native forward and backward beyond supported variants, including the v0.2.199 Revleaky training path; `tucker_attention`, `mambavision`, `kimi_kda`: native forward and backward remain open.
-   - `depth_anything` and `dpt_head`: native forward after `vit`, then backward.
-2. Layers with device primitives but no runtime path: `wmhf` (Haar DWT/IWT, scan, split, gate and high-frequency primitives exist; the seven convolution branches do not), and `recursive_block`; Clifford Fourier forward/backward is native (§264), while network-wide CPU backward fallback remains.
-3. Layers with no device path and a CPU gap: `yolo_3d` (needs the v0.1 loss and decode work first) and `obb_refine`/CARPN (CPU training first).
-4. Hybrid layers that still use host steps: `hyperbolic_foveation` and `foveation_film` (host HF source and cache), `dcnv4` unsupported activations and mixed fallback networks (point count no longer excludes native execution; the normalization mixed-network cache test remains failing), `deform_conv` with batch norm, `graph_conv` unsupported variants, GRU BN training: CPU reference done in v0.1.043, native GPU path open; and CenterNet, modern-YOLO and LayaLoss dense-head loss.
-5. Optimizers: GPU Muon for the remaining matrix families, and native update and residency where parameters are still host-staged.
-
-A host fallback listed in `layer-support.md` is interim until the layer passes the contract. Compact (`forward_compact`) coverage is part of the contract only where the layer is on the f16 inference list; `vit`, `swin`, `tucker_attention`, `mambavision` and `kimi_kda` have no compact arm today.
-
-**Muon optimizer (also in scope).** Add Muon next to SGD/Adam wherever it applies: 2D weight matrices (convolution weights viewed as `[out, in*kh*kw]`, `connected`, deconvolutional, attention/MLP projections in `vit`/`swin`/`transformer`/`tucker_attention`/`kimi_kda`/`mambavision`, MoE/EML expert convs, `dcnv4` projections, `laya_*` projections). Biases, BN/norm scales, positional/embedding tables and 1D params stay on Adam/AdamW. Follows the same two stages: CPU first (momentum buffer + Newton-Schulz orthogonalisation, optimizer state saved in the DNOPT sidecar and round-trip tested like Adam moments), then a native GPU kernel. No Muon exists in the repo or on any C++ branch (checked with `git grep`), so the spec must be written first (update rule, NS coefficients/iterations, update-scale convention, per-layer eligibility); state "hand-derived from the paper, no C++ reference".
-
-**Sparse MoE (also in scope):** `[moe_convolutional]` currently runs every expert and masks the output (same as C++). `MOE.md` plans an opt-in true sparse path (CPU first, then GPU) that must equal the dense-masked result.
-
-Current gaps and completed CPU work (see `implemented.md`, `todo.md`, `layer-support.md`, and `STATUS.md`; latest version-mapped CPU increment is v0.1.044 and GPU increment is v0.2.202):
-
-1. **`[yolo_3d]` remains a partial v0.1 layer, not a complete port.** The `depth_3d` source confirms scope, and `[dpt_head]` is CPU-ported. The accepted `yolo_3d_plan.md` supersedes the draft; S1–S13 are transcribed in `yolo_3d_notes.md`. v0.1.024 adds config/spec/shape helpers; v0.1.025 adds standalone label/truth helpers; v0.1.026 integrates network aliases/shared class-K validation and weightless raw CPU forward/exact supplied-seed backward, with checkpoint/optimizer and legacy consumer/GPU rejection tests (`implemented.md` §§38–40). The `yolo_3d` filter passes 42 core + 1 CLI tests. Next: projected math/assignments/loss and exact derivatives, standalone/mixed training APIs consuming truths and map/counter metadata, decode/evaluator and the A2 output-axis pin; then depth/metric CPU support. Seeded optimizer tests are not full loss-to-conv training evidence; all legacy detector consumers still reject cuboid networks. Axis status remains Open, GPU status none, no compiled-C++ golden. The plan's projected version numbers are stale; use `version-map.tsv` and never reuse them.
-2. **DSConv multi-template `morph=0/1` CPU forward and exact backward landed in v0.1.044** (§268), including cached view dropout, weights and SGD/Adam resume. Muon for extra offset arrays explicitly errors and remains open (the matrix visitor in `muon_runtime.rs` is user WIP); multi-template GPU is explicitly rejected and open. C++ backward is a stub; no compiled-C++ golden.
-3. The other previously missing Stage-1 CPU ports are implemented within their documented bounds: `deform_conv`, `graph_conv`, `wmhf`, `clifford`, `recursive_block`, `hyperbolic_foveation`, `foveation_film`, `depth_anything`, and `dpt_head`; CPU Muon is recorded in v0.1.005. Their focused tests and evidence boundaries are in `implemented.md` and `STATUS.md`. These do not establish compiled-C++ parity.
-4. The bounded A1 family audit is complete in v0.1.012; DPT's named axis test is in v0.1.013. This is not all-layer axis completion: the current ledger has 46 pinned C++-backed LayerKind variants, 14 open C++-backed variants (including partial Yolo3d), 5 Rust-only variants and Unsupported. See `axis-coverage.md`; `axis_layout` passes 52 tests. DSConv, DeformConv, GraphConv, WMHF, Clifford, DepthAnything, RNN, LSTM, CRNN, Contrastive, JevCe and OmdLoss source-derived axis pins are recorded in `implemented.md`; check `version-map.tsv` for whether a specific pin has landed. Resolve all applicable Open contracts as well as per-backlog A2 tests before closing Stage 1.
-5. **v0.2 is incomplete:** every layer needs a native GPU implementation and CPU-parity test, including current host fallbacks; GPU Muon remains open. The current operator override authorizes GPU work now despite unresolved v0.1 requirements. Native JevCe loss/delta (v0.2.196, §260) and Segmentation loss/delta (v0.2.197, §261) are wired; CenterNet, modern-YOLO and LayaLoss still use the host dense-loss path. Deconvolution `NormalizeChannels*` and compact f32/f16 inference are native (v0.2.193–195, §§257–259). DCNv4 native runtime math includes kernels above 961 points (§266), BN adjoint/EMA and `NormalizeChannels*` activations (§§50–52); unsupported variants and mixed networks can fall back, while host mirrors and rolling stats still limit residency. WMHF primitives are not a runtime GPU path. Do not confuse native primitives or forward with a complete native layer.
-6. **v0.3 is incomplete:** `[moe_convolutional]` still computes every expert; the opt-in sparse path in `MOE.md` is sequenced after v0.2.
-7. **Act-head training gap discovered during GPU audit:** executable C++ accumulates/updates all four act-head parameter blocks, whereas Rust runtime uses only the returned CLS adjoint and ignores parameter gradients. The frozen-weight module description does not establish full source-training support. The operator question about including this training fix remains unanswered; do not infer approval from automatic continuation. Independent native math can progress without changing that behavior. Evidence: `implemented.md` §43. Shared-file act-head loading also remains unproven: an error hint naming a missing loader is not an artifact, and §45 tests only in-memory blob replacement. These gaps remain part of overall CPU/GPU completion.
-
-**C++ enum boundary:** `NETWORK` is the `[net]`/`[network]` metadata section, not a layer (`Jev_laya:src-lib/darknet_cfg.cpp:817-820`; Rust `NetConfig::from_section` accepts both). `BLANK` and `EMPTY` are marked unused in `darknet_enums.hpp:51-52`; `BLANK` is an internal GPU-fusion sentinel (`darknet_network.cpp:2662-2672`), and the `[blank]` alias falls through the parser's unsupported default. `[empty]`/`[silence]` map to `EMPTY` and also hit that default (`darknet_enums.cpp:60-62`; `darknet_cfg.cpp:947-1157`). They are not missing Rust layer kinds; unsupported cfgs must still error explicitly.
-
-Already done within documented CPU-reference bounds, do not blindly re-plan those ports (`vit` also has a native inference forward since v0.2.198): `vit`/`vc_attention`, `swin`/`transformer`, `tucker_attention`, `mambavision`, `kimi_kda` (MiniMax sparse attention is a shared option), `dcnv4`, `laya_*`. This does not close native GPU work or the act-head training/loading gaps above.
-
-Not dispatched from this GPU-layer queue (still in `todo.md`): GUI, CARPN Stage-2 training and `detector train -map`, OBB GPU training/`-map`, CUDA graph capture (conditional; see `AGENTS_fp8.md`), and convergence runs. FP8/FP4 is a separate active goal in `AGENTS_fp8.md`, not part of this queue.
-
-Blocked: `dcnv3` (no reference numerics); `detr_decoder` (C++ broken).
-
-## Lessons
-
-- One package/command per build; do not chain `-p` crates or bundle edit+build+restore.
-- Use the exact model name the user types (codex: `gpt-6-luna`).
-- Do not compare NaN with `PartialEq`; assert `.is_nan()`.
-- When one loss spans several passes, each pass owns only its partial gradient.
-
-Full list: `lessons.md`.
-
-## Doc Hygiene
-
-- Finished work goes in `implemented.md` (one line per version with evidence), not as prose in plan files.
-- Plan files keep only open work. Update `todo.md`, `STATUS.md`, `version-map.tsv` per version.
-- Candidates to archive or trim (not done, needs user approval since most are untracked): `task_plan.md`, `notes.md`, and the checked-off Phase 0 TDD body of `layers.md` (about lines 97–3213).
+- Tick an item only after its definition of done holds. Add a new item at the end of its phase with the next planned version; a ticked item keeps the version it shipped as.
+- Update [State snapshot](#state-snapshot) whenever a version lands: latest versions, next free numbers, wired-but-unvalidated layers.
+- Finished work goes in `02_state/implemented.md`, not here. Open work stays here and in `todo.md`.
+- After a user correction, add the rule to `lessons.md`.
+- Each edited `.md` keeps its table of contents in sync with its headings.

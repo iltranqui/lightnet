@@ -368,7 +368,7 @@ Correctness: `oxide_conv_parity` (13, incl. `conv_parity_implicit`), `oxide_cfg_
 | v0.2.168 scale fused into quantise | 2.95 ms | 1.02 ms | 4.68 ms | 4.60 ms |
 | v0.2.169 A+B fused (block-reduced amax) | 2.23 ms | 0.98 ms | 4.16 ms | 4.21 ms |
 
-`nsys` after v0.2.168 (2402 GEMMs): 14022 launches (238 ms host API time) and 4906 memsets (71 ms) against 166 ms of GPU kernel time, so the path was launch-bound; `sgemm_fp8_mma` was 76% of GPU time, amax and quantise about 20%. A first A+B fusion with one atomic per element on adjacent slots doubled the lego time (5.89 ms; the amax kernel averaged 140 us against 3.4 us) and was replaced by the block-reduced version. Numbers are single runs; the fp32 column moved by up to 20% between runs. Remaining ideas and status: `tasks/rust/plan_fp8.md`, "Overhead optimisation". No training run was made.
+`nsys` after v0.2.168 (2402 GEMMs): 14022 launches (238 ms host API time) and 4906 memsets (71 ms) against 166 ms of GPU kernel time, so the path was launch-bound; `sgemm_fp8_mma` was 76% of GPU time, amax and quantise about 20%. A first A+B fusion with one atomic per element on adjacent slots doubled the lego time (5.89 ms; the amax kernel averaged 140 us against 3.4 us) and was replaced by the block-reduced version. Numbers are single runs; the fp32 column moved by up to 20% between runs. Remaining ideas and status: `tasks/rust/03_plans/lowprec/plan_fp8.md`, "Overhead optimisation". No training run was made.
 
 ## Gradient-method shootout (2026-10-01)
 

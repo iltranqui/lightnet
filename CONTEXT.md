@@ -45,16 +45,16 @@ Most files in `tasks/rust/` are tracked. Check with `git ls-files tasks/rust/<fi
 | Need | File |
 |---|---|
 | Rules, commands, versioning, file map | `tasks/rust/AGENTS.md` |
-| Verified state after a reset | `tasks/rust/STATUS.md` |
-| What is implemented | `tasks/rust/implemented.md` |
-| Per-layer CPU/GPU/f16/axis status | `tasks/rust/layer-support.md` |
-| Open work | `tasks/rust/todo.md`, `tasks/rust/plan-open-items.md` |
+| Verified state after a reset | `tasks/rust/02_state/STATUS.md` |
+| What is implemented | `tasks/rust/02_state/implemented.md` |
+| Per-layer CPU/GPU/f16/axis status | `tasks/rust/02_state/layer-support.md` |
+| Open work | `tasks/rust/todo.md`, `tasks/rust/03_plans/cpu-layers/plan-open-items.md` |
 | Feature plans | `tasks/rust/*_plan.md`, `fp8_fp4.md`, `onnx.md` |
-| Version to commit map | `tasks/rust/version-map.tsv` |
+| Version to commit map | `tasks/rust/02_state/version-map.tsv` |
 
 Completed plans stay in place: they are the roadmap.
 
 ## Factory vs product
 
 - Factory (stable across runs): `cfg/`, `tools/`, `third_party/`, `tasks/rust/AGENTS.md`.
-- Product (changes with the work): `src/`, `tasks/rust/STATUS.md`, `todo.md`, `implemented.md`.
+- Product (changes with the work): `src/`, `tasks/rust/02_state/STATUS.md`, `todo.md`, `implemented.md`.

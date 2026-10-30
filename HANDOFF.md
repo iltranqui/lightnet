@@ -136,8 +136,8 @@ already correct. No tolerances were loosened.
 
 ## First work on explicit resume
 
-Read `tasks/rust/AGENTS.md`, `tasks/rust/source-wip.md`,
-`tasks/rust/device_completion_plan.md` and the layer CONTEXT file first.
+Read `tasks/rust/AGENTS.md`, `tasks/rust/04_reference/source-wip.md`,
+`tasks/rust/03_plans/gpu/device_completion_plan.md` and the layer CONTEXT file first.
 Work directly without subagents. Preserve **at most two build jobs/test
 threads, MemoryHigh=3G, one Cargo check/test command at a time**. GPU suites
 use one test thread; cap Rayon at two. The earlier source-only restriction
@@ -260,9 +260,9 @@ implementation of the device-completion priority; see the continuation below.
 1. `tasks/rust/AGENTS.md`: layer completion contract, remaining variants and
    policy constraints. Some version/status paragraphs predate the WIP commits.
 2. `src/lightnet-core/src/layers/CONTEXT.md`: layer layout and runtime wiring.
-3. `tasks/rust/source-wip.md`: written source and explicit limitations.
-4. `tasks/rust/device_completion_plan.md`: current device-first continuation.
-5. `tasks/rust/layer-support.md`, `layer-map.md`, `gpu_layers_plan.md`: historical
+3. `tasks/rust/04_reference/source-wip.md`: written source and explicit limitations.
+4. `tasks/rust/03_plans/gpu/device_completion_plan.md`: current device-first continuation.
+5. `tasks/rust/02_state/layer-support.md`, `layer-map.md`, `gpu_layers_plan.md`: historical
    support matrix, file locations and remaining queue. Do not mistake old
    tested counts or matrix rows for validation of these new WIP changes.
 6. `tasks/rust/lessons.md`, plus local `tasks/lessons.md` and `tasks/todo.md`.
@@ -310,7 +310,7 @@ editing or staging.
   local WIP checkpoint; no release tag or version-map entry is appropriate.
 
 The original per-layer descriptions below describe the earlier checkpoint;
-use this continuation and `tasks/rust/source-wip.md` for current source scope.
+use this continuation and `tasks/rust/04_reference/source-wip.md` for current source scope.
 
 ## Muon, AMP and GRU source continuation
 
@@ -336,7 +336,7 @@ At the source-only checkpoint, the new fixtures were unrun. CPU finite differenc
 Oxide sources cover dense AMP, Muon order/gates/resume, full GRU accumulation,
 deferred steps and optimizer resume. No Cargo/check/build/test/runtime/training
 or benchmark execution occurred. Source review and `git diff --check` are the
-only verification. See `tasks/rust/device_completion_plan.md` for the exact map
+only verification. See `tasks/rust/03_plans/gpu/device_completion_plan.md` for the exact map
 and remaining queue. Keep local WIP commits untagged and preserve unrelated work.
 
 The user subsequently authorized check/test execution with two jobs, serially.

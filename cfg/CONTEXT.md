@@ -12,7 +12,7 @@ Model configuration files, label lists and `.data` files. Factory material: stab
 - `*.cfg`: Darknet network definitions (YOLO, CSP, darknet53, efficientnet, and others).
 - `*.data`, `*.names`, `*.labels`, `*.map`: dataset descriptors and class lists (for example `coco.data`, `coco.names`).
 
-Parsed by `src/lightnet-core/src/cfg.rs`. Layer coverage per kind: `tasks/rust/layer-support.md`.
+Parsed by `src/lightnet-core/src/cfg.rs`. Layer coverage per kind: `tasks/rust/02_state/layer-support.md`.
 
 ## Constraints
 

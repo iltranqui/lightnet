@@ -14,7 +14,7 @@ A Rust port of the Darknet/YOLO runtime. The CPU path is the behavioural referen
 
 ## Status
 
-Work in progress. Per-layer CPU, GPU, f16 and axis status is tracked in `tasks/rust/layer-support.md`; the overall roadmap is in `tasks/rust/`. No parity with the C++ implementation is claimed beyond what `docs/CPP_PARITY.md` describes.
+Work in progress. Per-layer CPU, GPU, f16 and axis status is tracked in `tasks/rust/02_state/layer-support.md`; the overall roadmap is in `tasks/rust/`. No parity with the C++ implementation is claimed beyond what `docs/CPP_PARITY.md` describes.
 
 ## Repository layout
 

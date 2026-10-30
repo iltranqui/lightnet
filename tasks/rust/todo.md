@@ -3,13 +3,14 @@
 Plan: ~/.claude/plans/https-github-com-nvidia-cuda-rust-port-t-imperative-pumpkin.md
 Goal: cuda-oxide backend `src/lightnet-cuda-oxide` implementing `F32TensorOpsBackend` with Rust kernels ported from `src-lib/*.cu`.
 
-> **All implemented work has moved to [`implemented.md`](implemented.md).** This
+> **All implemented work has moved to [`implemented.md`](02_state/implemented.md).** This
 > file tracks only open / partial / deferred items. Phase tables live in
-> [`layers.md`](layers.md); the FP8/FP4 plan is [`fp8_fp4.md`](fp8_fp4.md).
-> Per-`LayerKind` CPU/GPU/f16/axis status is in [`layer-support.md`](layer-support.md).
+> [`layers.md`](04_reference/layers.md); the FP8/FP4 plan is [`fp8_fp4.md`](03_plans/lowprec/fp8_fp4.md).
+> Per-`LayerKind` CPU/GPU/f16/axis status is in [`layer-support.md`](02_state/layer-support.md).
 
 ## Contents
 
+- [Open queue](#open-queue)
 - [Build/test (one command at a time, repo root)](#buildtest-one-command-at-a-time-repo-root)
 - [Hardware-blocked (cannot be compiled/tested on this sm_89 GPU)](#hardware-blocked-cannot-be-compiledtested-on-this-sm_89-gpu)
 - [Backend / kernel follow-ups](#backend--kernel-follow-ups)
@@ -24,6 +25,10 @@ Goal: cuda-oxide backend `src/lightnet-cuda-oxide` implementing `F32TensorOpsBac
 - [Not implemented by design / no scanned cfg needs it](#not-implemented-by-design--no-scanned-cfg-needs-it)
 - [Known small diffs vs C++](#known-small-diffs-vs-c)
 - [Version rewrite v0.0.001 – v0.0.246](#version-rewrite-v00001--v00246)
+
+## Open queue
+
+The prioritized, ordered checklist lives in [AGENTS.md](AGENTS.md#agent-todo) (one home per fact). This file keeps the long backlog by area below.
 
 ## Build/test (one command at a time, repo root)
 
@@ -196,6 +201,10 @@ for the cache would erase the gain. **Backward stage 1 (host reference) landed:*
 - [x] **v0.2.042 (`56bfbe2f`): actual-device connected Muon `train_only_bn` gate.** Two-update Oxide test matches CPU and confirms the gated parameters remain unchanged. Together with `dont_update` and `burnin_update`, the three `LayerTrainOptions` gates now have connected actual-device coverage; other parameter families remain open. Evidence: `implemented.md` §69.
 - [x] **v0.2.041 (`4edd8860`): actual-device connected BN GPU Muon parity.** Oxide output, connected weights/biases, BN scales and rolling stats match CPU across two updates; backward/BN optimizer state still use the existing host fallback. Evidence: `implemented.md` §69.
 - [x] **v0.2.201 (`74db0cb`): native RecursiveBlock channel shuffle forward/backward.** Static bodies containing `channel_shuffle` use the existing shuffle kernel and its inverse in `recursive_block/gpu.rs`; other variants remain host. CPU parity tolerances are 2e-4 forward and 5e-4 gradients; checks passed, recursive_block host tests passed 11 and Oxide tests passed 2. Hand-derived from source, no compiled-C++ golden. Evidence: `implemented.md` §265.
+- [x] **v0.2.206 (`4eaa51f`): MambaVision validation.** Native f32 forward, compact f32, backward and resident SGD/Adam pass on the source-wired WIP code (Muon stays hybrid); no code diff. Host `mamba` 19, `oxide_mambavision` 2. Hand-derived from source, no compiled-C++ golden. Evidence: `implemented.md` §272.
+- [x] **v0.2.205 (`4e31459`): TuckerAttention validation.** Native f32 forward, compact f32, backward and resident SGD/Adam pass on the source-wired WIP code (Muon stays hybrid); no code diff. Host `tucker` 15, `oxide_tucker_attention` 3. Hand-derived from source, no compiled-C++ golden. Evidence: `implemented.md` §271.
+- [x] **v0.2.204 (`dcda301`): ViT resident Muon and block-sparse MSA.** ViT keeps its f32 master bank under Muon (serialized views, sanitize/clip, momentum/orthogonalization, AdamW fallback, mHC policy) and runs block-sparse MSA with a fixed-mask adjoint; VC attention, head_dim > 128 and unmapped activations stay host. Checks passed; host `vit` 33, `oxide_vit` 10. Hand-derived from source, no compiled-C++ golden. Evidence: `implemented.md` §270.
+- [x] **v0.2.203 (`4fd83e4`): Swin resident Muon.** Swin keeps its resident bank under Muon (matrix views, gradient sanitize/clip, resident momentum/orthogonalization, AdamW fallback, mHC clamp) with deferred host-mirror updates and stale-tape rejection. Checks passed; host `swin` 28, `oxide_swin` 9. Hand-derived from source, no compiled-C++ golden. Evidence: `implemented.md` §269.
 - [x] **v0.2.202 (`eeb6db6d`): native DCNv4 above 961 points.** Per-thread device scratch replaces fixed mask and mask-gradient arrays without changing reduction order; point count no longer forces host fallback, and scratch grows with point count. Checks passed; DCNv4 host tests passed 31, Oxide aggregate 7, chain 4, BN 2, and runtime chain `dcnv4` 4. Large-kernel aggregation and composition tests compare with CPU. Hand-derived from source, no compiled-C++ golden. Evidence: `implemented.md` §266.
 - [x] **v0.2.200 (`44aebc0`): native Clifford Fourier forward/backward.** Direct truncated transform with native coefficient, synthesis and parameter-gradient kernels; `clifford/gpu.rs` selects the native path. CPU parity test tolerances are 2e-4 forward and 5e-4 gradients; checks passed, Clifford host tests passed 14 and Oxide tests passed 5. Hand-derived from source, no compiled-C++ golden; network-wide CPU backward fallback unchanged. Evidence: `implemented.md` §264.
 - [x] **v0.2.199 (`204424c`): native Swin Revleaky training forward/backward.** Device Leaky mapping; CPU parity covers forward (2e-4), gradients and updated parameters (5e-4). `cargo xtask check`, `cargo xtask gpu-check`, `cargo xtask test swin` (28 passed), `cargo xtask oxide --test oxide_swin` (5 passed); hand-derived from source, no compiled-C++ golden. Evidence: `implemented.md` §263.
@@ -215,7 +224,7 @@ for the cache would erase the gain. **Backward stage 1 (host reference) landed:*
 - [x] **v0.2.033 (`d73a87e7`): standalone BatchNorm fallback parity for GPU Muon dispatch.** FakeBackend test matches CPU scale/bias AdamW fallback and sidecar state; focused GPU-Muon host filter 3 tests, Muon regression filter 24 tests. No added native GPU layer coverage; evidence: `implemented.md` §69.
 - [x] **v0.2.032 (`2ddcaa6b`): connected-layer GPU Muon runtime slice.** Actual Oxide Newton–Schulz is used for eligible connected matrices; AdamW fallback, momentum staging, final weight update and state remain host-side. DNOPT6 round-trip plus actual-GPU two-step CPU parity and resumed-step parity passed. Other parameter families explicitly reject. Evidence: `implemented.md` §69.
 - [x] **v0.2.031 (`b46ad9c8`): standalone native GPU Muon Newton–Schulz orthogonalization primitive.** Oxide host-reference parity passed for square/tall/wide matrices, zero and bad shapes (`oxide_muon`, 2 tests); host reference tests also passed (2). Evidence: `implemented.md` §68.
-- [ ] **GPU Muon remains partial:** connected, standard non-BN convolution, non-BN EML/MoE/DCNv4/deform_conv, GraphConv (eligible no-BN/BN native training), local, RNN/LSTM/CRNN convolution projections, deconvolution, ViT, Swin, TuckerAttention, MambaVision, KimiKda, and HF/FiLM eligible matrices are supported with a mixture of device and host-staged gradients/state/final updates (HF/FiLM added v0.2.146; gate and sidecar-resume evidence v0.2.147–148); layer-specific boundaries and BN fallback limits are in `layer-support.md` and `implemented.md` §§69–78, 91–97, 182–184. Extend only with explicit gradient/weight lifecycle parity and preserve DNOPT6 mirrors. Connected BN backward now stays on the GPU path for supported activations (v0.2.101), but BN optimizer accumulation and rolling-stat synchronization remain host-managed; other parameter families remain open. No host fallback masquerading as a native GPU layer.
+- [ ] **GPU Muon remains partial:** connected, standard non-BN convolution, non-BN EML/MoE/DCNv4/deform_conv, GraphConv (eligible no-BN/BN native training), local, RNN/LSTM/CRNN convolution projections, deconvolution, TuckerAttention, MambaVision, KimiKda, and HF/FiLM eligible matrices are supported with a mixture of device and host-staged gradients/state/final updates (HF/FiLM added v0.2.146; gate and sidecar-resume evidence v0.2.147–148); layer-specific boundaries and BN fallback limits are in `layer-support.md` and `implemented.md` §§69–78, 91–97, 182–184. ViT and Swin moved to native resident Muon in v0.2.204/v0.2.203. Extend only with explicit gradient/weight lifecycle parity and preserve DNOPT6 mirrors. Connected BN backward now stays on the GPU path for supported activations (v0.2.101), but BN optimizer accumulation and rolling-stat synchronization remain host-managed; other parameter families remain open. No host fallback masquerading as a native GPU layer.
 - [ ] DCNv4 parameters now have reusable device-resident copies across forwards/SGD/Adam updates (v0.2.030), with host snapshots for external edits; host mirrors are still downloaded each optimizer step and rolling stats remain host-managed. Preserve host fallback for unsupported/mixed paths; broader GPU coverage remains open.
 - [x] **v0.2.023 (`2ff4544e`): native act-head CLS-adjoint scatter.** Added a checked host reference and real Oxide kernel that adds `[B,H]` into token zero of `[B,H,1,T]`; complete `oxide_laya_act_backward` suite 5, host `laya_act` 11, and lightnet-cuda helper 2 pass. It is still a standalone primitive, not runtime backward/update integration; training eligibility, f16 and file loading remain open. Evidence: `implemented.md` §60.
 - [x] **v0.2.022 (`27ab3cfb`): native DCNv4 gradient accumulation.** Bias, offset-weight, offset-bias and optional BN-scale gradients remain device tensors and accumulate across microbatches; they cross to host once at the unchanged SGD/Adam optimizer boundary. Host DCNv4 28 and focused RTX 4060 two-step runtime SGD/Adam parity passed. Parameter residency/device optimizer updates and GPU Muon remain open; no speedup or compiled-C++ claim. Evidence: `implemented.md` §59.
@@ -425,7 +434,7 @@ reference tolerance is `TOL_COMPOSED = 1e-4` rather than the single-stage `2e-6`
 - [x] v0.2.191: delayed-scaling history includes the buffer-pool incarnation, so a recycled address starts at call 0 instead of inheriting the old tensor's amax. `oxide_gemm_f8` 54 of 54. See `implemented.md` §255.
 - [x] v0.2.192: production quantisers use stable per-role delayed-history keys, so history survives pool reuse across steps; incarnation remains the unkeyed fallback. `oxide_gemm_f8` 54 of 54. See `implemented.md` §256.
 - [x] bf16 Tasks 2 to 8 (`plan_bf16.md`); 3000-iteration run recorded. See `implemented.md` §242.
-- [ ] fp8 Task 9: measure delayed scaling against the default and decide the default. User-gated; current directive is code only. See `AGENTS_fp8.md`.
+- [ ] fp8 Task 9: measure delayed scaling against the default and decide the default. User-gated. Tracked in `03_plans/lowprec/ROADMAP_FP8.md` (Phase 3).
 - [ ] Step 5: FP8 conv via im2col + LegoGears_v2 mAP vs the C++ FP8 path. Not
   runnable here (no C++ build of `v6-dev-fp8`).
 
@@ -801,7 +810,7 @@ Immediately next, in dependency order:
 - [x] `git rebase --exec` in temp worktree (branch `rust-versioned`); hook checks each replayed tree equals the original before amending
 - [x] Verify: 246/246 rows; parent chain; trees; author + committer name/email/date; raw message bytes after subject; subject sequence `v0.0.001…246`; tip tree == old tip tree; main tree and other refs unchanged
 - [x] Swap `refs/heads/rust`: `a4c40375` -> `d1972af5` (compare-and-swap); temp worktree and branch removed
-- Map (old -> new per index): `tasks/rust/version-map.tsv` (git-excluded)
+- Map (old -> new per index): `tasks/rust/02_state/version-map.tsv` (git-excluded)
 
 Review:
 - Only subject lines changed. `rust milestone vN: ` prefix stripped on 163 commits, 83 subjects kept as-is, body bytes identical.
@@ -812,7 +821,11 @@ Review:
 
 ## ONNX export
 
+- [x] `lightnet-rs export-onnx` is implemented: protobuf encoder (`v0.0.254`), supported-layer exporter (`v0.0.255`), CLI (`v0.0.256`), and Rust-runtime checker (`v0.0.257`). Focused results: `MEM=3G ./tools/test_host.sh onnx` ck: `git update-ref refs/heads/rust backup/rust-pre-version`
+
+## ONNX export
+
 - [x] `lightnet-rs export-onnx` is implemented: protobuf encoder (`v0.0.254`), supported-layer exporter (`v0.0.255`), CLI (`v0.0.256`), and Rust-runtime checker (`v0.0.257`). Focused results: `MEM=3G ./tools/test_host.sh onnx` passed 11 core tests; `MEM=3G ./tools/test_host.sh export_onnx_args` passed 1 CLI test; `cargo build -p lightnet-cli -j 2` passed. The CLI exported both fused and unfused models from `build/logs/verify/lego_cur_cpu/run.cfg` and `run_final.weights`.
 - [x] `python3 -m py_compile tools/onnx_check.py` passed. ONNX Runtime numeric checks against Rust CPU layer dumps passed at tolerance `1e-4`: fused worst relative error `3.257e-06`; unfused `3.908e-05`; Mish-opset-18 variant `3.831e-06`. The Mish test changed Leaky activations to Mish in a temporary cfg while retaining the same real weights; image was `artwork/dog.jpg`.
 - Canonical `/home/kerrigan/src/DarkSuite/datasets/LegoGears_v2` assets are absent in this checkout, so verification used the local matching cfg/weights plus `build/logs/bench/LegoGears.names`; no compiled-C++ parity is claimed. `onnx` Python package is absent, but `onnxruntime`, NumPy, and OpenCV are installed and the emitted models loaded and executed successfully in ONNX Runtime.
-- [x] ONNX plan bookkeeping and verification are complete; version map, `implemented.md`, and `STATUS.md` record the milestone evidence. Follow-ups listed in `tasks/rust/onnx.md` remain out of scope.
+- [x] ONNX plan bookkeeping and verification are complete; version map, `implemented.md`, and `STATUS.md` record the milestone evidence. Follow-ups listed in `tasks/rust/03_plans/misc/onnx.md` remain out of scope.
