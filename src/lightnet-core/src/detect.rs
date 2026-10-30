@@ -2059,6 +2059,7 @@ mod obb_decode_tests {
             delta_normalizer: 1.0,
             class_multipliers: None,
             class_map: None,
+            max_boxes: 200,
         }
     }
 

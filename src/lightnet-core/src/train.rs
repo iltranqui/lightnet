@@ -919,7 +919,7 @@ pub fn compute_yolo_training_loss_with_state(
                         let mut best_match_iou = 0.0f32;
                         let mut best_label: Option<(&YoloLabel, usize)> = None;
 
-                        for label in batch_labels {
+                        for label in yolo_truths(batch_labels, spec) {
                             let class_id = remap_class_id(spec, label.class_id, head.layer_index)?;
                             let iou = bbox_iou(predicted_bbox, bbox_from_label(label));
                             if class_match && iou > best_match_iou {
@@ -1015,7 +1015,7 @@ pub fn compute_yolo_training_loss_with_state(
         // `iou_thresh` extra anchors are taken from this head's mask independently of it.
         let total_anchors = spec.num.min(spec.anchors.len() / 2);
         for (batch, image_labels) in labels.iter().enumerate() {
-            for label in image_labels {
+            for label in yolo_truths(image_labels, spec) {
                 let class_id = remap_class_id(spec, label.class_id, head.layer_index)?;
                 let truth_shift = YoloBox {
                     x: 0.0,
@@ -1592,6 +1592,11 @@ fn apply_yolo_class_delta(
         }
         seed.set(batch, class_base + class_offset, row, col, delta);
     }
+}
+
+/// C++ `process_batch` truth loops: at most `max` truths, ending at the first truth with `x == 0`.
+fn yolo_truths<'a>(labels: &'a [YoloLabel], spec: &YoloSpec) -> impl Iterator<Item = &'a YoloLabel> {
+    labels.iter().take(spec.max_boxes).take_while(|label| label.x != 0.0)
 }
 
 fn remap_class_id(spec: &YoloSpec, raw_class_id: usize, layer_index: usize) -> Result<usize> {
@@ -3740,6 +3745,7 @@ mod tests {
             delta_normalizer: 1.0,
             class_multipliers: None,
             class_map: None,
+            max_boxes: 200,
         };
         let shape = TensorShape {
             width: 1,
@@ -3828,6 +3834,7 @@ mod tests {
             delta_normalizer: 1.0,
             class_multipliers: None,
             class_map: None,
+            max_boxes: 200,
         };
         let shape = TensorShape {
             width: 1,
@@ -4168,6 +4175,7 @@ mod tests {
             delta_normalizer: 1.0,
             class_multipliers: None,
             class_map: None,
+            max_boxes: 200,
         };
         let shape = TensorShape {
             width: 1,
@@ -4428,6 +4436,120 @@ mod tests {
         assert_eq!(seed.get(0, 5, 16, 16), 0.0);
         assert_eq!(seed.get(0, 0, 16, 16), 0.0);
         assert_eq!(training.box_count, 0);
+    }
+
+    fn yolo_parity_label(x: f32, y: f32, w: f32, h: f32) -> YoloLabel {
+        YoloLabel {
+            class_id: 0,
+            x,
+            y,
+            w,
+            h,
+        }
+    }
+
+    /// yolo_parity: two truths in different cells of one head each get a primary positive.
+    /// Truth A (x=y=.5) -> cell (16,16); truth B (x=y=.25) -> cell (8,8). Both have the same
+    /// 10x12 px box, so best anchor 0 (mask 0, iou 1) in head A. Positive objectness delta =
+    /// obj_normalizer * (1 - sigmoid(0)) = .5, class delta = 1 - .5 = .5 (zero input).
+    #[test]
+    fn yolo_parity_two_truths_in_different_cells_both_positive() {
+        let (network, forward) = forward_two_head_zero_input("");
+        let a = yolo_parity_label(0.5, 0.5, 10.0 / 32.0, 12.0 / 32.0);
+        let b = yolo_parity_label(0.25, 0.25, 10.0 / 32.0, 12.0 / 32.0);
+        let training = compute_yolo_training_loss(&network, &forward, &[vec![a, b]])
+            .expect("training loss computes");
+        assert_eq!(training.positive_matches, 2);
+        let seed = training.layer_output_gradient_seeds[1]
+            .as_ref()
+            .expect("head A seed");
+        assert!((seed.get(0, 4, 16, 16) - 0.5).abs() < 1.0e-6, "truth A objectness");
+        assert!((seed.get(0, 5, 16, 16) - 0.5).abs() < 1.0e-6, "truth A class");
+        assert!((seed.get(0, 4, 8, 8) - 0.5).abs() < 1.0e-6, "truth B objectness");
+        assert!((seed.get(0, 5, 8, 8) - 0.5).abs() < 1.0e-6, "truth B class");
+    }
+
+    /// yolo_parity: `max=1` ([yolo] key, YoloSpec.max_boxes, C++ `max`) caps the truth list
+    /// before assignment, so only truth A is positive. Cell (8,8) then has no truth: its box
+    /// (centre ~.27, 10x12 px) does not overlap A, so the negative objectness delta is -.5.
+    #[test]
+    fn yolo_parity_max_boxes_caps_truths_before_assignment() {
+        let (network, forward) = forward_two_head_zero_input("max=1");
+        let a = yolo_parity_label(0.5, 0.5, 10.0 / 32.0, 12.0 / 32.0);
+        let b = yolo_parity_label(0.25, 0.25, 10.0 / 32.0, 12.0 / 32.0);
+        let capped = compute_yolo_training_loss(&network, &forward, &[vec![a.clone(), b]])
+            .expect("training loss computes");
+        assert_eq!(capped.positive_matches, 1);
+        let seed = capped.layer_output_gradient_seeds[1]
+            .as_ref()
+            .expect("head A seed");
+        assert!((seed.get(0, 4, 16, 16) - 0.5).abs() < 1.0e-6, "truth A positive");
+        assert!((seed.get(0, 4, 8, 8) + 0.5).abs() < 1.0e-6, "truth B capped, negative");
+        // relational: identical to passing only truth A under the same cap
+        let only_a = compute_yolo_training_loss(&network, &forward, &[vec![a]])
+            .expect("training loss computes");
+        assert_eq!(capped.loss, only_a.loss);
+        assert_eq!(capped.positive_matches, only_a.positive_matches);
+    }
+
+    /// yolo_parity: a label with x == 0.0 ends the truth list (C++ `if (!truth.x) break`), so
+    /// [A(x=0), B] behaves like an empty image. Relational: same loss as `[]`, no positives.
+    #[test]
+    fn yolo_parity_zero_x_label_terminates_truth_list() {
+        let (network, forward) = forward_two_head_zero_input("");
+        let sentinel = yolo_parity_label(0.0, 0.5, 10.0 / 32.0, 12.0 / 32.0);
+        let b = yolo_parity_label(0.25, 0.25, 10.0 / 32.0, 12.0 / 32.0);
+        let terminated = compute_yolo_training_loss(&network, &forward, &[vec![sentinel, b]])
+            .expect("training loss computes");
+        let empty = compute_yolo_training_loss(&network, &forward, &[Vec::new()])
+            .expect("training loss computes");
+        assert_eq!(terminated.positive_matches, 0);
+        assert_eq!(terminated.loss, empty.loss);
+    }
+
+    /// yolo_parity: single head, mask=0,1 (anchors 10x12, 12x14), truth 10x12 px at the centre.
+    /// Best anchor 0 (iou 1) is primary. Anchor 1 iou = 120/168 = .714: above iou_thresh=.5 it
+    /// is an extra positive (total 2); with iou_thresh=1.0 only the primary (total 1).
+    #[test]
+    fn yolo_parity_extra_anchor_assigned_to_both_masked_anchors() {
+        for (extra, expected) in [("iou_thresh=1.0", 1), ("iou_thresh=0.5", 2)] {
+            let cfg = ConfigFile::parse_str(
+                "inline.cfg",
+                &format!(
+                    r#"
+                [net]
+                batch=1
+                width=32
+                height=32
+                channels=3
+
+                [convolutional]
+                filters=12
+                size=1
+                stride=1
+                pad=1
+                activation=linear
+
+                [yolo]
+                mask=0,1
+                anchors=10,12,12,14
+                classes=1
+                num=2
+                truth_thresh=1.0
+                {extra}
+            "#
+                ),
+            )
+            .expect("cfg parses");
+            let network = Network::from_config(cfg).expect("network builds");
+            let executable = ExecutableNetwork::new(network.clone());
+            let input = executable.zero_input();
+            let forward = executable.forward(&input).expect("forward runs");
+            let label = yolo_parity_label(0.5, 0.5, 10.0 / 32.0, 12.0 / 32.0);
+            let training = compute_yolo_training_loss(&network, &forward, &[vec![label]])
+                .expect("training loss computes");
+            assert_eq!(training.positive_matches, expected, "{extra}");
+        }
     }
 
     /// #10: `delta_normalizer` scales only the propagated delta (backward axpy), not the cost.

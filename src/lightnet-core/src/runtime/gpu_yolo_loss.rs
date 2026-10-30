@@ -64,6 +64,7 @@ where
                         && spec.class_multipliers.is_none()
                         && spec.class_map.is_none()
                         && spec.anchors.len() / 2 <= YOLO_GPU_MAX_ANCHORS
+                        && spec.max_boxes <= YOLO_GPU_MAX_BOXES
                         && spec.mask.iter().all(|&m| 2 * m + 1 < spec.anchors.len());
                     if !supported {
                         return Ok(None);
@@ -115,7 +116,8 @@ where
                 classes: spec.classes,
                 anchors: spec.mask.len(),
                 total_anchors: spec.anchors.len() / 2,
-                max_boxes,
+                // C++ loops `t < max_boxes` per head: the kernel stops at this head's `max`.
+                max_boxes: spec.max_boxes.min(max_boxes),
                 truth_size: TRUTH_SIZE,
                 truths,
                 net_width: net.width,

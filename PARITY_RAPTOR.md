@@ -47,11 +47,11 @@ Model parsing and validation own configuration semantics. Head kernels own activ
 
 ### Git state
 
-- Work is committed as `4406741` on branch `wip-gpu-parity`, based on `0362beaa` (remote `origin/main`). The commit contains the 80 `src/` files only. It is WIP and has not been built or tested.
+- Work is committed on branch `wip-gpu-parity`, based on `0362beaa` (remote `origin/main`). `4406741` holds the 80 `src/` files. `f1f15d0` and `ed7fcae` follow. `a51d56c` removes the legacy `[detection]` layer. All of it is WIP and has not been built or tested.
 - `refs/heads/main` was missing commit `dcbd197a5da7a09db8f3cd887842e6f050ff3fd0`, a zero-byte loose file whose content is unrecoverable. It now points to `0362beaa` (remote `origin/main`), by user choice. HEAD is `wip-gpu-parity`.
 - Thirteen zero-byte loose object files were moved, not deleted, to `.git/corrupt-empty-objects/`. Five of the moved objects are blobs that dangling trees reference. None are reachable from HEAD (`git rev-list --objects HEAD` runs without errors).
 - The index cache-tree still references missing object `8f5064135548b63d658603b1ba5d8b28e388dae1`. This is a cache only.
-- Sixty files outside `src/` (docs, `tasks/`, `CLAUDE.md`, `CONTEXT.md` files) were already staged before the WIP commit and remain staged. They were not committed. **Pending user decision:** unstage, commit separately, or leave staged. Leaving them staged risks a plain `git commit` sweeping them in. Commit only with the `-- src` pathspec until decided.
+- The sixty files outside `src/` (docs, `tasks/`, `CLAUDE.md`, `CONTEXT.md` files) that had been staged are committed in `ed7fcae`. Nothing is staged. This resolves the earlier decision. `Cargo.lock` has an uncommitted modification that is not part of this work.
 
 ### Implemented, not yet built or tested
 
@@ -65,6 +65,15 @@ Model parsing and validation own configuration semantics. Head kernels own activ
   - Runtime: `compute_yolo_training_loss_gpu` in `runtime/gpu_yolo_loss.rs`. It activates each raw head once with `yolo_activate_f32`, returns device seeds, and applies `delta_normalizer` to the propagated seed only. It returns `Ok(None)` for unsupported configurations: non-CIoU loss, `iou_thresh_kind` other than IoU, focal loss, label smoothing, class multipliers or map, more than 32 anchors, more than 1024 boxes, adversarial, equidistant points, bad-label rejection, OBB, and Gaussian YOLO.
   - CLI: `run_detector_train` uses the GPU loss when `LIGHTNET_YOLO_GPU` is set and not `0`. Otherwise, or when the GPU loss declines, it uses the host loss with `backward_accumulate_seeded_gpu`. The GPU path uses `backward_accumulate_device_seeded_gpu`.
   - Tests: `gpu_yolo_loss_falls_back_when_backend_has_no_native_loss` in `runtime/tests/tests_04.rs`, and `native_yolo_loss_matches_hand_derived_single_truth` in `tests/oxide_runtime_chain.rs`. The Oxide test checks objectness and class deltas (0.8, 0.7) and the metrics for one truth on one cell. It does not check the box delta.
+- **Classic YOLO parity fixes (CPU and GPU).**
+  - `mask` defaults to `0..num` when absent, as `make_yolo_layer`. `num` is the total anchor count (`model.rs`, `[yolo]` arm).
+  - `max` is parsed into `YoloSpec.max_boxes` (default 200). The CPU loss (`train.rs`, `yolo_truths`) and the GPU path (`gpu_yolo_loss.rs`) both stop at that cap. GPU rejects `max > 1024`.
+  - CPU truth list ends at the first label with `x == 0`, as `yolo_layer.cpp` does. The GPU kernel already did this.
+  - `embedding_layer` and the tracking keys (`track_history_size`, `sim_thresh`, `dets_for_track`, `dets_for_show`, `track_ciou_norm`) on `[yolo]` now fail with `InvalidConfig`. `nms_kind`, `beta_nms`, `resize` and `random` are accepted: shipped cfgs set them (21 to 25 files each), and they do not change the classic loss.
+  - `yolo_parity_*` CPU tests in `train.rs`: two truths in different cells, `max` cap, `x == 0` sentinel, extra-anchor (`iou_thresh`). Hand-derived or relational against Rust only.
+  - Verified: host `cargo xtask test yolo` 124 passed in `lightnet-core` and 2 in `lightnet-cli`. Oxide `oxide_runtime_chain -- yolo` 3 passed on the RTX 4060.
+  - Not verified: no raptor-fp4 golden exists, so none of this is checked against Darknet. The GPU box delta is not checked; the Oxide test covers objectness and class deltas only.
+- **Decoded ONNX tests.** `decoded_detection_export_{fp32,fp16}_{nchw,nhwc}` (new) and the existing `decoded_detection_export_replaces_raw_heads_with_boxes_and_confs` (now uses a valid 16x16 `DECODE_CFG`; the old `CFG` gave a head channel mismatch). All 5 pass in the host run. No numerical comparison against Darknet.
 - **ONNX export tests from earlier.** The 13 focused exporter tests and the CLI option test passed at their earlier checkpoints. They have not been rerun since the decode option was added.
 
 ### Earlier work
@@ -76,7 +85,9 @@ Model parsing and validation own configuration semantics. Head kernels own activ
 
 ### Not started
 
-- Region truth loss and decode, legacy Detection loss and decode, modern-head (YOLOX, PP-YOLOE, YOLO-NAS) losses and decode, and CenterNet GPU paths. `tasks/rust/02_state/layer-support.md` reports some of these as incomplete or host-owned. Verify live source before acting on that table.
+- Region truth loss and decode, modern-head (YOLOX, PP-YOLOE, YOLO-NAS) losses and decode, and CenterNet GPU paths. `tasks/rust/02_state/layer-support.md` reports some of these as incomplete or host-owned. Verify live source before acting on that table.
+- Subagent drafts, **uncommitted and unwired**, not built: `layers/modern_yolo/{yolox,ppyoloe,yolonas}_train.rs`, `layers/centernet/train.rs`, and `lightnet-cuda-oxide/src/kernels/{yolox,ppyoloe,yolonas,centernet}_train.rs`. `yolox_train.rs` has a syntax error at line 184. Their assignment logic differs from the existing `modern_yolo/cpu.rs` (`assign_tal_like`, YOLOX centre-only geometry, SIMOTA top-k, L1 and class-term gaps). Undecided: fix `cpu.rs` or replace it with these files.
+- Legacy `[detection]` layer: removed in `a51d56c`. It was an identity passthrough, and no shipped cfg uses it. Not built or tested.
 - Per-layer FP8 policy and the FP32 head boundary.
 - Short LegoGears, `semantic_binary` and `semantic_multi` smoke tests, and the native-vs-native FP8 and ONNX FP32/FP16 comparisons.
 
@@ -86,7 +97,7 @@ Model parsing and validation own configuration semantics. Head kernels own activ
 2. Validate device-resident seeded backward: exact seed shapes (**implemented, unverified**), loss scaling, forward-state lifetime, fallback behavior, and parity with the host-seed path on the real Oxide backend. **Status: partial.**
 3. Classic YOLO GPU activation, assignment, loss and metrics. **Status: implemented, unverified.** Still to verify: parity with the Rust CPU loss on multi-truth, extra-anchor, objectness-smoothing, `new_coords`, truth-threshold and collision cases, plus the reference-rejected options.
 4. Connect head activation and loss to `GpuForwardState` and the device-seed backward path. **Status: implemented as opt-in (`LIGHTNET_YOLO_GPU`), unverified.** Still to verify: no double activation, forward-state lifetime, and mixed-precision loss scaling in the real training loop.
-5. Other detection gaps (Region, legacy Detection, modern heads, CenterNet). **Status: not started.** Do not imply that the classic YOLO kernel completes all detection heads.
+5. Other detection gaps (Region, modern heads, CenterNet). **Status: not started.** Do not imply that the classic YOLO kernel completes all detection heads.
 6. Per-layer FP8 policy and FP32 head boundary, then a short LegoGears training and inference smoke test. **Status: not started.** Do not claim FP8 coverage or performance from an FP32-only test. Training runs are limited to the user's authorized short smoke tests; choose a small, explicit iteration count and document it.
 7. Decoded detection ONNX output, FP16/FP32 and layout coverage, and comparisons on the three acceptance datasets. **Status: decoded output implemented, unverified; comparisons not started.** Follow user priority if they redirect work.
 
@@ -109,7 +120,7 @@ git diff --check
 Decided by user (layer interview):
 
 - **Region (`[region]`)**: full truth loss and decode, so training and inference both work. Backend: **GPU directly**, with no CPU reference first. The user accepted that there is no independent CPU oracle for these results. Verify GPU output against the compiled `raptor-fp4` golden or hand-derived values where possible, and say so when a result has only been checked against itself.
-- **Legacy Detection (`[detection]`)**: not the next target. The user answered "the [yolo] layer", which is read as: keep the classic `[yolo]` work as the priority. Legacy `[detection]` stays identity and needs its own plan (per `layer-support.md`).
+- **Legacy Detection (`[detection]`)**: removed in `a51d56c` on user request. The earlier reading of "the [yolo] layer" was only that classic `[yolo]` is the priority.
 - **Smoke tests**: deferred. Finish the code paths first; no training runs until the user asks.
 
 Carried over from earlier: after classic YOLO is verified, Region comes next.
@@ -127,6 +138,6 @@ Decided by user (interview on the convolutional layer, plus the earlier question
 - **FP8 eligibility**: every convolution except the one immediately before a detection or segmentation head, which stays FP32.
 - **Optimizer boundary**: convolution gradients must update natively on device before any smoke test. Host download at the optimizer boundary is not acceptable.
 - **Ordering**: FP8 policy comes after the detection heads. Native vs ONNX comparisons come after all code is done.
-- **Staged files outside `src/`**: the user asked for an explanation before deciding. Still pending.
+- **Staged files outside `src/`**: resolved. They are committed in `ed7fcae`.
 
 Next: build and run the commands above, fix Oxide codegen issues in the new YOLO kernels, then add device-seed GPU parity tests against the host seed path and the reference baseline (extra anchors, objectness smoothing, `new_coords`, truth-threshold positives, combined options, collisions, and invalid-option rejection). Test assignment, deltas and metrics against Rust CPU and, where practical, a compiled `raptor-fp4` golden. Run a short real-data smoke test only once the end-to-end path is wired. Do not transfer earlier test results to new changes.

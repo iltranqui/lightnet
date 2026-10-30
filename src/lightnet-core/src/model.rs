@@ -1221,6 +1221,8 @@ pub struct YoloSpec {
     pub delta_normalizer: f32,
     pub class_multipliers: Option<Vec<f32>>,
     pub class_map: Option<Vec<usize>>,
+    /// C++ `max`: truths beyond this per image are ignored by the loss (default 200).
+    pub max_boxes: usize,
 }
 
 /// NMS variants implemented for the legacy OBB decoder.
@@ -4217,12 +4219,39 @@ fn parse_layer_kind(
                     section.line
                 )));
             }
-            let mask = section.get_usize_list("mask")?;
+            // nms_kind, beta_nms, resize and random are accepted: shipped cfgs set them, and they do not
+            // change the classic loss (NMS is inference-only; resize/random are augmentation).
+            for key in [
+                "track_history_size",
+                "sim_thresh",
+                "dets_for_track",
+                "dets_for_show",
+                "track_ciou_norm",
+            ] {
+                if section.get(key).is_some() {
+                    return Err(Error::InvalidConfig(format!(
+                        "[yolo] at line {} {key} is not supported by the Rust port (tracking)",
+                        section.line
+                    )));
+                }
+            }
+            if section.get("embedding_layer").is_some() {
+                return Err(Error::InvalidConfig(format!(
+                    "[yolo] at line {} embedding_layer is not supported by the Rust port",
+                    section.line
+                )));
+            }
+            let mut mask = section.get_usize_list("mask")?;
+            // C++ make_yolo_layer(): `num` is the total anchor count; without `mask` the head uses anchors 0..num.
+            let num = section.get_usize("num", if mask.is_empty() { 1 } else { mask.len() })?;
+            if mask.is_empty() {
+                mask.extend(0..num);
+            }
             let classes = section.get_usize("classes", 20)?;
             let max_delta = section.get_f32("max_delta", f32::MAX)?;
             LayerKind::Yolo(YoloSpec {
                 classes,
-                num: mask.len().max(section.get_usize("num", 1)?),
+                num,
                 mask,
                 anchors: section.get_f32_list("anchors")?,
                 scale_x_y: section.get_f32("scale_x_y", 1.0)?,
@@ -4242,6 +4271,7 @@ fn parse_layer_kind(
                 delta_normalizer: section.get_f32("delta_normalizer", 1.0)?,
                 class_multipliers: parse_class_multipliers(section, classes, max_delta)?,
                 class_map: parse_class_map(section, cfg_parent)?,
+                max_boxes: section.get_usize("max", 200)?,
             })
         }
         "obb_yolo" => {
@@ -4400,6 +4430,7 @@ fn parse_layer_kind(
                     delta_normalizer: section.get_f32("delta_normalizer", 1.0)?,
                     class_multipliers: parse_class_multipliers(section, classes, max_delta)?,
                     class_map: parse_class_map(section, cfg_parent)?,
+                    max_boxes: section.get_usize("max", 200)?,
                 },
                 nms_kind,
             })
@@ -4437,6 +4468,7 @@ fn parse_layer_kind(
                 delta_normalizer: section.get_f32("delta_normalizer", 1.0)?,
                 class_multipliers: parse_class_multipliers(section, classes, max_delta)?,
                 class_map: parse_class_map(section, cfg_parent)?,
+                max_boxes: section.get_usize("max", 200)?,
             })
         }
         "region" => LayerKind::Region(RegionSpec {

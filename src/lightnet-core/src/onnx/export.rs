@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn decoded_detection_export_replaces_raw_heads_with_boxes_and_confs() {
-        let executable = build(CFG);
+        let executable = build(DECODE_CFG);
         let export = |decode_detections| export_onnx(
             &executable.network,
             &executable.params,
@@ -811,6 +811,205 @@ mod tests {
             assert!(actual.contains(&op.to_owned()), "missing {op}");
         }
         assert!(contains(&decoded, "boxes") && contains(&decoded, "confs"));
+    }
+
+    // One 16x16 head with 2 classes: a 1x1 conv to 7 = 1 mask * (5 + 2) channels.
+    const DECODE_CFG: &str = "\n[net]\nwidth=16\nheight=16\nchannels=3\nbatch=1\n\n[convolutional]\nfilters=7\nsize=1\nstride=1\npad=0\nactivation=linear\n\n[yolo]\nmask=0\nanchors=2,3\nclasses=2\nnum=1\n";
+
+    #[test]
+    fn decoded_detection_export_fp32_nchw() {
+        let executable = build(DECODE_CFG);
+        let options = OnnxOptions { decode_detections: true, fp16: false, nhwc: false, ..OnnxOptions::default() };
+        let bytes = export_onnx(&executable.network, &executable.params, &options).unwrap();
+        let mut found = Vec::new();
+        for (field, wire) in graph(&bytes) {
+            let Wire::Len(info) = wire else { continue };
+            if field != 11 && field != 12 {
+                continue;
+            }
+            let info = decode(&info);
+            let name = info.iter().find_map(|(f, w)| match (f, w) {
+                (1, Wire::Len(v)) => Some(String::from_utf8(v.clone()).unwrap()),
+                _ => None,
+            }).unwrap();
+            let ty = info.iter().find_map(|(f, w)| match (f, w) {
+                (2, Wire::Len(v)) => Some(decode(v)),
+                _ => None,
+            }).unwrap();
+            let tensor = ty.iter().find_map(|(f, w)| match (f, w) {
+                (1, Wire::Len(v)) => Some(decode(v)),
+                _ => None,
+            }).unwrap();
+            let elem = tensor.iter().find_map(|(f, w)| match (f, w) {
+                (1, Wire::Varint(v)) => Some(*v as i64),
+                _ => None,
+            }).unwrap();
+            let shape = tensor.iter().find_map(|(f, w)| match (f, w) {
+                (2, Wire::Len(v)) => Some(decode(v)),
+                _ => None,
+            }).unwrap();
+            let dims: Vec<String> = shape.iter().filter_map(|(f, w)| match (f, w) {
+                (1, Wire::Len(v)) => Some(decode(v).iter().find_map(|(f, w)| match (f, w) {
+                    (1, Wire::Varint(d)) => Some(d.to_string()),
+                    (2, Wire::Len(p)) => Some(String::from_utf8(p.clone()).unwrap()),
+                    _ => None,
+                }).unwrap()),
+                _ => None,
+            }).collect();
+            found.push((name, elem, dims.join(",")));
+        }
+        assert_eq!(found, vec![
+            ("input".to_owned(), 1, "batch,3,16,16".to_owned()),
+            ("boxes".to_owned(), 1, "batch,256,1,4".to_owned()),
+            ("confs".to_owned(), 1, "batch,256,2".to_owned()),
+        ]);
+    }
+
+    #[test]
+    fn decoded_detection_export_fp32_nhwc() {
+        let executable = build(DECODE_CFG);
+        let options = OnnxOptions { decode_detections: true, fp16: false, nhwc: true, ..OnnxOptions::default() };
+        let bytes = export_onnx(&executable.network, &executable.params, &options).unwrap();
+        let mut found = Vec::new();
+        for (field, wire) in graph(&bytes) {
+            let Wire::Len(info) = wire else { continue };
+            if field != 11 && field != 12 {
+                continue;
+            }
+            let info = decode(&info);
+            let name = info.iter().find_map(|(f, w)| match (f, w) {
+                (1, Wire::Len(v)) => Some(String::from_utf8(v.clone()).unwrap()),
+                _ => None,
+            }).unwrap();
+            let ty = info.iter().find_map(|(f, w)| match (f, w) {
+                (2, Wire::Len(v)) => Some(decode(v)),
+                _ => None,
+            }).unwrap();
+            let tensor = ty.iter().find_map(|(f, w)| match (f, w) {
+                (1, Wire::Len(v)) => Some(decode(v)),
+                _ => None,
+            }).unwrap();
+            let elem = tensor.iter().find_map(|(f, w)| match (f, w) {
+                (1, Wire::Varint(v)) => Some(*v as i64),
+                _ => None,
+            }).unwrap();
+            let shape = tensor.iter().find_map(|(f, w)| match (f, w) {
+                (2, Wire::Len(v)) => Some(decode(v)),
+                _ => None,
+            }).unwrap();
+            let dims: Vec<String> = shape.iter().filter_map(|(f, w)| match (f, w) {
+                (1, Wire::Len(v)) => Some(decode(v).iter().find_map(|(f, w)| match (f, w) {
+                    (1, Wire::Varint(d)) => Some(d.to_string()),
+                    (2, Wire::Len(p)) => Some(String::from_utf8(p.clone()).unwrap()),
+                    _ => None,
+                }).unwrap()),
+                _ => None,
+            }).collect();
+            found.push((name, elem, dims.join(",")));
+        }
+        assert_eq!(found, vec![
+            ("input".to_owned(), 1, "batch,16,16,3".to_owned()),
+            ("boxes".to_owned(), 1, "batch,256,1,4".to_owned()),
+            ("confs".to_owned(), 1, "batch,256,2".to_owned()),
+        ]);
+    }
+
+    #[test]
+    fn decoded_detection_export_fp16_nchw() {
+        let executable = build(DECODE_CFG);
+        let options = OnnxOptions { decode_detections: true, fp16: true, nhwc: false, ..OnnxOptions::default() };
+        let bytes = export_onnx(&executable.network, &executable.params, &options).unwrap();
+        let mut found = Vec::new();
+        for (field, wire) in graph(&bytes) {
+            let Wire::Len(info) = wire else { continue };
+            if field != 11 && field != 12 {
+                continue;
+            }
+            let info = decode(&info);
+            let name = info.iter().find_map(|(f, w)| match (f, w) {
+                (1, Wire::Len(v)) => Some(String::from_utf8(v.clone()).unwrap()),
+                _ => None,
+            }).unwrap();
+            let ty = info.iter().find_map(|(f, w)| match (f, w) {
+                (2, Wire::Len(v)) => Some(decode(v)),
+                _ => None,
+            }).unwrap();
+            let tensor = ty.iter().find_map(|(f, w)| match (f, w) {
+                (1, Wire::Len(v)) => Some(decode(v)),
+                _ => None,
+            }).unwrap();
+            let elem = tensor.iter().find_map(|(f, w)| match (f, w) {
+                (1, Wire::Varint(v)) => Some(*v as i64),
+                _ => None,
+            }).unwrap();
+            let shape = tensor.iter().find_map(|(f, w)| match (f, w) {
+                (2, Wire::Len(v)) => Some(decode(v)),
+                _ => None,
+            }).unwrap();
+            let dims: Vec<String> = shape.iter().filter_map(|(f, w)| match (f, w) {
+                (1, Wire::Len(v)) => Some(decode(v).iter().find_map(|(f, w)| match (f, w) {
+                    (1, Wire::Varint(d)) => Some(d.to_string()),
+                    (2, Wire::Len(p)) => Some(String::from_utf8(p.clone()).unwrap()),
+                    _ => None,
+                }).unwrap()),
+                _ => None,
+            }).collect();
+            found.push((name, elem, dims.join(",")));
+        }
+        assert_eq!(found, vec![
+            ("input".to_owned(), 10, "batch,3,16,16".to_owned()),
+            ("boxes".to_owned(), 10, "batch,256,1,4".to_owned()),
+            ("confs".to_owned(), 10, "batch,256,2".to_owned()),
+        ]);
+    }
+
+    #[test]
+    fn decoded_detection_export_fp16_nhwc() {
+        let executable = build(DECODE_CFG);
+        let options = OnnxOptions { decode_detections: true, fp16: true, nhwc: true, ..OnnxOptions::default() };
+        let bytes = export_onnx(&executable.network, &executable.params, &options).unwrap();
+        let mut found = Vec::new();
+        for (field, wire) in graph(&bytes) {
+            let Wire::Len(info) = wire else { continue };
+            if field != 11 && field != 12 {
+                continue;
+            }
+            let info = decode(&info);
+            let name = info.iter().find_map(|(f, w)| match (f, w) {
+                (1, Wire::Len(v)) => Some(String::from_utf8(v.clone()).unwrap()),
+                _ => None,
+            }).unwrap();
+            let ty = info.iter().find_map(|(f, w)| match (f, w) {
+                (2, Wire::Len(v)) => Some(decode(v)),
+                _ => None,
+            }).unwrap();
+            let tensor = ty.iter().find_map(|(f, w)| match (f, w) {
+                (1, Wire::Len(v)) => Some(decode(v)),
+                _ => None,
+            }).unwrap();
+            let elem = tensor.iter().find_map(|(f, w)| match (f, w) {
+                (1, Wire::Varint(v)) => Some(*v as i64),
+                _ => None,
+            }).unwrap();
+            let shape = tensor.iter().find_map(|(f, w)| match (f, w) {
+                (2, Wire::Len(v)) => Some(decode(v)),
+                _ => None,
+            }).unwrap();
+            let dims: Vec<String> = shape.iter().filter_map(|(f, w)| match (f, w) {
+                (1, Wire::Len(v)) => Some(decode(v).iter().find_map(|(f, w)| match (f, w) {
+                    (1, Wire::Varint(d)) => Some(d.to_string()),
+                    (2, Wire::Len(p)) => Some(String::from_utf8(p.clone()).unwrap()),
+                    _ => None,
+                }).unwrap()),
+                _ => None,
+            }).collect();
+            found.push((name, elem, dims.join(",")));
+        }
+        assert_eq!(found, vec![
+            ("input".to_owned(), 10, "batch,16,16,3".to_owned()),
+            ("boxes".to_owned(), 10, "batch,256,1,4".to_owned()),
+            ("confs".to_owned(), 10, "batch,256,2".to_owned()),
+        ]);
     }
 
     #[test]
