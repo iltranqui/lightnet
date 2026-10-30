@@ -37,9 +37,9 @@ Current operator override: GPU layers first, edited directly in the main session
 
 State on 2026-10-27, from a static audit of source against the docs (no cargo run):
 
-- Latest versions: `v0.1.044` (CPU, DSConv multi-template) and `v0.2.202` (GPU, native DCNv4 large kernels). Next free numbers: `v0.1.045`, `v0.2.203`. Never reuse a number; confirm in `02_state/version-map.tsv`.
-- 23 commits sit after `v0.2.202`: layout refactors, `v0.1.043`, `v0.1.044`, the dcnv4 test fix (`a62e123`) and the Swin residency WIP (`0362bea`).
-- Wired in the runtime with no recorded pass: native GPU forward, backward and compact f32 for `wmhf`, `vit` training, `tucker_attention`, `mambavision`, `kimi_kda`, `depth_anything`, `dpt_head`. They come from WIP commits with no version. Only the Swin resident slice has results (`oxide_swin` 8/8, host `swin` 28/28).
+- Latest versions: `v0.1.044` (CPU, DSConv multi-template) and `v0.2.204` (GPU, ViT resident Muon and sparse MSA). Next free numbers: `v0.1.045`, `v0.2.205`. Never reuse a number; confirm in `02_state/version-map.tsv`.
+- 25 commits sit after `v0.2.202`: layout refactors, `v0.1.043`, `v0.1.044`, the dcnv4 test fix (`a62e123`), the Swin residency WIP (`0362bea`), and `v0.2.203`/`v0.2.204`.
+- Wired in the runtime with no recorded pass: native GPU forward, backward and compact f32 for `wmhf`, `tucker_attention`, `mambavision`, `kimi_kda`, `depth_anything`, `dpt_head`. They come from WIP commits with no version. `swin` (v0.2.203) and `vit` (v0.2.204) now have recorded passes.
 - No GPU arm: `yolo_3d`, `obb_refine`, GRU training with batch norm. Host-only on GPU: `vc_attention`, `recursive_block` variants other than static `channel_shuffle`, the `clifford` network-wide backward.
 - Host suite baseline is not green: four `cfg_corpus` cases are unresolved (two OOM at about 7 GiB, two 300 s timeouts). Do not claim a green host suite.
 - Details: [02_state/STATUS.md](02_state/STATUS.md) "Audit 2026-10-27", [02_state/layer-support.md](02_state/layer-support.md).
@@ -55,8 +55,8 @@ State on 2026-10-27, from a static audit of source against the docs (no cargo ru
 | Long backlog by area, with history | [todo.md](todo.md) |
 | Check whether X exists | [02_state/implemented.md](02_state/implemented.md), [02_state/layer-map.md](02_state/layer-map.md) |
 | GPU layer work | [03_plans/gpu/gpu_layers_plan.md](03_plans/gpu/gpu_layers_plan.md) |
-| Low-precision work | [03_plans/lowprec/AGENTS_fp8.md](03_plans/lowprec/AGENTS_fp8.md) |
-| LLM work | [03_plans/llm/AGENTS_LLM.md](03_plans/llm/AGENTS_LLM.md) |
+| Low-precision work (fp16, bf16, fp8; own roadmap and todo, versions from `v0.2.224`) | [03_plans/lowprec/ROADMAP_FP8.md](03_plans/lowprec/ROADMAP_FP8.md) |
+| LLM work (own roadmap and todo; versions from `v0.1.067` and `v0.2.227`) | [03_plans/llm/ROADMAP_LLM.md](03_plans/llm/ROADMAP_LLM.md) |
 | Any other plan | [03_plans/CONTEXT.md](03_plans/CONTEXT.md) |
 | Layer Port Contract, TDD recipe, source notes | [04_reference/CONTEXT.md](04_reference/CONTEXT.md) |
 | Past corrections | [lessons.md](lessons.md) |
@@ -112,10 +112,10 @@ Ordered checklist. Each item starts with the version it will ship as. `--` means
 
 The runtime already dispatches native forward, backward and compact f32 for these layers, but no pass is recorded. For each item: run the Oxide suite and the host filter, fix failures at the root cause, then commit, tag and document. Layer files live in `src/lightnet-core/src/layers/<layer>/`; run a suite with `cargo xtask oxide --test <suite>`.
 
-- [ ] v0.2.203 `swin`: version the resident SGD/Adam/AdamW slice (WIP `0362bea`). Run `oxide_swin` and host filter `swin`. Done when both pass and the version row exists.
-- [ ] v0.2.204 `vit`: native training forward/backward, compact f32, resident parameters. Run `oxide_vit` and host filter `vit`. Done when native training matches the CPU result and the host fallback is not used for supported variants.
-- [ ] v0.2.205 `tucker_attention`: run `oxide_tucker_attention`, host filter `tucker`.
-- [ ] v0.2.206 `mambavision`: run `oxide_mambavision`, host filter `mamba`.
+- [x] v0.2.203 `swin`: version the resident SGD/Adam/AdamW slice (WIP `0362bea`). Run `oxide_swin` and host filter `swin`. Done when both pass and the version row exists.
+- [x] v0.2.204 `vit`: native training forward/backward, compact f32, resident parameters. Run `oxide_vit` and host filter `vit`. Done when native training matches the CPU result and the host fallback is not used for supported variants.
+- [x] v0.2.205 `tucker_attention`: run `oxide_tucker_attention`, host filter `tucker`.
+- [x] v0.2.206 `mambavision`: run `oxide_mambavision`, host filter `mamba`.
 - [ ] v0.2.207 `kimi_kda`: run `oxide_kimi_kda`, host filter `kimi`.
 - [ ] v0.2.208 Resident parameters for v0.2.205 to v0.2.207: run `oxide_resident_params`.
 - [ ] v0.2.209 `depth_anything`: run `oxide_depth_anything`, host filter `depth_anything`. Head dimension above 128 stays on the CPU; say so in the docs.
@@ -174,7 +174,7 @@ Stop and report, without continuing, for:
 
 - the act-head training fix (executable C++ updates four parameter blocks, Rust uses only the CLS adjoint): the operator question is unanswered;
 - any push, pull request, history rewrite, or deletion of data;
-- any training run, convergence run, or the FP8 default decision (`03_plans/lowprec/AGENTS_fp8.md`);
+- any training run, convergence run, or the FP8 default decision (`03_plans/lowprec/ROADMAP_FP8.md`);
 - a failing test whose cause is unclear after one root-cause pass;
 - work outside this list: GUI, CARPN Stage-2 training, OBB GPU training, CUDA graph capture, `dcnv3` (no reference numerics), `detr_decoder` (C++ broken).
 
