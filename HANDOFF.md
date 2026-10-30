@@ -12,6 +12,32 @@ Updated: **2026-10-26**. Branch: `main`. Latest code: **`627d115`**.
 
 ## Stopped state
 
+**2026-10-27 Swin Muon continuation:** The supported native Swin path now
+retains its resident bank for Muon, including optional residual-projection
+matrix views, global gradient sanitization/clipping, AdamW fallback and mHC
+clamping. An initial focused device regression failed as expected because the
+old path rejected deferred Muon. After implementation, full `oxide_swin` passed
+9/9 (551.13s), host `swin` 28/28 and `runtime::` 332/332; concurrent task-doc
+reorganization overlapped that run. After the reorganization, host check and
+gpu-check passed again and `swin_resident_muon_deferred_updates_and_resume_match_cpu`
+passed 1/1 (83.75s), covering both projection layouts, two deferred updates and
+DNOPT resume. The post-reorganization host `swin` filter passed 28/28, host
+`runtime::` passed 332/332, and full `oxide_swin` passed 9/9 (545.15s).
+Commands used at most two build jobs, one GPU test thread and
+MemoryHigh=3G. The corpus was filtered out. These are Rust CPU-reference results,
+not a compiled-C++ golden or full Swin completion. The work remains uncommitted;
+unrelated staged moves and existing user changes were preserved.
+
+**2026-10-27 current-worktree verification:** On `main` at `0362bea` with
+the existing uncommitted ViT Muon, resident-parameter and unrelated user edits
+preserved, host `cargo xtask check` and `gpu-check` passed. The core `runtime::`
+filter passed **332/332** and the core `vit` filter passed **33/33**; both
+filtered out the cfg corpus. The full `oxide_vit` suite passed **8/8**
+(401.57s), including the resident Muon deferred-update comparison. Commands
+ran serially with two build jobs, one GPU test thread and MemoryHigh=3G.
+This is Rust CPU-reference evidence for the covered variants, not a C++ golden,
+full-suite result or proof of complete ViT support. MSA/VC remain open.
+
 **Explicitly resumed by the user, 2026-10-26.** The earlier stopped
 Cargo/cfg-corpus session `61558` is historical; do not poll that handle.
 Current resume evidence at `0e93bcb`: host check passed for core/CLI;
@@ -94,6 +120,18 @@ selected zero), and `oxide_dpt_head` passed **1/1** (68.88s). A requested fresh
 vit_gpu_muon_hybrid_backward_and_adamw_update_match_cpu` passed **1/1**
 (23.91s), comparing host-staged parameter gradients and GPU orthogonalization
 against CPU. It does not establish resident ViT Muon updates.
+
+Resident ViT Muon continuation at `2120c4f` plus this working tree: native
+forward now retains ViT's f32 master bank. Serialized matrix views follow the
+five matrices visited by the CPU Muon path. The device update applies ViT's
+layer-wide sanitize/clip policy, resident Muon momentum and orthogonalization,
+AdamW fallback, and mHC's 0.1 learning-rate/clamp policy. The focused resident
+test passed **1/1** (25.50s), checking gradients, deferred host-mirror stability,
+resident inference and synchronized weights against CPU. Full `oxide_vit`
+passed **8/8** (458.47s). Host check passed (5.82s), gpu-check passed (5.05s),
+and `PKGS=lightnet-core runtime::` passed **326/326** (22.98s; corpus selected
+zero). MSA/VC remain unsupported; this is a partial slice, not ViT or all-layer
+completion. No C++ golden or parity claim is made.
 
 The substantive objective remains full native GPU backward/updates, Muon,
 FP16 training and every-layer completion under `tasks/rust/AGENTS.md`.

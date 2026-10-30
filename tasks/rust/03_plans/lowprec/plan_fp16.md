@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust (workspace crates `lightnet-core`, `lightnet-cli`, `xtask`; non-workspace crate `lightnet-cuda-oxide`), cuda-oxide kernels, sm_89 GPU.
 
-**Spec:** [AGENTS_fp8.md](AGENTS_fp8.md) (goal and rules), section "Phase 1: fp16".
+**Spec:** [ROADMAP_FP8.md](ROADMAP_FP8.md) (goal and rules), section "Phase 1: fp16".
 
 ## Table of Contents
 

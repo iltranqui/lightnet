@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, cuda-oxide kernels (`mma_m16n8k32_fp8_*`, `cp.async`, `ldmatrix`), sm_89.
 
-**Spec:** [AGENTS_fp8.md](AGENTS_fp8.md), section "Phase 3: fp8", and [fp8_fp4.md](fp8_fp4.md) (earlier fp8 design, Phase D numbers). Do Phases 1 and 2 first ([plan_fp16.md](plan_fp16.md), [plan_bf16.md](plan_bf16.md)); Tasks 4 and 6 depend on plan_bf16 Tasks 2 and 6.
+**Spec:** [ROADMAP_FP8.md](ROADMAP_FP8.md), section "Phase 3: fp8", and [fp8_fp4.md](fp8_fp4.md) (earlier fp8 design, Phase D numbers). Do Phases 1 and 2 first ([plan_fp16.md](plan_fp16.md), [plan_bf16.md](plan_bf16.md)); Tasks 4 and 6 depend on plan_bf16 Tasks 2 and 6.
 
 ## Table of Contents
 
@@ -246,8 +246,8 @@ Open issues:
 Issues outside the fp8 path that affect how fp8 work is verified or committed. Recorded here so they are not lost; none is fixed by the fp8 work.
 
 - **Default `cargo xtask clippy` fails.** Three `approx_constant` errors in `src/lightnet-core/src/vc_attention.rs`, which this work does not touch. Touched crates (`xtask`, `lightnet-cuda-oxide`) are clean on their own (source: `implemented.md`, section 237).
-- **Default `cargo xtask test` status unverified.** `implemented.md` (section 237) reports 77 core runtime test-harness errors; `AGENTS_fp8.md` says commit `37ec4b5` made it compile again. Not re-run in this session. Re-check before citing host tests as a gate.
-- **Flaky bf16 parity test.** `oxide_half` `gemm_bf16_parity_all_transposes_alignments_alpha_beta` failed once on `OxideBackend::new()` and passed in 10 later runs; cause unknown (source: `AGENTS_fp8.md`, Current state). Blocks Phase 2 verification.
+- **Default `cargo xtask test` status unverified.** `implemented.md` (section 237) reports 77 core runtime test-harness errors; `ROADMAP_FP8.md` says commit `37ec4b5` made it compile again. Not re-run in this session. Re-check before citing host tests as a gate.
+- **Flaky bf16 parity test.** `oxide_half` `gemm_bf16_parity_all_transposes_alignments_alpha_beta` failed once on `OxideBackend::new()` and passed in 10 later runs; cause unknown (source: `ROADMAP_FP8.md`, Current state). Blocks Phase 2 verification.
 - **Uncommitted user edit in `src/lightnet-core/src/runtime/mod.rs`** (28 lines, not ours). It was present at the start of the session and is not staged. Commits must stage only named hunks.
 - **Uncommitted bench test** `gemm_bench_low_precision_lego_kernels` in `src/lightnet-cuda-oxide/tests/oxide_gemm_bench.rs`. Ours; needs a commit once accepted.
 - **`bench/` folder untracked.** Haiku-written; the script has not been run end to end (see the Progress section for the two undecided items).

@@ -62,7 +62,7 @@ Current gaps and completed CPU work (see `implemented.md`, `todo.md`, `layer-sup
 
 Already done within documented CPU-reference bounds, do not blindly re-plan those ports (`vit` also has a native inference forward since v0.2.198): `vit`/`vc_attention`, `swin`/`transformer`, `tucker_attention`, `mambavision`, `kimi_kda` (MiniMax sparse attention is a shared option), `dcnv4`, `laya_*`. This does not close native GPU work or the act-head training/loading gaps above.
 
-Not dispatched from this GPU-layer queue (still in `todo.md`): GUI, CARPN Stage-2 training and `detector train -map`, OBB GPU training/`-map`, CUDA graph capture (conditional; see `AGENTS_fp8.md`), and convergence runs. FP8/FP4 is a separate active goal in `AGENTS_fp8.md`, not part of this queue.
+Not dispatched from this GPU-layer queue (still in `todo.md`): GUI, CARPN Stage-2 training and `detector train -map`, OBB GPU training/`-map`, CUDA graph capture (conditional; see `ROADMAP_FP8.md`), and convergence runs. FP8/FP4 is a separate active goal in `ROADMAP_FP8.md`, not part of this queue.
 
 Blocked: `dcnv3` (no reference numerics); `detr_decoder` (C++ broken).
 

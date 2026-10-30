@@ -63,9 +63,10 @@ Full rule set lives in `tasks/rust/AGENTS.md`.
 - Delete model weights and other big files from the repository when they are no longer needed.
 - Do not archive or remove completed plans in tasks/rust/; keep them, since they are the project roadmap needed for development.
 - Prefer `cargo xtask` subcommands over raw commands when running or testing this project; they are documented in CLAUDE.md.
-- After testing a new feature and confirming it works correctly, commit the change with the feature tag, as specified in AGENTS.md and AGENTS_fp8.md.
+- After testing a new feature and confirming it works correctly, commit the change with the feature tag, as specified in AGENTS.md and ROADMAP_FP8.md.
 - Limit all builds and checks to a maximum of 4 threads in this project (`JOBS=4 MEM=4G cargo xtask ...`).
 - Do code edits and refactors in the main session with shell tools, `Edit` and `Write`; no Python scripts and no subagents unless the user asks.
 - Run `cargo xtask check` (4 threads) after each layer when moving layer code, not only at the end.
 - Each layer's CPU reference and GPU runtime glue live together in `src/lightnet-core/src/layers/<layer>/` (`cpu.rs`, `gpu.rs`, `mod.rs`); `lib.rs` re-exports the old paths. Oxide kernels stay in `lightnet-cuda-oxide`, which depends on `lightnet-core` and cannot host CPU code.
+- Run all new codex tasks with model gpt-6.1-terra at medium reasoning effort.
 <!-- end claude-reflect -->

@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust, cuda-oxide kernels (`cuda_device::convert::cvt_bf16x2_f32`, `mma_m16n8k16_f32_bf16`), sm_89.
 
-**Spec:** [AGENTS_fp8.md](AGENTS_fp8.md), section "Phase 2: bf16". Do Phase 1 ([plan_fp16.md](plan_fp16.md)) first.
+**Spec:** [ROADMAP_FP8.md](ROADMAP_FP8.md), section "Phase 2: bf16". Do Phase 1 ([plan_fp16.md](plan_fp16.md)) first.
 
 ## Table of Contents
 
