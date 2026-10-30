@@ -1670,6 +1670,156 @@ fn smoothed_target(is_positive: bool, epsilon: f32) -> f32 {
     }
 }
 
+/// Truth row width of the dense box-table heads (`float_to_box` + class id +
+/// padding), as `[yolox]`, `[ppyoloe]`, `[yolonas]` and `[centernet]` read it.
+const DENSE_TRUTH_SIZE: usize = 6;
+
+/// Per-layer truth tensors for the dense box-table heads.
+///
+/// Every `[yolox]`, `[ppyoloe]`, `[yolonas]` and `[centernet]` layer gets
+/// `batch` images of `max * truth_size` floats: the labels in image-normalized
+/// `x, y, w, h, class` order, then an all-zero row (C++ stops at the first row
+/// whose `x` is zero, which is how a short list is terminated). Other layers get
+/// `None`, which is what [`crate::dense_loss::compute_dense_training_loss_at`]
+/// expects.
+///
+/// Labels beyond the head's `max` are dropped, matching C++'s truth loop.
+pub fn dense_head_truth(
+    network: &Network,
+    labels: &[Vec<YoloLabel>],
+) -> Result<Vec<Option<Tensor>>> {
+    let batch = network.net.batch.max(1);
+    if labels.len() != batch {
+        return Err(Error::InvalidConfig(format!(
+            "dense truth batch mismatch: expected {batch}, got {}",
+            labels.len()
+        )));
+    }
+    let mut truth = vec![None; network.layers.len()];
+    for layer in &network.layers {
+        let max_boxes = match &layer.kind {
+            LayerKind::Yolox(spec) | LayerKind::Ppyoloe(spec) | LayerKind::Yolonas(spec) => {
+                spec.max_boxes
+            }
+            LayerKind::CenterNet(spec) => spec.max_boxes,
+            _ => continue,
+        };
+        let rows = max_boxes * DENSE_TRUTH_SIZE;
+        let mut data = vec![0.0f32; batch * rows];
+        for (image, image_labels) in labels.iter().enumerate() {
+            for (row, label) in image_labels.iter().take(max_boxes).enumerate() {
+                let at = image * rows + row * DENSE_TRUTH_SIZE;
+                data[at..at + 5].copy_from_slice(&[
+                    label.x,
+                    label.y,
+                    label.w,
+                    label.h,
+                    label.class_id as f32,
+                ]);
+            }
+        }
+        truth[layer.index] = Some(Tensor::from_data(
+            TensorShape::new(rows, 1, 1, batch),
+            data,
+        )?);
+    }
+    Ok(truth)
+}
+
+/// True for a network whose only detection heads are the dense box-table heads.
+pub fn network_uses_dense_heads(network: &Network) -> bool {
+    network.layers.iter().any(|layer| {
+        matches!(
+            layer.kind,
+            LayerKind::Yolox(_)
+                | LayerKind::Ppyoloe(_)
+                | LayerKind::Yolonas(_)
+                | LayerKind::CenterNet(_)
+        )
+    })
+}
+
+/// One optimiser step for a network whose heads are `[yolox]`, `[ppyoloe]`,
+/// `[yolonas]` or `[centernet]`.
+///
+/// The step builds the head truth with [`dense_head_truth`], takes the deltas
+/// from [`crate::dense_loss::compute_dense_training_loss_at`], feeds them to
+/// `backward_accumulate_seeded` and applies the configured optimizer (Muon,
+/// Adam or SGD with momentum/decay). Mixed networks that also carry a classic
+/// `[yolo]` head are rejected: that head needs its own assignment step.
+pub fn train_dense_head_batch_step(
+    executable: &mut ExecutableNetwork,
+    input: &Tensor,
+    labels: &[Vec<YoloLabel>],
+    iteration: usize,
+    learning_rate: f32,
+) -> Result<crate::dense_loss::DenseTrainingLoss> {
+    let network = &executable.network;
+    if !network_uses_dense_heads(network) {
+        return Err(Error::InvalidConfig(
+            "dense training requires a [yolox], [ppyoloe], [yolonas] or [centernet] head"
+                .to_owned(),
+        ));
+    }
+    if network.layers.iter().any(|layer| {
+        matches!(
+            layer.kind,
+            LayerKind::Yolo(_) | LayerKind::ObbYolo(_) | LayerKind::GaussianYolo(_)
+        )
+    }) {
+        return Err(Error::InvalidConfig(
+            "dense training cannot mix dense heads with a classic YOLO head; use the YOLO batch step"
+                .to_owned(),
+        ));
+    }
+    if network.net.subdivisions.max(1) != 1 {
+        return Err(Error::InvalidConfig(
+            "dense CPU batch-step helper requires subdivisions=1".to_owned(),
+        ));
+    }
+    if input.shape != network.net.input_shape() {
+        return Err(Error::InvalidConfig(
+            "dense training batch tensor shape does not match the network".to_owned(),
+        ));
+    }
+    if !learning_rate.is_finite() || learning_rate < 0.0 {
+        return Err(Error::InvalidConfig(
+            "dense training learning rate must be finite and non-negative".to_owned(),
+        ));
+    }
+
+    executable.zero_train_buffers();
+    let forward = executable.forward_training(input)?;
+    let truth = dense_head_truth(&executable.network, labels)?;
+    let loss = crate::dense_loss::compute_dense_training_loss_at(
+        &executable.network,
+        &forward,
+        input,
+        &truth,
+        iteration,
+    )?;
+    if loss.layer_output_gradient_seeds.iter().all(Option::is_none) {
+        return Err(Error::InvalidConfig(
+            "dense training found no head with truth".to_owned(),
+        ));
+    }
+    executable.backward_accumulate_seeded(input, &forward, &loss.layer_output_gradient_seeds)?;
+    let batch = input.shape.batch.max(1);
+    if executable.network.net.muon {
+        executable.update_weights_muon(learning_rate, batch)?;
+    } else if executable.network.net.adam {
+        executable.update_weights_adam(learning_rate, batch)?;
+    } else {
+        executable.update_weights(
+            learning_rate,
+            executable.network.net.momentum,
+            executable.network.net.decay,
+            batch,
+        );
+    }
+    Ok(loss)
+}
+
 pub fn load_paths_file(path: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
     let path = path.as_ref();
     let text = fs::read_to_string(path)?;
@@ -4821,5 +4971,131 @@ mod tests {
         let seed = seeds[0].as_ref().expect("seed should remain present");
         assert_eq!(seed.data, vec![0.1, 0.2, 0.0, 0.0, 0.0, 0.0]);
         assert!(state.delta_rolling_std > 0.1);
+    }
+
+    fn dense_yolox_network(batch: usize) -> Network {
+        Network::from_config(
+            ConfigFile::parse_str(
+                "dense-yolox.cfg",
+                &format!(
+                    "[net]\nwidth=4\nheight=4\nchannels=1\nbatch={batch}\n\
+                     [convolutional]\nfilters=6\nsize=1\nactivation=linear\n\
+                     [yolox]\nclasses=1\nmax=4\n"
+                ),
+            )
+            .expect("cfg"),
+        )
+        .expect("network")
+    }
+
+    fn dense_deterministic_executable(batch: usize) -> ExecutableNetwork {
+        let mut executable = ExecutableNetwork::new(dense_yolox_network(batch));
+        let LayerParams::Convolutional(params) = &mut executable.params[0] else {
+            panic!("expected convolution params")
+        };
+        for (index, weight) in params.weights.iter_mut().enumerate() {
+            *weight = ((index as f32) * 0.37).sin() * 0.4;
+        }
+        for (index, bias) in params.biases.iter_mut().enumerate() {
+            *bias = ((index as f32) * 0.71).cos() * 0.15;
+        }
+        executable
+    }
+
+    #[test]
+    fn dense_head_truth_packs_labels_and_zeros_the_tail() {
+        let network = dense_yolox_network(2);
+        let labels = vec![
+            vec![YoloLabel { class_id: 0, x: 0.5, y: 0.25, w: 0.2, h: 0.3 }],
+            vec![
+                YoloLabel { class_id: 0, x: 0.1, y: 0.2, w: 0.05, h: 0.1 },
+                YoloLabel { class_id: 0, x: 0.8, y: 0.9, w: 0.1, h: 0.1 },
+            ],
+        ];
+        let truth = super::dense_head_truth(&network, &labels).expect("truth");
+        let rows = 4 * 6;
+        assert_eq!(truth.len(), network.layers.len());
+        assert!(truth[0].is_none(), "the convolution takes no truth");
+        let head = truth[1].as_ref().expect("head truth");
+        assert_eq!(head.data.len(), 2 * rows);
+        // Image 0: one label, then zero rows.
+        assert_eq!(&head.data[..5], &[0.5, 0.25, 0.2, 0.3, 0.0]);
+        assert!(head.data[6..rows].iter().all(|v| *v == 0.0));
+        // Image 1: two labels in rows 0 and 1.
+        assert_eq!(&head.data[rows..rows + 5], &[0.1, 0.2, 0.05, 0.1, 0.0]);
+        assert_eq!(&head.data[rows + 6..rows + 11], &[0.8, 0.9, 0.1, 0.1, 0.0]);
+        assert!(head.data[rows + 12..2 * rows].iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn dense_head_truth_rejects_a_batch_mismatch() {
+        let network = dense_yolox_network(2);
+        let err = super::dense_head_truth(&network, &[Vec::new()]).unwrap_err();
+        assert!(matches!(err, crate::error::Error::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn dense_head_step_updates_weights_and_matches_the_dense_loss_seeds() {
+        let mut executable = dense_deterministic_executable(1);
+        let before = executable.params[0].clone();
+        let input = Tensor::from_data(
+            executable.network.net.input_shape(),
+            (0..16).map(|i| ((i as f32) * 0.31).sin()).collect(),
+        )
+        .expect("input");
+        let labels = vec![vec![YoloLabel { class_id: 0, x: 0.5, y: 0.5, w: 0.25, h: 0.5 }]];
+
+        // The seeds and cost the step uses are the dense-loss ones.
+        let forward = executable.forward_training(&input).expect("forward");
+        let truth = super::dense_head_truth(&executable.network, &labels).expect("truth");
+        let reference = crate::dense_loss::compute_dense_training_loss_at(
+            &executable.network,
+            &forward,
+            &input,
+            &truth,
+            0,
+        )
+        .expect("dense loss");
+        assert!(reference.loss.is_finite() && reference.loss >= 0.0);
+        let head_seed = reference.layer_output_gradient_seeds[1]
+            .as_ref()
+            .expect("head seed");
+        assert!(head_seed.data.iter().all(|v| v.is_finite()));
+
+        let step = super::train_dense_head_batch_step(&mut executable, &input, &labels, 0, 0.05)
+            .expect("dense step");
+        assert_eq!(step.loss, reference.loss);
+        let after = &executable.params[0];
+        let LayerParams::Convolutional(before) = &before else { unreachable!() };
+        let LayerParams::Convolutional(after) = after else { unreachable!() };
+        assert!(
+            before.weights != after.weights || before.biases != after.biases,
+            "the dense step must change the convolution parameters"
+        );
+        assert!(after.weights.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn dense_head_step_rejects_networks_without_a_dense_head() {
+        let mut executable = ExecutableNetwork::new(
+            Network::from_config(
+                ConfigFile::parse_str(
+                    "classic-yolo.cfg",
+                    "[net]\nwidth=4\nheight=4\nchannels=1\nbatch=1\n\
+                     [convolutional]\nfilters=6\nsize=1\nactivation=linear\n\
+                     [yolo]\nmask=0\nanchors=2,3\nclasses=1\nnum=1\niou_loss=ciou\n",
+                )
+                .expect("cfg"),
+            )
+            .expect("network"),
+        );
+        let input = Tensor::from_data(
+            executable.network.net.input_shape(),
+            vec![0.5; 16],
+        )
+        .expect("input");
+        let err = super::train_dense_head_batch_step(&mut executable, &input, &[Vec::new()], 0, 0.1)
+            .unwrap_err();
+        assert!(matches!(err, crate::error::Error::InvalidConfig(_)));
     }
 }

@@ -23,6 +23,7 @@ use lightnet_core::{
 use lightnet_core::{
     compute_obb_yolo_training_deltas, load_obb_training_batch_with_flips_from_paths,
 };
+use lightnet_core::train::{dense_head_truth, network_uses_dense_heads};
 #[cfg(feature = "oxide")]
 use lightnet_cuda_oxide::OxideBackend;
 
@@ -2511,20 +2512,39 @@ fn run_detector_train_cpu(
             }
             pending_shape = Some(current_shape);
             let forward = executable.forward_training(&batch.input)?;
-            let yolo = compute_yolo_training_loss_with_state(
-                &executable.network,
-                &forward,
-                &batch.labels,
-                batch_num,
-                Some(&mut yolo_state),
-            )?;
-            iter_loss += yolo.loss;
-            executable.backward_accumulate_seeded_with_hf_auxiliary_gradients(
-                &batch.input,
-                &forward,
-                &yolo.layer_output_gradient_seeds,
-                &batch.labels,
-            )?;
+            if network_uses_dense_heads(&executable.network) {
+                // `[yolox]` / `[ppyoloe]` / `[yolonas]` / `[centernet]` heads take a
+                // per-head box-table truth and their own dense loss.
+                let truth = dense_head_truth(&executable.network, &batch.labels)?;
+                let dense = lightnet_core::compute_dense_training_loss_at(
+                    &executable.network,
+                    &forward,
+                    &batch.input,
+                    &truth,
+                    batch_num,
+                )?;
+                iter_loss += dense.loss;
+                executable.backward_accumulate_seeded(
+                    &batch.input,
+                    &forward,
+                    &dense.layer_output_gradient_seeds,
+                )?;
+            } else {
+                let yolo = compute_yolo_training_loss_with_state(
+                    &executable.network,
+                    &forward,
+                    &batch.labels,
+                    batch_num,
+                    Some(&mut yolo_state),
+                )?;
+                iter_loss += yolo.loss;
+                executable.backward_accumulate_seeded_with_hf_auxiliary_gradients(
+                    &batch.input,
+                    &forward,
+                    &yolo.layer_output_gradient_seeds,
+                    &batch.labels,
+                )?;
+            }
         }
         if executable.network.net.muon {
             executable.update_weights_muon(lr, images_per_iteration)?;
@@ -3154,12 +3174,26 @@ fn run_detector_train_gpu(
             let start = profile.as_ref().map(|_| Instant::now());
             // LIGHTNET_YOLO_GPU=1 opts into the native CIoU loss with device-resident
             // seeds; unsupported configurations fall back to the host loss.
-            let gpu_yolo = if std::env::var("LIGHTNET_YOLO_GPU").is_ok_and(|v| v != "0") {
+            let dense = if network_uses_dense_heads(&executable.network) {
+                let truth = dense_head_truth(&executable.network, &batch.labels)?;
+                Some(lightnet_core::compute_dense_training_loss_at(
+                    &executable.network,
+                    &forward.cpu_forward,
+                    &batch.input,
+                    &truth,
+                    batch_num,
+                )?)
+            } else {
+                None
+            };
+            let gpu_yolo = if dense.is_none()
+                && std::env::var("LIGHTNET_YOLO_GPU").is_ok_and(|v| v != "0")
+            {
                 executable.compute_yolo_training_loss_gpu(&forward, &batch.labels)?
             } else {
                 None
             };
-            let host_yolo = if gpu_yolo.is_none() {
+            let host_yolo = if dense.is_none() && gpu_yolo.is_none() {
                 Some(compute_yolo_training_loss_with_state(
                     &executable.network,
                     &forward.cpu_forward,
@@ -3174,7 +3208,11 @@ fn run_detector_train_gpu(
                 phase_ms[2] += start.elapsed().as_secs_f64() * 1000.0;
             }
             let start = profile.as_ref().map(|_| Instant::now());
-            if let Some(gpu) = &gpu_yolo {
+            if let Some(dense) = &dense {
+                iter_loss += dense.loss;
+                executable
+                    .backward_accumulate_seeded_gpu(&forward, &dense.layer_output_gradient_seeds)?;
+            } else if let Some(gpu) = &gpu_yolo {
                 iter_loss += gpu.loss;
                 executable.backward_accumulate_device_seeded_gpu(&forward, &gpu.device_seeds)?;
             } else if let Some(yolo) = &host_yolo {
