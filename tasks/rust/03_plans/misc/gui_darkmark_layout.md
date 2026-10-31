@@ -92,3 +92,12 @@ Verification for every step: `JOBS=4 MEM=4G cargo xtask check lightnet-gui`. Lau
 - Prediction mode is re-run only when `p`, the menu or an image load changes it. The load hook is in `load_current(LoadKind::Full)`, matching `DMContent.cpp:2537`: navigating re-detects when a model is loaded and predictions are not off. Not verified live (no weights in the test project).
 - The scrollfield follows the visible (filtered and sorted) list and rebuilds its rows on a worker thread when that list changes. DarkMark rebuilds after sort and filter apply; this port keeps the strip in sync every frame instead.
 - `image.scale` is written from the canvas fit/zoom at save time. DarkMark records the same number, but this port does not keep DarkMark's per-project cache database, so the launcher stats are recomputed from the sidecars on demand.
+
+## Not done in this pass
+
+Kept here so nothing looks finished that is not:
+
+- Launcher rows DarkMark shows that this port does not: directory size and cache size, last opened, exclusion regex, network dimensions from the cfg, darknet template. The thumbnail is missing too. The file list, the markup/negative/class/mark statistics and the buttons are there.
+- Hotkeys that are still mapped-but-unimplemented: mass delete (`o`), homography (`P`), merge (backtick), heatmaps (`h`/`H`), screenshots (`s`/`S`/F12), tiling (`t`, `[`, `]`, `(`, `)`), delete/undo-delete image (Shift+Del, Shift+U). They report their name in the status bubble instead of doing something.
+- DarkMark windows that have no equivalent yet: statistics, review, review-IoU, jump slider markers. Segmentor, OBB, cuboid and 3D projects remain unsupported by the sidecar layer.
+- Sidecar format is still JSON only; YAML stays an open question.
