@@ -38,6 +38,7 @@ usage: cargo xtask <cmd> [args...]
                         both datasets, all 8 exports (FP32/FP16 x NCHW/NHWC x activated/raw), one summary table each; add -all for every test image
   export_test_onnx_match [image] [flags]
                         ./tools/onnx_match.sh: LegoGears_v2 ONNX heads vs Rust runtime (needs python deps)
+  gui|g [args...]       cargo run --release -p lightnet-gui (egui DarkMark replacement); args go to the app
   fmt|f                 cargo fmt --all
   help                  this text
 
@@ -179,6 +180,14 @@ fn main() -> ExitCode {
             let mut v = vec!["./tools/onnx_match.sh".to_owned()];
             v.extend(rest.clone());
             return run(v, &mem, false);
+        }
+        "gui" | "g" => {
+            let mut v = cargo(&["run", "--release", "-j", &jobs], vec!["-p".into(), "lightnet-gui".into()]);
+            if !rest.is_empty() {
+                v.push("--".into());
+                v.extend(rest.clone());
+            }
+            v
         }
         "fmt" | "f" => vec!["cargo".into(), "fmt".into(), "--all".into()],
         "help" | "-h" | "--help" => {

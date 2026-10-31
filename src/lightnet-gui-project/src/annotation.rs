@@ -219,7 +219,9 @@ impl Annotation {
                     "unsupported annotation_mode {other}; only detector mode is handled"
                 ));
             }
-            None => return Err("missing annotation_mode".to_owned()),
+            // Pre-mode DarkMark sidecars (e.g. LegoGears_v2) have no key; DarkMark itself
+            // accepts them (`AnnotationJson.cpp:729`), so treat them as detector.
+            None => {}
         }
 
         let (image_width, image_height) = match object.get("image") {
@@ -488,6 +490,13 @@ mod tests {
             "no space indentation may remain"
         );
     }
+    #[test]
+    fn missing_annotation_mode_is_legacy_detector() {
+        let text = SAMPLE.replacen("\t\"annotation_mode\": \"detector\",\n", "", 1);
+        assert!(!text.contains("annotation_mode"));
+        assert!(Annotation::from_json(&text).is_ok());
+    }
+
 
     #[test]
     fn integer_mode_zero_is_detector_and_other_modes_are_rejected() {

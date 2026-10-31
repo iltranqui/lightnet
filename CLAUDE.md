@@ -49,6 +49,7 @@ Whole-repo map: [CONTEXT.md](CONTEXT.md).
 | `cargo xtask export_test_onnx_match` [image] [flags] | none | `tools/onnx_match.sh`: `tools/onnx_check.py` on LegoGears_v2 (raw YOLO heads vs Rust layer dumps; needs numpy, opencv, onnxruntime). Detection only; segmentation has its own commands below |
 | `cargo xtask export_test_onnx_match_segmentation_bin` / `export_test_onnx_match_segmentation_multi` [image] [-all --variants --cpu --fp16 --nhwc --raw -help] | none | `tools/onnx_match_seg.sh`: exports the trained model, runs it in ONNX Runtime (CPU) and compares the segmentation head (max error, class agreement) with `lightnet-rs segment-image` (native forward: oxide GPU when available, CPU fallback; `--cpu` forces CPU). Needs numpy, opencv, onnxruntime. Rust-runtime parity only |
 | `cargo xtask export_test_onnx_match_segmentation_all` [flags] | none | `tools/onnx_match_seg.sh both --variants`: both semantic datasets, every export variant (FP32/FP16 x NCHW/NHWC x activated/raw logits) against one native forward each, with a summary table. `-all` runs every test image. Same requirements |
+| `cargo xtask gui [args...]` | `g` | `cargo run --release -p lightnet-gui` (egui DarkMark replacement); args after the command go to the app |
 | `cargo xtask fmt` | `f` | `cargo fmt --all` |
 
 Every command exports the detected GPU arch as the advisory `CUDA_OXIDE_DEVICE_ARCH` (unless `CUDA_OXIDE_TARGET` or `CUDA_OXIDE_DEVICE_ARCH` is already set).

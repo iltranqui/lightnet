@@ -1003,6 +1003,12 @@ impl App {
                     let path = PathBuf::from(self.new_dir.clone());
                     self.open_project(&path);
                 }
+                if ui.button("Open folder...").clicked() {
+                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                        self.new_dir = folder.to_string_lossy().into_owned();
+                        self.open_project(&folder);
+                    }
+                }
                 if ui.button("New project…").clicked() {
                     self.show_new_project = true;
                 }

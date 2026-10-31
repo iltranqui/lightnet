@@ -18,5 +18,6 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 imageproc = "0.26.1"
 regex = "1"
 arboard = "3.6.1"
+rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal"] }
 serde.workspace = true
 serde_json.workspace = true
