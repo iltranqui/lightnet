@@ -10,6 +10,7 @@ Reference: [darkmark_gui_behavior.md](../../04_reference/darkmark_gui_behavior.m
 - [Phase 1: small independent fixes](#phase-1-small-independent-fixes)
 - [Implementation plan](#implementation-plan)
 - [Open questions](#open-questions)
+- [Not done in this pass](#not-done-in-this-pass)
 
 ## DarkMark layout reference
 
