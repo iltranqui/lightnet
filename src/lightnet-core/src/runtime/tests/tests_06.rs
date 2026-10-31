@@ -2554,19 +2554,14 @@ fn gpu_muon_respects_layer_update_gate_without_advancing_layer_state() {
 }
 
 #[test]
-fn gpu_muon_rejects_batch_normalized_convolution_eml_moe_dcnv4_and_deform_before_updating() {
+fn gpu_muon_updates_batch_normalized_convolution_on_device_and_rejects_eml_moe_dcnv4_and_deform() {
+    // A BN convolution with device params and gradient buffers takes the
+    // device-resident Muon arm (`gpu_conv_muon.rs`) instead of being rejected.
     let mut gpu = optimizer_net("muon=1\ndecoupled_decay=1");
-    let before = gpu.params.clone();
-    let error = gpu
-        .update_weights_gpu(0.01, 0.9, 0.0005, 2)
-        .expect_err("batch-normalized convolution Muon staging is not integrated yet");
-    assert!(
-        error
-            .to_string()
-            .contains("other parameter families remain explicitly unsupported")
-    );
-    assert_eq!(gpu.params, before);
-    assert_eq!(gpu.adam_step, 0);
+    assert!(gpu.device_conv_muon_eligible(0));
+    gpu.update_weights_gpu(0.01, 0.9, 0.0005, 2)
+        .expect("device convolution Muon update with batch normalization");
+    assert_eq!(gpu.adam_step, 1);
 
     let network = Network::from_config(
             ConfigFile::parse_str(

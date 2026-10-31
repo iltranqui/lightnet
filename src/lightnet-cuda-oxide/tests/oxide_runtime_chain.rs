@@ -8729,6 +8729,70 @@ fn native_yolo_loss_declines_unsupported_options() {
     }
 }
 
+/// Device-seed backward must update the weights exactly like the host-seed
+/// path: same `loss_scale`, `delta_normalizer`, and one loss-scale application.
+/// Both paths consume the native-loss seeds; only the seed transport differs
+/// (device buffer vs host download + upload).
+#[test]
+fn yolo_device_seed_backward_matches_host_seed_backward() {
+    use lightnet_core::YoloLabel;
+    let labels = vec![
+        YoloLabel { class_id: 0, x: 0.2, y: 0.2, w: 0.1, h: 0.1 },
+        YoloLabel { class_id: 1, x: 0.8, y: 0.7, w: 0.2, h: 0.15 },
+    ];
+    for extra in ["", "delta_normalizer=0.5"] {
+        let cfg = format!(
+            "[net]\nbatch=1\nwidth=16\nheight=16\nchannels=1\nloss_scale=8\n\
+             [convolutional]\nfilters=21\nsize=1\nactivation=linear\n\
+             [yolo]\nmask=0,1,2\nanchors=1,2, 3,4, 5,6\nclasses=2\nnum=3\niou_loss=ciou\n{extra}"
+        );
+        let mut host = GpuExecutableNetwork::new(network(&cfg), OxideBackend::new().expect("Oxide backend"));
+        fill_params(&mut host.params);
+        let mut device = GpuExecutableNetwork::new(network(&cfg), OxideBackend::new().expect("Oxide backend"));
+        device.params = host.params.clone();
+        let input = patterned(host.network.net.input_shape());
+
+        let host_forward = host.forward_training_with_state(&input).expect("host-path forward");
+        let device_forward = device.forward_training_with_state(&input).expect("device-path forward");
+        let host_loss = host
+            .compute_yolo_training_loss_gpu(&host_forward, std::slice::from_ref(&labels))
+            .expect("native loss")
+            .expect("native loss declined");
+        let device_loss = device
+            .compute_yolo_training_loss_gpu(&device_forward, std::slice::from_ref(&labels))
+            .expect("native loss")
+            .expect("native loss declined");
+
+        // Host-seed transport: download every device seed, hand it to the host entry point.
+        let host_seeds: Vec<Option<Tensor>> = host_loss
+            .device_seeds
+            .iter()
+            .enumerate()
+            .map(|(index, seed)| {
+                seed.as_ref().map(|seed| {
+                    let data = host.backend.download_f32(seed).expect("download seed");
+                    Tensor::from_data(host.network.layers[index].output_shape, data).expect("seed tensor")
+                })
+            })
+            .collect();
+        host.backward_accumulate_seeded_gpu(&host_forward, &host_seeds)
+            .expect("host-seed backward");
+        device
+            .backward_accumulate_device_seeded_gpu(&device_forward, &device_loss.device_seeds)
+            .expect("device-seed backward");
+        close(&format!("[{extra}] loss"), &[host_loss.loss], &[device_loss.loss], 0.0);
+
+        host.update_weights_gpu(0.01, 0.0, 0.0, 1).expect("host-path update");
+        device.update_weights_gpu(0.01, 0.0, 0.0, 1).expect("device-path update");
+        let (LayerParams::Convolutional(h), LayerParams::Convolutional(d)) = (&host.params[0], &device.params[0])
+        else {
+            panic!("convolution params expected");
+        };
+        close(&format!("[{extra}] conv weights"), &h.weights, &d.weights, 1e-6);
+        close(&format!("[{extra}] conv biases"), &h.biases, &d.biases, 1e-6);
+    }
+}
+
 /// FP8 policy: only the convolution immediately before a detection or
 /// segmentation head is held on the f32 path; every other conv still quantises.
 #[test]
@@ -8782,4 +8846,48 @@ fn fp8_policy_holds_the_head_boundary_conv_on_f32() {
             .any(|(a, b)| (a - b).abs() > 1e-4 * scale),
         "an ordinary convolution must keep the FP8 GEMMs"
     );
+}
+
+/// Device-resident convolution Muon (`runtime/gpu_conv_muon.rs`) against the
+/// Rust CPU Muon step: plain, grouped, and batch-normalized convolutions over
+/// two steps so the momentum carries. The CPU step is the oracle; there is no
+/// compiled `raptor-fp4` golden.
+#[test]
+fn conv_gpu_muon_device_update_matches_cpu_over_two_steps() {
+    for (name, conv_extra, tolerance) in [
+        ("plain", "", 8e-4),
+        ("grouped", "groups=2\n", 8e-4),
+        ("batch_normalize", "batch_normalize=1\n", 3e-3),
+    ] {
+        let cfg = format!(
+            "[net]\nwidth=4\nheight=4\nchannels=2\nbatch=1\nmuon=1\nadam=0\ndecoupled_decay=1\ndecay=0.01\nmuon_momentum=0.8\n\
+             [convolutional]\nfilters=4\nsize=3\npad=1\nactivation=linear\n{conv_extra}"
+        );
+        let mut cpu = ExecutableNetwork::new(network(&cfg));
+        fill_params(&mut cpu.params);
+        let mut gpu = GpuExecutableNetwork::new(network(&cfg), OxideBackend::new().expect("Oxide backend"));
+        gpu.params = cpu.params.clone();
+        let input = patterned(cpu.network.net.input_shape());
+        let seed = [Some(patterned(cpu.network.layers[0].output_shape))];
+        for step in 0..2 {
+            cpu.zero_train_buffers();
+            gpu.zero_train_buffers_gpu().expect("zero GPU conv Muon gradients");
+            let cpu_forward = cpu.forward_training(&input).expect("CPU conv forward");
+            let gpu_forward = gpu.forward_training_with_state(&input).expect("native conv forward");
+            cpu.backward_accumulate_seeded(&input, &cpu_forward, &seed).expect("CPU conv backward");
+            gpu.backward_accumulate_seeded_gpu(&gpu_forward, &seed).expect("native conv backward");
+            cpu.update_weights_muon(0.002, 1).expect("CPU conv Muon update");
+            gpu.update_weights_gpu(0.002, 0.0, 0.01, 1).expect("device conv Muon update");
+
+            let (LayerParams::Convolutional(c), LayerParams::Convolutional(g)) = (&cpu.params[0], &gpu.params[0])
+            else {
+                panic!("convolution params expected");
+            };
+            close(&format!("{name} Muon weights step {step}"), &c.weights, &g.weights, tolerance);
+            close(&format!("{name} Muon biases step {step}"), &c.biases, &g.biases, tolerance);
+            if let (Some(cb), Some(gb)) = (&c.batch_norm, &g.batch_norm) {
+                close(&format!("{name} Muon BN scales step {step}"), &cb.scales, &gb.scales, tolerance);
+            }
+        }
+    }
 }

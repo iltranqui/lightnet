@@ -78,6 +78,7 @@ mod gpu_dense_loss;
 mod gpu_yolo_loss;
 pub use gpu_yolo_loss::GpuYoloLoss;
 mod gpu_params;
+mod gpu_conv_muon;
 mod gpu_resident_params;
 pub(crate) use gpu_resident_params::{ResidentMomentSlot, ResidentParameterRange, ResidentParameterState};
 mod defaults;

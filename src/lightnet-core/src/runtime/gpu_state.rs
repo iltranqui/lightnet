@@ -471,6 +471,7 @@ where
         if version >= 6 {
             let mut muon_states = self.muon_state.clone();
             self.materialize_resident_muon_states(&mut muon_states)?;
+            self.materialize_device_conv_muon_states(&mut muon_states)?;
             let entries: Vec<usize> = muon_states
                 .iter()
                 .enumerate()

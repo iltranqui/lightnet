@@ -409,7 +409,7 @@ where
             let kind = &self.network.layers[*index].kind;
             match (kind, *params) {
                 (LayerKind::Convolutional(spec), LayerParams::Convolutional(_)) => {
-                    spec.batch_normalize
+                    spec.batch_normalize && !self.device_conv_muon_eligible(*index)
                 }
                 (LayerKind::EmlConvolutional(spec), LayerParams::EmlConvolutional(_)) => {
                     spec.branch.batch_normalize
@@ -466,8 +466,9 @@ where
         if !sync_host_weights && self.params.iter().enumerate().any(|(i,p)| {
             !matches!(p,LayerParams::None | LayerParams::DepthAnything(_))
                 && !resident_layers.get(i).copied().unwrap_or(false)
+                && !self.device_conv_muon_eligible(i)
         }) {
-            return Err(Error::InvalidConfig("deferred GPU Muon requires every trainable parameter family to use a resident bank; hybrid families require eager synchronization".into()));
+            return Err(Error::InvalidConfig("deferred GPU Muon requires every trainable parameter family to use a resident bank or the device convolution path; hybrid families require eager synchronization".into()));
         }
         let step = self
             .adam_step
@@ -520,11 +521,24 @@ where
             self.flush_device_dcnv4_gradients_to_host(Some(index))?;
         }
         self.update_resident_muon_parameters(&adam,loss_scale,ElementwiseLaunchConfig::default())?;
+        // Owning standard convolutions update fully on the device: no gradient
+        // download, no host weight upload (see `gpu_conv_muon.rs`).
+        let mut device_conv_done = vec![false; layer_count];
+        for index in 0..layer_count {
+            if !self.network.layers[index].train.updates_at(iteration_num, burn_in)
+                || resident_layers.get(index).copied().unwrap_or(false)
+            {
+                continue;
+            }
+            device_conv_done[index] =
+                self.update_device_conv_muon(index, &adam, loss_scale, sync_host_weights)?;
+        }
         let mut buffers = self.cpu_fallback_train_buffers.borrow_mut();
         for index in 0..layer_count {
             let layer = self.network.layers[index].clone();
             if !layer.train.updates_at(iteration_num, burn_in)
                 || resident_layers.get(index).copied().unwrap_or(false)
+                || device_conv_done[index]
                 || matches!(self.params[index], LayerParams::None)
                 || matches!(layer.kind, LayerKind::DepthAnything(_))
             {
