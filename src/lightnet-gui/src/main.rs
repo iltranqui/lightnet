@@ -459,11 +459,9 @@ impl App {
     }
 
     /// Loads the current image. `Quick` skips the sidecar and the detector, like
-    /// DarkMark's `load_image(..., full_load = false)`.
+    /// DarkMark's `load_image(..., full_load = false)`. The caller must have
+    /// saved the edits of the image it is leaving; see [`App::go_to`].
     fn load_current(&mut self, kind: LoadKind) {
-        if self.dirty {
-            self.save();
-        }
         let Some(project) = &self.project else {
             return;
         };
@@ -495,9 +493,15 @@ impl App {
         }
     }
 
-    /// Jumps to `index`. A quick load schedules the full load 500 ms later.
+    /// Jumps to `index`. The edits of the image being left are saved first: a
+    /// save writes to `self.index`, so moving the index before saving would put
+    /// them in the next image's sidecar. A failed save keeps the edits and
+    /// cancels the jump. A quick load schedules the full load 500 ms later.
     fn go_to(&mut self, index: usize, kind: LoadKind) {
         if self.project.is_none() {
+            return;
+        }
+        if self.dirty && !self.save() {
             return;
         }
         self.index = index;
@@ -514,7 +518,9 @@ impl App {
         };
         if started.elapsed() >= FULL_LOAD_DELAY {
             self.pending_full = None;
-            self.load_current(LoadKind::Full);
+            // Through `go_to` so an edit made during the quick load is saved
+            // instead of being overwritten by the full load.
+            self.go_to(self.index, LoadKind::Full);
         } else {
             ctx.request_repaint_after(FULL_LOAD_DELAY - started.elapsed());
         }
@@ -1263,7 +1269,13 @@ impl App {
             shift: input.modifiers.shift,
         });
         if response.drag_started() {
-            if let Some(pos) = response.interact_pointer_pos() {
+            // `drag_started()` only fires once the pointer has moved past the drag
+            // threshold, so the current position is not the press point; ask for
+            // it, otherwise the first few pixels of every box are lost.
+            let pressed = ui
+                .input(|input| input.pointer.press_origin())
+                .or_else(|| response.interact_pointer_pos());
+            if let Some(pos) = pressed {
                 if mods.ctrl {
                     self.pan_start = Some((self.pan, pos));
                 } else {
@@ -1292,11 +1304,18 @@ impl App {
         if response.drag_stopped() {
             if mods.ctrl && self.pan_start.take().is_some() {
                 // pan ended
-            } else if let (Some(_start), Some(pos)) = (self.drag_start.take(), self.drag_now.take())
-                && let Some(editor) = self.editor.as_mut()
-                && editor.release(to_image(pos))
-            {
-                self.dirty = true;
+            } else {
+                // The release position is newer than the last drag frame's.
+                let position = ui
+                    .input(|input| input.pointer.latest_pos())
+                    .or_else(|| response.interact_pointer_pos())
+                    .or(self.drag_now);
+                if let (Some(_start), Some(pos)) = (self.drag_start.take(), position)
+                    && let Some(editor) = self.editor.as_mut()
+                    && editor.release(to_image(pos))
+                {
+                    self.dirty = true;
+                }
             }
         } else if response.clicked()
             && let Some(pos) = response.interact_pointer_pos()
