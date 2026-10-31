@@ -27,69 +27,7 @@ impl GradMode {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Tensor {
-    pub shape: TensorShape,
-    pub data: Vec<f32>,
-}
-
-impl Tensor {
-    pub fn zeros(shape: TensorShape) -> Self {
-        Self {
-            shape,
-            data: vec![0.0; shape.batch * shape.element_count()],
-        }
-    }
-
-    pub fn filled(shape: TensorShape, value: f32) -> Self {
-        Self {
-            shape,
-            data: vec![value; shape.batch * shape.element_count()],
-        }
-    }
-
-    pub fn from_data(shape: TensorShape, data: Vec<f32>) -> Result<Self> {
-        let expected = shape.batch * shape.element_count();
-        if data.len() != expected {
-            return Err(Error::InvalidConfig(format!(
-                "tensor data length mismatch: expected {expected}, got {}",
-                data.len()
-            )));
-        }
-        Ok(Self { shape, data })
-    }
-
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
-    }
-
-    pub(super) fn channel_area(&self) -> usize {
-        self.shape.width * self.shape.height
-    }
-
-    pub(super) fn batch_stride(&self) -> usize {
-        self.shape.channels * self.channel_area()
-    }
-
-    pub(crate) fn offset(&self, batch: usize, channel: usize, y: usize, x: usize) -> usize {
-        // Keep the indexing formula in one place.  CPU layers and host-side
-        // GPU checks then cannot accidentally interpret this tensor as NHWC.
-        batch * self.batch_stride() + channel * self.channel_area() + y * self.shape.width + x
-    }
-
-    pub fn get(&self, batch: usize, channel: usize, y: usize, x: usize) -> f32 {
-        self.data[self.offset(batch, channel, y, x)]
-    }
-
-    pub fn set(&mut self, batch: usize, channel: usize, y: usize, x: usize, value: f32) {
-        let idx = self.offset(batch, channel, y, x);
-        self.data[idx] = value;
-    }
-}
+pub use crate::model::Tensor;
 
 impl From<PlanarRgbImage> for Tensor {
     fn from(value: PlanarRgbImage) -> Self {

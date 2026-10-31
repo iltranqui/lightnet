@@ -7,10 +7,10 @@
 use crate::error::{Error, Result};
 use crate::model::{
     Activation, CliffordContextMode, CliffordGffnMode, CliffordGlobalOp, CliffordHigherMode,
-    CliffordInteractionMode, CliffordSpec, ConvolutionalSpec, TensorShape,
+    CliffordInteractionMode, CliffordSpec, ConvolutionalSpec, Tensor, TensorShape,
 };
 use crate::runtime::{
-    BatchNormParams, BatchNormTrainBuffers, ConvolutionalParams, ConvolutionalTrainBuffers, Tensor,
+    BatchNormParams, BatchNormTrainBuffers, ConvolutionalParams, ConvolutionalTrainBuffers,
     WmhfConvRuntimeCache, backward_wmhf_convolution, forward_wmhf_convolution,
 };
 

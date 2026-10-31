@@ -54,6 +54,7 @@ pub use dense_loss::{
 pub use dpt_head::DptHeadWeights;
 pub(crate) use layers::deconvolutional;
 pub mod detect;
+pub(crate) mod detection_geometry;
 pub(crate) use layers::eml_conv_math;
 pub mod error;
 pub mod evaluate;
@@ -125,6 +126,7 @@ pub(crate) use layers::shortcut_weights;
 pub(crate) use layers::swin;
 pub(crate) use layers::swin::block as swin_block;
 pub mod train;
+pub mod training_types;
 pub(crate) use layers::tucker_attention;
 pub(crate) use layers::vc_attention;
 pub(crate) use layers::vit;

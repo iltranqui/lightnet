@@ -45,6 +45,70 @@ impl Display for TensorShape {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct Tensor {
+    pub shape: TensorShape,
+    pub data: Vec<f32>,
+}
+
+impl Tensor {
+    pub fn zeros(shape: TensorShape) -> Self {
+        Self {
+            shape,
+            data: vec![0.0; shape.batch * shape.element_count()],
+        }
+    }
+
+    pub fn filled(shape: TensorShape, value: f32) -> Self {
+        Self {
+            shape,
+            data: vec![value; shape.batch * shape.element_count()],
+        }
+    }
+
+    pub fn from_data(shape: TensorShape, data: Vec<f32>) -> Result<Self> {
+        let expected = shape.batch * shape.element_count();
+        if data.len() != expected {
+            return Err(Error::InvalidConfig(format!(
+                "tensor data length mismatch: expected {expected}, got {}",
+                data.len()
+            )));
+        }
+        Ok(Self { shape, data })
+    }
+
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    pub(crate) fn channel_area(&self) -> usize {
+        self.shape.width * self.shape.height
+    }
+
+    pub(crate) fn batch_stride(&self) -> usize {
+        self.shape.channels * self.channel_area()
+    }
+
+    pub(crate) fn offset(&self, batch: usize, channel: usize, y: usize, x: usize) -> usize {
+        // Keep the indexing formula in one place.  CPU layers and host-side
+        // GPU checks then cannot accidentally interpret this tensor as NHWC.
+        batch * self.batch_stride() + channel * self.channel_area() + y * self.shape.width + x
+    }
+
+    pub fn get(&self, batch: usize, channel: usize, y: usize, x: usize) -> f32 {
+        self.data[self.offset(batch, channel, y, x)]
+    }
+
+    pub fn set(&mut self, batch: usize, channel: usize, y: usize, x: usize, value: f32) {
+        let idx = self.offset(batch, channel, y, x);
+        self.data[idx] = value;
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct NetConfig {
     pub width: usize,
     pub height: usize,
@@ -772,12 +836,12 @@ pub struct DepthAnythingSpec {
     /// Resolved path and layer-only tensors from cfg `weights=`. Such weights
     /// are excluded from the network's sequential checkpoint stream.
     pub weights_path: Option<PathBuf>,
-    pub external_weights: Option<crate::depth_anything::DepthAnythingWeights>,
+    pub external_weights: Option<crate::depth_anything::geometry::DepthAnythingWeights>,
 }
 
 impl DepthAnythingSpec {
-    pub fn geometry(&self, input: TensorShape) -> crate::depth_anything::DepthAnythingGeometry {
-        crate::depth_anything::DepthAnythingGeometry {
+    pub fn geometry(&self, input: TensorShape) -> crate::depth_anything::geometry::DepthAnythingGeometry {
+        crate::depth_anything::geometry::DepthAnythingGeometry {
             batch: input.batch,
             height: input.height,
             width: input.width,
@@ -811,8 +875,8 @@ pub struct DptHeadSpec {
 }
 
 impl DptHeadSpec {
-    pub(crate) fn geometry(&self, input: TensorShape) -> crate::dpt_head::DptHeadGeometry {
-        crate::dpt_head::DptHeadGeometry {
+    pub(crate) fn geometry(&self, input: TensorShape) -> crate::dpt_head::geometry::DptHeadGeometry {
+        crate::dpt_head::geometry::DptHeadGeometry {
             batch: input.batch,
             height: input.height,
             width: input.width,
@@ -2094,7 +2158,7 @@ impl Layer {
                     return None;
                 }
                 let geometry = spec.geometry(self.input_shape);
-                let entries = crate::depth_anything::weight_array_sizes(&geometry)
+                let entries = crate::depth_anything::geometry::weight_array_sizes(&geometry)
                     .expect("validated depth_anything weight geometry")
                     .into_iter()
                     .map(|(name, len)| WeightsEntry {
@@ -2106,7 +2170,7 @@ impl Layer {
             }
             LayerKind::DptHead(spec) => {
                 let geometry = spec.geometry(self.input_shape);
-                let layout = crate::dpt_head::dpt_head_weight_layout(geometry)
+                let layout = crate::dpt_head::geometry::dpt_head_weight_layout(geometry)
                     .expect("validated dpt_head weight geometry");
                 Some(LayerWeights {
                     entries: layout
@@ -2114,7 +2178,7 @@ impl Layer {
                         .iter()
                         .enumerate()
                         .map(|(slot, range)| WeightsEntry {
-                            array: WeightsArray::Named(crate::dpt_head::dpt_weight_slot_name(slot)),
+                            array: WeightsArray::Named(crate::dpt_head::geometry::dpt_weight_slot_name(slot)),
                             len: range.len,
                         })
                         .collect(),
@@ -2431,7 +2495,7 @@ impl Layer {
             }
             LayerKind::TuckerAttention(spec) => {
                 let channels = self.input_shape.channels;
-                let weights = crate::tucker_attention::tucker_weight_count(
+                let weights = crate::tucker_attention::geometry::tucker_weight_count(
                     channels,
                     spec.heads,
                     spec.rank_q,
@@ -2454,7 +2518,7 @@ impl Layer {
                 })
             }
             LayerKind::MambaVision(spec) => Some(LayerWeights {
-                entries: crate::mambavision::mambavision_weight_blocks(
+                entries: crate::mambavision::geometry::mambavision_weight_blocks(
                     self.input_shape.channels,
                     spec,
                 )
@@ -2467,7 +2531,7 @@ impl Layer {
                 .collect(),
             }),
             LayerKind::KimiKda(spec) => {
-                let (biases, weights) = crate::kimi_kda::kimi_kda_parameter_counts(
+                let (biases, weights) = crate::kimi_kda::geometry::kimi_kda_parameter_counts(
                     self.input_shape.channels,
                     spec.rank,
                     spec.experts,
@@ -3894,7 +3958,7 @@ fn parse_depth_anything_spec(
             .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
             .collect::<Vec<_>>();
         spec.external_weights = Some(
-            crate::depth_anything::DepthAnythingWeights::from_blob(&blob, &geometry).map_err(
+            crate::depth_anything::geometry::DepthAnythingWeights::from_blob(&blob, &geometry).map_err(
                 |error| Error::InvalidConfig(format!("[depth_anything] at line {line}: {error}")),
             )?,
         );
@@ -5038,8 +5102,8 @@ fn parse_layer_kind(
             })?;
             let hidden = section.get_usize("hidden", LAYA_HEAD_HIDDEN)?;
             let max_options = section.get_usize("max_options", 4)?;
-            let fc_dim = section.get_usize("fc_dim", crate::laya_act_head::LAYA_ACT_HEAD_FC_DIM)?;
-            let n_act = section.get_usize("n_act", crate::laya_act_head::LAYA_ACT_HEAD_N_ACT)?;
+            let fc_dim = section.get_usize("fc_dim", crate::laya_act_head::geometry::LAYA_ACT_HEAD_FC_DIM)?;
+            let n_act = section.get_usize("n_act", crate::laya_act_head::geometry::LAYA_ACT_HEAD_N_ACT)?;
             if hidden == 0 || max_options < 2 || fc_dim == 0 || n_act == 0 {
                 return Err(Error::InvalidConfig(format!(
                     "[laya_act_head] at line {line}: hidden={hidden} max_options={max_options} (>=2) fc_dim={fc_dim} n_act={n_act} invalid"
@@ -5810,7 +5874,7 @@ fn infer_output_shape(
                     current.channels, spec.filters
                 )));
             }
-            crate::kimi_kda::validate_geometry(current, spec).map_err(|error| {
+            crate::kimi_kda::geometry::validate_geometry(current, spec).map_err(|error| {
                 Error::InvalidConfig(format!("[kimi_kda] layer #{layer_index}: {error}"))
             })?;
             Ok(current)
@@ -8335,7 +8399,7 @@ fn parse_tucker_attention_spec(
             section.name
         )));
     }
-    let weight_count = crate::tucker_attention::tucker_weight_count(
+    let weight_count = crate::tucker_attention::geometry::tucker_weight_count(
         input.channels,
         heads,
         rank_q,
@@ -8350,7 +8414,7 @@ fn parse_tucker_attention_spec(
             section.name
         ))
     })?;
-    crate::tucker_attention::validate_geometry(&crate::tucker_attention::TuckerGeometry {
+    crate::tucker_attention::geometry::validate_geometry(&crate::tucker_attention::geometry::TuckerGeometry {
         batch: input.batch,
         channels: input.channels,
         height: input.height,
@@ -8548,7 +8612,7 @@ fn parse_mambavision_spec(section: &RawSection, input: TensorShape) -> Result<Ma
         msa_heads,
         causal: section.get_i64("causal", 0)? != 0,
     };
-    crate::mambavision::validate_geometry(input, &spec).map_err(|error| {
+    crate::mambavision::geometry::validate_geometry(input, &spec).map_err(|error| {
         Error::InvalidConfig(format!("[{}] at line {line}: {error}", section.name))
     })?;
     Ok(spec)
@@ -8740,7 +8804,7 @@ fn parse_kimi_kda_spec(section: &RawSection, input: TensorShape) -> Result<KimiK
         load_balance,
         activation,
     };
-    crate::kimi_kda::validate_geometry(input, &spec).map_err(|error| {
+    crate::kimi_kda::geometry::validate_geometry(input, &spec).map_err(|error| {
         Error::InvalidConfig(format!("[{}] at line {line}: {error}", section.name))
     })?;
     Ok(spec)
@@ -9687,8 +9751,8 @@ mod tests {
         );
         assert_eq!(
             layer_weights.parameter_count(),
-            crate::vit::vit_blob_float_count(
-                &crate::vit::VitGeometry {
+            crate::vit::geometry::vit_blob_float_count(
+                &crate::vit::geometry::VitGeometry {
                     batch: 1,
                     channels: 3,
                     height: 6,
@@ -11649,7 +11713,7 @@ output=2
 
         assert_eq!(pinned.len(), 46, "pinned variants");
         assert_eq!(open, 14, "C++-backed variants without an axis pin");
-        assert_eq!(rust_only, 6, "Rust-only variants plus Unsupported");
+        assert_eq!(rust_only, 5, "Rust-only variants (axis-coverage.md lists 5)");
 
         // The pinned set is the contract: renaming one of these tests must be a
         // deliberate edit here, not an accident.

@@ -155,7 +155,7 @@ pub(crate) fn hyperbolic_foveation_params_from_values(
 pub(crate) fn hyperbolic_foveation_auxiliary_param_gradients(
     network: &Network,
     forward: &ForwardResult,
-    labels: &[Vec<crate::train::YoloLabel>],
+    labels: &[Vec<crate::training_types::YoloLabel>],
 ) -> Result<Vec<Option<Vec<f32>>>> {
     let batch = network.net.batch.max(1);
     if labels.len() != batch {

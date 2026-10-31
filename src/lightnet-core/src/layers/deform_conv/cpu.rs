@@ -7,7 +7,7 @@
 
 use crate::error::{Error, Result};
 use crate::model::{DeformConvSpec, TensorShape};
-use crate::runtime::Tensor;
+use crate::model::Tensor;
 
 const VALUE_LIMIT: f32 = 10_000.0;
 const SIGMOID_LIMIT: f32 = 80.0;
@@ -1050,7 +1050,7 @@ pub(crate) fn deform_conv_backward(
 mod tests {
     use super::{deform_conv_backward, deform_conv_forward};
     use crate::model::{Activation, DeformConvSpec, TensorShape};
-    use crate::runtime::Tensor;
+    use crate::model::Tensor;
 
     fn spec(
         _channels: usize,

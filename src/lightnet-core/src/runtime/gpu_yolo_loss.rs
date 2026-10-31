@@ -1,7 +1,7 @@
 use super::*;
 
 use crate::model::YoloIouLoss;
-use crate::train::YoloLabel;
+use crate::training_types::YoloLabel;
 
 /// Loss, device gradient seeds and statistics of the native classic-YOLO loss.
 pub struct GpuYoloLoss<T> {

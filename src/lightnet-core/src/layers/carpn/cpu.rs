@@ -5,10 +5,11 @@
 //! `raptor:src-lib/obb_stage2_refine_layer.cpp`; no compiled-C++ oracle is
 //! available.
 
-use crate::detect::{anchor_pair, decode_obb_bbox, finite_or_zero, head_activation};
+use crate::detection_geometry::{anchor_pair, decode_obb_bbox, finite_or_zero, head_activation};
 use crate::error::{Error, Result};
 use crate::model::{LayerKind, Network, ObbRefineSpec, ObbYoloSpec, TensorShape};
-use crate::runtime::{ConnectedParams, Tensor};
+use crate::runtime::ConnectedParams;
+use crate::model::Tensor;
 
 /// Stage-1 proposal metadata retained for one valid Stage-2 regression row.
 #[derive(Clone, Debug, PartialEq)]

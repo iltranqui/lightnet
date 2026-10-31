@@ -8,7 +8,7 @@
 
 use crate::error::{Error, Result};
 use crate::model::{DsConvSpec, TensorShape};
-use crate::runtime::Tensor;
+use crate::model::Tensor;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct AxisSample {

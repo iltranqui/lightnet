@@ -1,11 +1,11 @@
 use super::*;
 
 use crate::model::ModernYoloKind;
-use crate::train::YoloLabel;
+use crate::training_types::YoloLabel;
 
 /// Loss and device gradient seeds of the native `[yolox]` / `[ppyoloe]` / `[yolonas]` / `[centernet]` loss.
 pub struct GpuDenseHeadLoss<T> {
-    /// Mean of the per-head cost, as [`crate::dense_loss::DenseTrainingLoss::loss`].
+    /// Mean of the per-head cost, as [`crate::training_types::DenseTrainingLoss::loss`].
     pub loss: f32,
     /// Seeds indexed by network layer; feed them to
     /// [`GpuExecutableNetwork::backward_accumulate_device_seeded_gpu`].
@@ -30,7 +30,7 @@ where
         forward: &GpuForwardState<B::Tensor>,
         labels: &[Vec<YoloLabel>],
     ) -> Result<Option<GpuDenseHeadLoss<B::Tensor>>> {
-        if !crate::train::network_uses_dense_heads(&self.network)
+        if !crate::training_types::network_uses_dense_heads(&self.network)
             || self.network.layers.iter().any(|layer| {
                 matches!(
                     layer.kind,
@@ -40,7 +40,7 @@ where
         {
             return Ok(None);
         }
-        let truth = crate::train::dense_head_truth(&self.network, labels)?;
+        let truth = crate::training_types::dense_head_truth(&self.network, labels)?;
         let config = ElementwiseLaunchConfig::default();
         let net = &self.network.net;
         let mut seeds: Vec<Option<B::Tensor>> =

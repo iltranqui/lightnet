@@ -2,7 +2,8 @@
 //! Sequence batch is time-major: [step, sequence_batch, feature].
 use crate::error::{Error,Result};
 use crate::model::{GruSpec,TensorShape};
-use crate::runtime::{ConnectedParams,GruParams,Tensor};
+use crate::runtime::{ConnectedParams,GruParams};
+use crate::model::Tensor;
 
 #[derive(Clone,Debug)]
 pub(crate) struct Step<T> {

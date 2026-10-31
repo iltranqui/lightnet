@@ -26,7 +26,7 @@
 //!   1 in C++; it is kept here so the softmax call matches the source exactly.
 //!
 //! The gate needs the training iteration, which the loss API did not carry; see
-//! `crate::dense_loss::compute_dense_training_loss_at`.
+//! the dense training loss function.
 
 use crate::model::{SegmentationLoss, SegmentationSpec};
 

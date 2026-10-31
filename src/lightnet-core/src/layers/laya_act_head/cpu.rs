@@ -26,13 +26,8 @@
 //!  * marker `[batch, 2*max_options, 1, T_marker]` (channel `2j+1` is the mask)
 
 use crate::laya_scorer::{blob_float_count as scorer_blob_float_count, gelu_erf, gelu_erf_grad};
+use super::geometry::LAYA_ACT_HEAD_N_FEATS;
 
-/// C++ `LAYA_ACT_HEAD_FC_DIM`.
-pub const LAYA_ACT_HEAD_FC_DIM: usize = 256;
-/// C++ `LAYA_ACT_HEAD_N_ACT`.
-pub const LAYA_ACT_HEAD_N_ACT: usize = 2;
-/// C++ `LAYA_ACT_HEAD_N_FEATS`: `[top1, top1-top2, entropy, k/255]`.
-pub const LAYA_ACT_HEAD_N_FEATS: usize = 4;
 
 #[cfg(test)]
 std::thread_local! { static FORWARD_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }

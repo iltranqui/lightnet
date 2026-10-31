@@ -7,7 +7,7 @@
 
 use crate::error::{Error, Result};
 use crate::model::{GraphConvSpec, TensorShape};
-use crate::runtime::Tensor;
+use crate::model::Tensor;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct GraphConvForwardCache {
@@ -801,7 +801,7 @@ pub(crate) fn graph_conv_backward(
 mod tests {
     use super::{graph_conv_backward, graph_conv_forward};
     use crate::model::{Activation, GraphConvSpec, TensorShape};
-    use crate::runtime::Tensor;
+    use crate::model::Tensor;
 
     fn spec(
         _channels: usize,

@@ -5,7 +5,7 @@
 //! swapped.
 
 use crate::error::{Error, Result};
-use crate::runtime::Tensor;
+use crate::model::Tensor;
 
 /// `[channel_shuffle]` forward (`inverse = false`) or its exact adjoint (`inverse = true`).
 pub(crate) fn shuffle_channels(x: &Tensor, groups: usize, inverse: bool) -> Result<Tensor> {

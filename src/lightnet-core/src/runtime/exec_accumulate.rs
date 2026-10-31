@@ -41,7 +41,7 @@ impl ExecutableNetwork {
         input: &Tensor,
         forward: &ForwardResult,
         layer_output_gradient_seeds: &[Option<Tensor>],
-        labels: &[Vec<crate::train::YoloLabel>],
+        labels: &[Vec<crate::training_types::YoloLabel>],
     ) -> Result<BackwardResult> {
         let auxiliary_gradients =
             hyperbolic_foveation_auxiliary_param_gradients(&self.network, forward, labels)?;

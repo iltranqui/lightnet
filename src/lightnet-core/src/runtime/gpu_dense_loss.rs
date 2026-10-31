@@ -14,7 +14,7 @@ where
         &self,
         forward: &GpuForwardState<B::Tensor>,
         truth: &[Option<Tensor>],
-    ) -> Result<crate::dense_loss::DenseTrainingLoss> {
+    ) -> Result<crate::training_types::DenseTrainingLoss> {
         if truth.len() != self.network.layers.len() {
             return Err(Error::InvalidConfig(format!(
                 "dense truth count mismatch: expected {}, got {}",
@@ -81,7 +81,7 @@ where
             total += cost;
             count += 1;
         }
-        Ok(crate::dense_loss::DenseTrainingLoss {
+        Ok(crate::training_types::DenseTrainingLoss {
             loss: if count == 0 {
                 0.0
             } else {
@@ -96,7 +96,7 @@ where
         forward: &GpuForwardState<B::Tensor>,
         truth: &[Option<Tensor>],
         iteration: usize,
-    ) -> Result<crate::dense_loss::DenseTrainingLoss> {
+    ) -> Result<crate::training_types::DenseTrainingLoss> {
         if truth.len() != self.network.layers.len() {
             return Err(Error::InvalidConfig(format!(
                 "dense truth count mismatch: expected {}, got {}",
@@ -178,7 +178,7 @@ where
             total += cost;
             count += 1;
         }
-        Ok(crate::dense_loss::DenseTrainingLoss {
+        Ok(crate::training_types::DenseTrainingLoss {
             loss: if count == 0 {
                 0.0
             } else {

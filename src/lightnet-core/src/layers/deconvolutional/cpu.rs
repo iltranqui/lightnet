@@ -1,7 +1,7 @@
 //! Transposed convolution host math (tasks/rust/04_reference/layers.md Task 9).
 
 use crate::model::TensorShape;
-use crate::runtime::Tensor;
+use crate::model::Tensor;
 
 /// Pre-activation transposed convolution: `weights` is `[c][n][k][k]`, `output_shape` is
 /// `n x (s*(h-1)+k) x (s*(w-1)+k)`.

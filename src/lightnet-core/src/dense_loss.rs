@@ -1,20 +1,13 @@
 //! Host loss for dense-truth heads (tasks/rust/04_reference/layers.md Task 10).
 
 use crate::error::{Error, Result};
+pub use crate::training_types::DenseTrainingLoss;
 use crate::model::{LayerKind, Network};
 use crate::runtime::{ForwardResult, Tensor};
 
 /// C++ `SECRET_NUM`: a truth value that masks the element out of a `masked` cost layer.
 pub const SECRET_NUM: f32 = -1234.0;
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct DenseTrainingLoss {
-    /// Mean of the per-layer `cost` over the loss layers that had truth (C++ `get_network_cost`).
-    pub loss: f32,
-    /// Descent-direction seeds, `Some` for every loss layer that had truth. Feed them to
-    /// `backward_accumulate_seeded`; the loss layers' backward arms pass them through.
-    pub layer_output_gradient_seeds: Vec<Option<Tensor>>,
-}
 
 pub fn compute_dense_training_loss(
     network: &Network,

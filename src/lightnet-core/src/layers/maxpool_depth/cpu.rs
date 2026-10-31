@@ -5,7 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::model::TensorShape;
-use crate::runtime::Tensor;
+use crate::model::Tensor;
 
 /// First maximum over the input channels `g, g + out_c, ...` at one pixel
 /// (C++ `val > max` keeps the first on ties). Returns `(value, input_channel)`.

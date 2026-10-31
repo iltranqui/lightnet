@@ -5,7 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::model::TensorShape;
-use crate::runtime::Tensor;
+use crate::model::Tensor;
 
 /// Channels `[start, end)` of every sample of `source`.
 pub(crate) fn slice_channels(source: &Tensor, start: usize, end: usize) -> Result<Tensor> {
