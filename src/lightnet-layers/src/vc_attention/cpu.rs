@@ -437,7 +437,7 @@ fn probability_code_boundary(u: f32, mode: ExpCastMode) -> bool {
         ExpCastMode::Order0 => {
             let raw = 8.0 * u + 120.0 - 0.35;
             let lower = raw.floor();
-            lower >= 0.0 && lower < 120.0 && raw - lower == 0.5
+            (0.0..120.0).contains(&lower) && raw - lower == 0.5
         }
         ExpCastMode::Order2 => {
             if u <= -15.0 || u >= 0.0 {

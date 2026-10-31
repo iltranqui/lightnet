@@ -55,7 +55,7 @@ where
         let opts = layer.train;
         let groups = spec.groups.max(1);
         let in_per_group = layer.input_shape.channels / groups;
-        if spec.filters == 0 || layer.input_shape.channels % groups != 0 || spec.filters % groups != 0 {
+        if spec.filters == 0 || !layer.input_shape.channels.is_multiple_of(groups) || spec.filters % groups != 0 {
             return Err(Error::InvalidConfig(
                 "Muon convolution has invalid grouped-channel geometry".to_owned(),
             ));

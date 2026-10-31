@@ -193,11 +193,10 @@ where
         if boundary.iter().any(|&x| x != 0.0) {
             return Err(Error::InvalidConfig("MambaVision scan derivative is undefined at a clamp boundary".into()));
         }
-        if let Some((_, _, _, boundary)) = &cache.msa {
-            if be.download_f32(boundary).map_err(err)?.iter().any(|&x| x != 0.0) {
+        if let Some((_, _, _, boundary)) = &cache.msa
+            && be.download_f32(boundary).map_err(err)?.iter().any(|&x| x != 0.0) {
                 return Err(Error::InvalidConfig("MambaVision MSA score derivative is undefined for nonfinite or boundary scores".into()));
             }
-        }
         let (b, t, c, n, d, rows, hidden) =
             (g.batch, g.tokens(), g.channels, g.filters, g.half(), g.rows(), g.hidden());
         let p = &cache.parameters;

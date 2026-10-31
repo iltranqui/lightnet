@@ -1191,13 +1191,12 @@ fn convex_intersection(subject: &[Point], clip: &[Point]) -> Vec<Point> {
                 subtract(current, clip_start),
             ) * orientation
                 >= 0.0;
-            if current_inside != previous_inside {
-                if let Some(intersection) =
+            if current_inside != previous_inside
+                && let Some(intersection) =
                     line_intersection(previous, current, clip_start, clip_end)
                 {
                     output.push(intersection);
                 }
-            }
             if current_inside {
                 output.push(current);
             }

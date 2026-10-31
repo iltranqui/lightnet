@@ -2,7 +2,7 @@
 
 pub fn forward(qkv: &[f32], batch: usize, tokens: usize, channels: usize,
     heads: usize, block: usize, topk: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-    assert!(batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels % heads == 0 && block > 0 && topk > 0);
+    assert!(batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels.is_multiple_of(heads) && block > 0 && topk > 0);
     assert_eq!(qkv.len(), batch * tokens * 3 * channels);
     let dim = channels / heads;
     let mut probabilities = vec![0.0; batch * heads * tokens * tokens];

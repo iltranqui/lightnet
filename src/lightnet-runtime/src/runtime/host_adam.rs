@@ -651,7 +651,7 @@ pub(super) fn read_host_adam_moments(
                 let mut bytes = vec![0; byte_len];
                 file.read_exact(&mut bytes)?;
                 Ok(bytes
-                    .chunks_exact(4)
+                    .as_chunks::<4>().0.iter()
                     .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
                     .collect())
             };

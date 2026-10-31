@@ -530,7 +530,7 @@ pub fn attention_forward_vc(
     mode: crate::vc_attention::ExpCastMode,
     permutation: Option<&[usize]>,
 ) -> Result<(Vec<f32>, AttentionCache), String> {
-    if batch == 0 || tokens == 0 || channels == 0 || heads == 0 || channels % heads != 0 {
+    if batch == 0 || tokens == 0 || channels == 0 || heads == 0 || !channels.is_multiple_of(heads) {
         return Err(
             "vit VC attention requires positive dimensions and channels divisible by heads".into(),
         );
@@ -630,7 +630,7 @@ pub fn attention_flash_cache_from_lse(
     heads: usize,
     lse: &[f32],
 ) -> Result<AttentionCache, String> {
-    if batch == 0 || tokens == 0 || channels == 0 || heads == 0 || channels % heads != 0 {
+    if batch == 0 || tokens == 0 || channels == 0 || heads == 0 || !channels.is_multiple_of(heads) {
         return Err(
             "vit flash cache requires positive dimensions and channels divisible by heads".into(),
         );
@@ -703,7 +703,7 @@ fn attention_forward_impl(
     sparse_blocks: Option<(usize, usize)>,
     flash: bool,
 ) -> Result<(Vec<f32>, AttentionCache), String> {
-    if batch == 0 || tokens == 0 || channels == 0 || heads == 0 || channels % heads != 0 {
+    if batch == 0 || tokens == 0 || channels == 0 || heads == 0 || !channels.is_multiple_of(heads) {
         return Err(
             "vit attention requires positive dimensions and channels divisible by heads".into(),
         );
@@ -1668,7 +1668,7 @@ where
         g.patch_pad,
     )?;
     validate_vit_weights(weights, g, out_h, out_w)?;
-    if g.hidden == 0 || g.mlp_dim == 0 || g.heads == 0 || g.hidden % g.heads != 0 {
+    if g.hidden == 0 || g.mlp_dim == 0 || g.heads == 0 || !g.hidden.is_multiple_of(g.heads) {
         return Err("vit requires positive hidden/mlp/heads and hidden divisible by heads".into());
     }
     if !g.ln_eps.is_finite() || g.ln_eps <= 0.0 {

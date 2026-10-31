@@ -45,7 +45,7 @@ pub(crate) fn device_activation(activation: &Activation) -> Option<F32Activation
 pub(crate) fn supported(g: &VitGeometry) -> bool {
     !g.vc_attention
         && g.heads > 0
-        && g.hidden % g.heads == 0
+        && g.hidden.is_multiple_of(g.heads)
         && g.hidden / g.heads <= 128
         && device_activation(&g.activation).is_some()
 }

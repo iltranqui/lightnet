@@ -11,7 +11,7 @@ use crate::model::Tensor;
 #[doc(hidden)]
 pub fn shuffle_channels(x: &Tensor, groups: usize, inverse: bool) -> Result<Tensor> {
     let s = x.shape;
-    if groups == 0 || s.channels % groups != 0 {
+    if groups == 0 || !s.channels.is_multiple_of(groups) {
         return Err(Error::InvalidConfig(format!(
             "channel_shuffle needs channels={} divisible by groups={groups}",
             s.channels

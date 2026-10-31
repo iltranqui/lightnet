@@ -169,13 +169,13 @@ where
                 launch_config,
             )
             .map_err(|err| backend_error("compact connected", err))?;
-        Ok(self.backend
+        self.backend
             .activation_f32(
                 &pre_activation,
                 gpu_activation_kind(layer.index, &spec.activation)?,
                 launch_config,
             )
-            .map_err(|err| backend_error("compact connected activation", err))?)
+            .map_err(|err| backend_error("compact connected activation", err))
     }
 
     /// Native fully-connected backward.

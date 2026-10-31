@@ -14,7 +14,7 @@ pub struct AttentionGeometry {
 impl AttentionGeometry {
     pub fn lengths(self) -> Result<(usize, usize), String> {
         if self.windows == 0 || self.tokens == 0 || self.channels == 0 || self.heads == 0
-            || self.channels % self.heads != 0
+            || !self.channels.is_multiple_of(self.heads)
         {
             return Err("Tucker attention requires positive dimensions and channels divisible by heads".into());
         }

@@ -43,7 +43,7 @@ impl Dcnv4Geometry {
         self.size * self.size - usize::from(self.remove_center)
     }
     pub fn offset_dim(&self) -> usize {
-        (self.groups * self.kernel_points() * 3 + 7) / 8 * 8
+        (self.groups * self.kernel_points() * 3).div_ceil(8) * 8
     }
     pub fn spatial(&self) -> usize {
         self.output_height * self.output_width
@@ -65,7 +65,7 @@ impl Dcnv4Geometry {
         if axes.contains(&0) {
             return Err("dcnv4 aggregation requires positive dimensions".to_owned());
         }
-        if self.channels % self.groups != 0 {
+        if !self.channels.is_multiple_of(self.groups) {
             return Err("dcnv4 aggregation: groups must divide channels".to_owned());
         }
         // Launchers use these extents for allocations and unsafe device indexing.

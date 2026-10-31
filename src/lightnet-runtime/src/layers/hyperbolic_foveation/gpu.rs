@@ -445,7 +445,7 @@ pub(crate) fn backward_hyperbolic_foveation(
             ));
         }
         let semantic = semantic
-            .chunks_exact(5)
+            .as_chunks::<5>().0.iter()
             .map(|values| [values[0], values[1], values[2], values[3], values[4]])
             .collect();
         (vec![0.0; warp_input.data.len()], semantic)

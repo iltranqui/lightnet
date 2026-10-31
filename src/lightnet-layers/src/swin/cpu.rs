@@ -78,7 +78,7 @@ fn swin_weight_sizes(
         || heads == 0
         || window == 0
         || ffn_ratio == 0
-        || input_channels % heads != 0
+        || !input_channels.is_multiple_of(heads)
     {
         return Err("Swin weight geometry requires positive dimensions and input channels divisible by heads".into());
     }
@@ -549,7 +549,7 @@ pub fn window_partition_nchw(
     window: usize,
 ) -> Result<Vec<f32>, String> {
     validate_spatial(batch, channels, padded_height, padded_width)?;
-    if window == 0 || padded_height % window != 0 || padded_width % window != 0 {
+    if window == 0 || !padded_height.is_multiple_of(window) || !padded_width.is_multiple_of(window) {
         return Err("Swin partition requires positive window-aligned padded dimensions".into());
     }
     let input_len = checked_product(
@@ -602,7 +602,7 @@ pub fn window_unpartition_nchw(
     window: usize,
 ) -> Result<Vec<f32>, String> {
     validate_spatial(batch, channels, padded_height, padded_width)?;
-    if window == 0 || padded_height % window != 0 || padded_width % window != 0 {
+    if window == 0 || !padded_height.is_multiple_of(window) || !padded_width.is_multiple_of(window) {
         return Err("Swin unpartition requires positive window-aligned padded dimensions".into());
     }
     let windows_h = padded_height / window;
@@ -661,7 +661,7 @@ pub fn build_attention_mask(
             "Swin mask requires positive input/window dimensions and covering padding".into(),
         );
     }
-    if padded_height % window != 0 || padded_width % window != 0 {
+    if !padded_height.is_multiple_of(window) || !padded_width.is_multiple_of(window) {
         return Err("Swin mask requires window-aligned padded dimensions".into());
     }
     let tokens = checked_product(&[window, window], "mask token")?;
@@ -923,7 +923,7 @@ pub fn window_attention_forward_with_indices(
     mask: &[f32],
     relative_position_indices: Arc<[usize]>,
 ) -> Result<(Vec<f32>, WindowAttentionCache), String> {
-    if window == 0 || channels == 0 || heads == 0 || channels % heads != 0 {
+    if window == 0 || channels == 0 || heads == 0 || !channels.is_multiple_of(heads) {
         return Err(
             "Swin attention requires positive dimensions and channels divisible by heads".into(),
         );

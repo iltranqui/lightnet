@@ -28,7 +28,7 @@ impl GraphConvAggregationGeometry {
             || self.output_height == 0
             || self.output_width == 0
             || self.size == 0
-            || self.size % 2 == 0
+            || self.size.is_multiple_of(2)
             || self.stride_x == 0
             || self.stride_y == 0
             || self.dilation == 0

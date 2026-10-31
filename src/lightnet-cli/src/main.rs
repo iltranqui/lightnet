@@ -724,7 +724,7 @@ fn format_obb_detection_line(detection: &ObbDetection, class_name: &str, tsv: bo
         ),
         (ObbDetectionGeometry::CarpnQuad(points), false) => {
             let vertices = points
-                .chunks_exact(2)
+                .as_chunks::<2>().0.iter()
                 .map(|vertex| format!("({:.2},{:.2})", vertex[0], vertex[1]))
                 .collect::<Vec<_>>()
                 .join(",");
@@ -986,7 +986,7 @@ fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std
     let mut parity_labels: Option<Vec<Vec<YoloLabel>>> = None;
     let read_f32 = |path: &str| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         Ok(fs::read(path)?
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect())
     };
@@ -1057,11 +1057,10 @@ fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std
             if let Ok(path) = std::env::var("LIGHTNET_BENCH_WEIGHTS") {
                 exec.load_weights_file(&path)?;
             }
-            if let Some(prefix) = &parity_prefix {
-                if parity_steps.contains(&0) {
+            if let Some(prefix) = &parity_prefix
+                && parity_steps.contains(&0) {
                     dump_parity(prefix, 0, &exec.params)?;
                 }
-            }
             for step in 0..warmup + steps {
                 let t0 = Instant::now();
                 let forward = exec.forward_training(&input)?;
@@ -1109,11 +1108,10 @@ fn bench_train(cfg: &str, steps: usize, warmup: usize) -> Result<(), Box<dyn std
                     exec.update_weights(lr, momentum, decay, batch);
                 }
                 let t3 = Instant::now();
-                if let Some(prefix) = &parity_prefix {
-                    if parity_steps.contains(&(step + 1)) {
+                if let Some(prefix) = &parity_prefix
+                    && parity_steps.contains(&(step + 1)) {
                         dump_parity(prefix, step + 1, &exec.params)?;
                     }
-                }
                 if step >= warmup {
                     let ms = |a: Instant, b: Instant| b.duration_since(a).as_secs_f64() * 1e3;
                     fwd.push(ms(t0, t1));
@@ -2524,7 +2522,7 @@ fn run_detector_train_cpu(
 
     while executable.network.net.max_batches == 0 || batch_num < executable.network.net.max_batches
     {
-        if augmentation.random > 0.0 && multi_scale_count % 10 == 0 {
+        if augmentation.random > 0.0 && multi_scale_count.is_multiple_of(10) {
             let (dim_w, dim_h) = augmentation.multi_scale_dimensions(
                 base_width,
                 base_height,
@@ -2682,8 +2680,8 @@ fn run_detector_train_cpu(
             iteration_start.elapsed().as_secs_f64() * 1000.0,
         )?;
 
-        if let Some(validation) = &mut validation {
-            if validation
+        if let Some(validation) = &mut validation
+            && validation
                 .schedule
                 .due(batch_num, executable.network.net.max_batches)
             {
@@ -2711,7 +2709,6 @@ fn run_detector_train_cpu(
                     println!("saved {}", checkpoint.display());
                 }
             }
-        }
 
         if options.save_every != 0 && batch_num % options.save_every == 0 {
             let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
@@ -2938,8 +2935,8 @@ fn run_detector_train_cpu_obb(
         )?;
         metrics_log.record(batch_num, seen, &iteration_metrics, subdivisions)?;
 
-        if let Some(validation) = &mut validation {
-            if validation
+        if let Some(validation) = &mut validation
+            && validation
                 .schedule
                 .due(batch_num, executable.network.net.max_batches)
             {
@@ -2965,9 +2962,8 @@ fn run_detector_train_cpu_obb(
                     println!("saved {}", checkpoint.display());
                 }
             }
-        }
 
-        if options.save_every != 0 && batch_num % options.save_every == 0 {
+        if options.save_every != 0 && batch_num.is_multiple_of(options.save_every) {
             let checkpoint = backup_dir.join(format!("{base_name}_{batch_num}.weights"));
             save_weights(&executable.network, &executable.params, &checkpoint, seen)?;
             println!("saved {}", checkpoint.display());

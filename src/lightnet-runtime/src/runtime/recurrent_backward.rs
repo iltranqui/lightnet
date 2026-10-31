@@ -776,7 +776,7 @@ where
             let gate_index = projection_index % 4;
             let recurrent = projection_index < 4;
             let projection_input = if recurrent {
-                &previous_state_gpu
+                previous_state_gpu
             } else {
                 &step_input_gpu
             };
@@ -1363,8 +1363,8 @@ where
     let expected_weights = filters * channels_per_group * spec.size * spec.size;
     if output_shape.channels != filters
         || input_shape.batch != output_shape.batch
-        || input_shape.channels % groups != 0
-        || filters % groups != 0
+        || !input_shape.channels.is_multiple_of(groups)
+        || !filters.is_multiple_of(groups)
         || params.weights.len() != expected_weights
         || params.biases.len() != filters
     {

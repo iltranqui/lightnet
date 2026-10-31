@@ -249,7 +249,7 @@ fn parse_rows(
                 ))));
             };
             let vertices = values[offset..]
-                .chunks_exact(3)
+                .as_chunks::<3>().0.iter()
                 .map(|p| [p[0].clamp(0.0, 1.0), p[1].clamp(0.0, 1.0), p[2]])
                 .collect();
             let label = CuboidLabel {

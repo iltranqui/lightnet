@@ -365,7 +365,7 @@ where
     let offsets = &cache.offsets;
     let delta = activation_delta(backend, pre, seed, layer, spec, GradMode::from_env())?;
     let (aggregation_grad, biases, scales) = if let Some(bn) = &params.batch_norm {
-        let normalized = normalized_raw(backend, &raw, bn, desc.geometry.spatial())?;
+        let normalized = normalized_raw(backend, raw, bn, desc.geometry.spatial())?;
         let product = backend
             .vector_mul_f32(
                 &delta,

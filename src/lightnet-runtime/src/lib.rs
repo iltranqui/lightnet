@@ -8,6 +8,7 @@
 //! `train` or `detect`. Module names that used to be crate-private in
 //! `lightnet-core` are `pub` and `#[doc(hidden)]` here so the upper crates can
 //! reach them; `lightnet-core` re-exports every old public path.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 #[doc(hidden)]
 pub mod layers;

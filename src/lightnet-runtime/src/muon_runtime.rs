@@ -291,7 +291,7 @@ fn visit_grouped_convolution(
     visitor: &mut MatrixVisitor<'_>,
 ) -> Result<()> {
     let groups = groups.max(1);
-    if filters == 0 || input_channels == 0 || filters % groups != 0 || input_channels % groups != 0
+    if filters == 0 || input_channels == 0 || !filters.is_multiple_of(groups) || !input_channels.is_multiple_of(groups)
     {
         return Err(Error::InvalidConfig(
             "Muon convolution has invalid grouped-channel geometry".to_owned(),
@@ -404,7 +404,7 @@ fn visit_connected(
     visitor: &mut MatrixVisitor<'_>,
 ) -> Result<()> {
     let rows = params.biases.len();
-    if rows == 0 || params.weights.len() % rows != 0 {
+    if rows == 0 || !params.weights.len().is_multiple_of(rows) {
         return Err(Error::InvalidConfig(
             "Muon connected weight geometry is invalid".to_owned(),
         ));

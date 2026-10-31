@@ -339,11 +339,10 @@ impl DetectorAugmentation {
                 margins[1] = (margins[1] as f32 - delta) as i32;
             }
         }
-        if let Some(quadrant) = mosaic_quadrant {
-            if rng.unit() < 0.5 {
+        if let Some(quadrant) = mosaic_quadrant
+            && rng.unit() < 0.5 {
                 move_crop_to_mosaic_corner(&mut margins, flip, quadrant)?;
             }
-        }
         let crop_width = ow
             .checked_sub(margins[0])
             .and_then(|v| v.checked_sub(margins[1]))
@@ -379,7 +378,7 @@ impl DetectorAugmentation {
         let mut out = crop.image(image, width, height)?;
         let profiling = crate::loader_profile::enabled();
         let hsv_start = std::time::Instant::now();
-        for pixel in out.chunks_exact_mut(3) {
+        for pixel in out.as_chunks_mut::<3>().0 {
             hsv_distort(pixel, hue, sat, exp);
         }
         let hsv_elapsed = hsv_start.elapsed();
@@ -679,7 +678,7 @@ pub fn blend_mixup(
     let b = second.to_rgb8()?;
     let mut out = vec![0u8; a.as_raw().len()];
     for ((dst, x), y) in out.iter_mut().zip(a.as_raw()).zip(b.as_raw()) {
-        *dst = ((*x as u32 + *y as u32 + 1) / 2) as u8;
+        *dst = (*x as u32 + *y as u32).div_ceil(2) as u8;
     }
     let mut labels = first_labels.to_vec();
     for label in second_labels {
@@ -789,7 +788,7 @@ impl Crop {
         let mean_start = std::time::Instant::now();
         let mut mean = [0u8; 3];
         for c in 0..3 {
-            mean[c] = ((src.chunks_exact(3).map(|p| p[c] as u64).sum::<u64>() as f64)
+            mean[c] = ((src.as_chunks::<3>().0.iter().map(|p| p[c] as u64).sum::<u64>() as f64)
                 / (ow * oh) as f64)
                 .round_ties_even() as u8;
         }
@@ -822,7 +821,7 @@ impl Crop {
                     // OpenCV's specialized u8 vertical pass drops four horizontal
                     // low bits, then truncates each weighted row before rounding.
                     let value =
-                        (((row(y0) >> 4) * (2048 - wy) >> 16) + ((row(y1) >> 4) * wy >> 16) + 2)
+                        ((((row(y0) >> 4) * (2048 - wy)) >> 16) + (((row(y1) >> 4) * wy) >> 16) + 2)
                             >> 2;
                     out[(y * nw + dx) * 3 + c] = value.clamp(0, 255) as u8;
                 }

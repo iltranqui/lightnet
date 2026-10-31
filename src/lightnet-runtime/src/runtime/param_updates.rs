@@ -1767,11 +1767,10 @@ pub(super) fn update_clifford_params(
         0.0,
         batch,
     );
-    if crate::clifford::has_global(spec) {
-        if let (Some(params), Some(train)) = (&mut params.global, &mut train.global) {
+    if crate::clifford::has_global(spec)
+        && let (Some(params), Some(train)) = (&mut params.global, &mut train.global) {
             update_clifford_branch(params, train, lr, momentum, decay, batch);
         }
-    }
     // FNO coefficients are trainable elementwise spectral multipliers. The
     // guarded C++ backward accumulates them, although its update callback omits
     // them; the Rust CPU path applies the ordinary decayed weight update.

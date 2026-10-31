@@ -247,7 +247,7 @@ where
         let per_sample = layer.output_shape.element_count();
         let layer_step = spec.weight_slots(layer.output_shape.channels);
         if layer_step == 0
-            || per_sample % layer_step != 0
+            || !per_sample.is_multiple_of(layer_step)
             || params.weights.len() != spec.weight_count(layer.output_shape.channels)
         {
             return Err(Error::InvalidConfig(format!(

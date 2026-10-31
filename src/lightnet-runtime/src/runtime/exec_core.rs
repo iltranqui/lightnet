@@ -1179,7 +1179,7 @@ impl ExecutableNetwork {
             prepare_muon_layer_gradients(
                 &layer.kind,
                 options,
-                &mut self.params[index],
+                &self.params[index],
                 &mut self.train_buffers[index],
             )?;
             let layer_adam = AdamParams {

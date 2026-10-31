@@ -810,13 +810,13 @@ fn constrain_predictor_output(value: f32, index: usize, param_count: usize) -> f
     if index < 2 {
         0.9 * value.tanh()
     } else if index + 1 == param_count {
-        let sigmoid = if value >= 0.0 {
+        
+        if value >= 0.0 {
             1.0 / (1.0 + (-value).exp())
         } else {
             let exp = value.exp();
             exp / (1.0 + exp)
-        };
-        sigmoid
+        }
     } else {
         (2.0 * softplus(value) + MIN_RADIUS).clamp(MIN_RADIUS, MAX_RADIUS)
     }
@@ -870,9 +870,9 @@ pub fn predictor_backward_nchw(
         batch * hidden_count,
         batch * param_count,
         batch * param_count,
-        hidden_count.checked_mul(input_dim).unwrap_or(usize::MAX),
+        hidden_count.saturating_mul(input_dim),
         hidden_count,
-        param_count.checked_mul(hidden_count).unwrap_or(usize::MAX),
+        param_count.saturating_mul(hidden_count),
         batch * param_count,
     ];
     let actual = [

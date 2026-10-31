@@ -36,7 +36,7 @@ pub fn set_serialized(p:&mut GruParams,values:&[f32])->Result<()> {
 }
 #[doc(hidden)]
 pub fn validate(s:&GruSpec,p:&GruParams,input:TensorShape,output:TensorShape)->Result<usize> {
-    if s.steps==0 || input.batch==0 || input.batch%s.steps!=0 || s.output==0
+    if s.steps==0 || input.batch==0 || !input.batch.is_multiple_of(s.steps) || s.output==0
         || output!=TensorShape::new(1,1,s.output,input.batch) {
         return Err(Error::InvalidConfig("GRU sequence/output geometry mismatch".into()));
     }
@@ -48,7 +48,7 @@ pub fn validate(s:&GruSpec,p:&GruParams,input:TensorShape,output:TensorShape)->R
 
 #[doc(hidden)]
 pub fn validate_cpu(s:&GruSpec,p:&GruParams,input:TensorShape,output:TensorShape)->Result<usize> {
-    if s.steps==0 || input.batch==0 || input.batch%s.steps!=0 || s.output==0
+    if s.steps==0 || input.batch==0 || !input.batch.is_multiple_of(s.steps) || s.output==0
         || output!=TensorShape::new(1,1,s.output,input.batch) {
         return Err(Error::InvalidConfig("GRU sequence/output geometry mismatch".into()));
     }
@@ -72,7 +72,7 @@ pub fn tape(s:&GruSpec,p:&GruParams,input:&Tensor,output:TensorShape)->Result<Ve
     let len=batch*outs;
     let pp=projections(p);
     let lin=|x:&[f32],i:usize| {
-        let width=if i%2==0{ins}else{outs};
+        let width=if i.is_multiple_of(2){ins}else{outs};
         let mut y=lightnet_cuda::host_ops::connected(x,&pp[i].weights,&vec![0.0;outs],batch,width,outs);
         for (j,v) in y.iter_mut().enumerate() {
             let c=j%outs;
@@ -111,7 +111,7 @@ pub fn backward(s:&GruSpec,p:&GruParams,input:&Tensor,grad:&Tensor)->Result<(Ten
         let dz=(0..len).map(|i|dh[i]*(step.previous[i]-step.candidate[i])*step.z[i]*(1.0-step.z[i])).collect::<Vec<_>>();
         let dn=(0..len).map(|i|dh[i]*(1.0-step.z[i])*step.candidate[i]*(1.0-step.candidate[i])).collect::<Vec<_>>();
         let mut project=|x:&[f32],dy:&[f32],i:usize| {
-            let width=if i%2==0{ins}else{outs};
+            let width=if i.is_multiple_of(2){ins}else{outs};
             let p=projections_mut(&mut gradients).into_iter().nth(i).expect("GRU projection");
             let mut raw_dy=dy.to_vec();
             if let (Some(bn),Some(gbn))=(&pp[i].batch_norm,&mut p.batch_norm) {

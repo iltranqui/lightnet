@@ -1,5 +1,6 @@
 #![feature(float_erf)]
 //! CPU reference layers and their parameter data.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 pub use lightnet_model::{activation_math, cfg, detection_geometry, error, model, names, training_types};
 #[cfg(test)]

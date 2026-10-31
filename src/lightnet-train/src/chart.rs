@@ -39,7 +39,7 @@ pub fn write_training_chart(path: &Path, points: &[ChartPoint]) -> Result<()> {
     let mut image = RgbaImage::from_pixel(WIDTH, HEIGHT, WHITE);
     draw_frame(&mut image);
     if points.is_empty() {
-        return Ok(image.save(path).map_err(chart_error)?);
+        return image.save(path).map_err(chart_error);
     }
 
     let plot_w = (WIDTH as i32 - LEFT - RIGHT).max(1) as f32;

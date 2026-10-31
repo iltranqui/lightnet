@@ -51,7 +51,7 @@ impl DptHeadGeometry {
                 "batch, input geometry, widths, and patch_size must be positive",
             ));
         }
-        if self.fusion % 2 != 0 {
+        if !self.fusion.is_multiple_of(2) {
             return Err(invalid(
                 "fusion must be even because the head uses fusion/2 channels",
             ));

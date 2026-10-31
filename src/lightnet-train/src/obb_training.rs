@@ -724,7 +724,7 @@ pub fn enumerate_obb_yolo_head_positives(
         }
 
         if iou_thresh < 1.0 {
-            for (anchor_index, pair) in anchors.chunks_exact(2).enumerate() {
+            for (anchor_index, pair) in anchors.as_chunks::<2>().0.iter().enumerate() {
                 if anchor_index == best_anchor {
                     continue;
                 }
@@ -1857,11 +1857,10 @@ pub fn obb_yolo_class_deltas(
             if result_delta.is_finite() {
                 *delta = result_delta;
             }
-            if index == class_id {
-                if let Some(multipliers) = class_multipliers {
+            if index == class_id
+                && let Some(multipliers) = class_multipliers {
                     *delta *= multipliers[class_id] * cls_normalizer;
                 }
-            }
         }
     }
 
@@ -2099,7 +2098,7 @@ pub fn visit_obb_yolo_batch_head_matches(
                     let channel_value = |entry: usize| {
                         finite_or_zero(head_output[anchor_base + entry * stride + cell_index])
                     };
-                    let prediction = std::array::from_fn(|channel| channel_value(channel));
+                    let prediction = std::array::from_fn(&channel_value);
                     class_outputs.clear();
                     class_outputs
                         .extend((0..config.classes).map(|class_id| channel_value(7 + class_id)));
@@ -3622,7 +3621,7 @@ fn validate_anchor_assignment_inputs(
     grid_width: usize,
     grid_height: usize,
 ) -> Result<()> {
-    if anchors.is_empty() || anchors.len() % 2 != 0 {
+    if anchors.is_empty() || !anchors.len().is_multiple_of(2) {
         return Err(Error::InvalidConfig(
             "OBB anchor list must contain width/height pairs".to_owned(),
         ));
@@ -3642,7 +3641,7 @@ fn validate_anchor_assignment_inputs(
             "OBB anchor assignment requires a nonzero grid".to_owned(),
         ));
     }
-    if anchors.chunks_exact(2).any(|pair| {
+    if anchors.as_chunks::<2>().0.iter().any(|pair| {
         !pair[0].is_finite() || !pair[1].is_finite() || pair[0] <= 0.0 || pair[1] <= 0.0
     }) {
         return Err(Error::InvalidConfig(
@@ -3660,7 +3659,7 @@ fn best_obb_yolo_anchor(
 ) -> Result<(usize, f32)> {
     let mut best_anchor = 0;
     let mut best_score = 0.0;
-    for (anchor_index, pair) in anchors.chunks_exact(2).enumerate() {
+    for (anchor_index, pair) in anchors.as_chunks::<2>().0.iter().enumerate() {
         let score = obb_yolo_anchor_match_score(truth, pair[0], pair[1], net_width, net_height)?;
         if score > best_score {
             best_score = score;

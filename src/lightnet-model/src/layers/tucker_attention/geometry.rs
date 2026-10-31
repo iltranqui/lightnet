@@ -40,7 +40,7 @@ pub fn tucker_weight_count(
 ) -> Result<usize, String> {
     if channels == 0
         || heads == 0
-        || channels % heads != 0
+        || !channels.is_multiple_of(heads)
         || rank_q == 0
         || rank_k == 0
         || rank_v == 0
@@ -75,7 +75,7 @@ pub fn validate_geometry(g: &TuckerGeometry) -> Result<(), String> {
         || g.width == 0
         || g.size == 0
         || g.heads == 0
-        || g.channels % g.heads != 0
+        || !g.channels.is_multiple_of(g.heads)
         || g.rank_q == 0
         || g.rank_k == 0
         || g.rank_v == 0

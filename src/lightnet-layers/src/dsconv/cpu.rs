@@ -317,7 +317,7 @@ fn validate(
     if shape.width > isize::MAX as usize || shape.height > isize::MAX as usize {
         return Err(invalid("spatial dimensions exceed host index range"));
     }
-    if spec.filters == 0 || spec.size == 0 || spec.size % 2 == 0 {
+    if spec.filters == 0 || spec.size == 0 || spec.size.is_multiple_of(2) {
         return Err(invalid("filters and odd snake size must be positive"));
     }
     if spec.padding != spec.size / 2 || !spec.extend_scope.is_finite() {

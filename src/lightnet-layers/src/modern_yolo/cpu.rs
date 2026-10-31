@@ -1014,11 +1014,10 @@ pub fn yolox_train_batch(
                     };
                     d *= weight;
                 }
-                if let Some(m) = &settings.classes_multipliers {
-                    if raw_target > 0.0 {
+                if let Some(m) = &settings.classes_multipliers
+                    && raw_target > 0.0 {
                         d *= m[c];
                     }
-                }
                 if d.is_finite() {
                     delta[idx] += d;
                 }

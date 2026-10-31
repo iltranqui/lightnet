@@ -71,7 +71,7 @@ fn validate_geometry(input: &[f32], weights: &SwinWeights, g: &SwinGeometry) -> 
         || g.heads == 0
         || g.window == 0
         || g.ffn_ratio == 0
-        || g.channels % g.heads != 0
+        || !g.channels.is_multiple_of(g.heads)
     {
         return Err(
             "Swin geometry requires positive dimensions and channels divisible by heads".into(),

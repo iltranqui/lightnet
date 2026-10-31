@@ -131,7 +131,7 @@ pub struct MambaVisionState {
 
 impl MambaVisionState {
     pub fn zeroed(batch: usize, filters: usize, state_size: usize) -> Result<Self, String> {
-        if filters < 2 || filters % 2 != 0 || state_size == 0 {
+        if filters < 2 || !filters.is_multiple_of(2) || state_size == 0 {
             return Err("MambaVision state requires even filters >= 2 and state >= 1".into());
         }
         let len = checked_product(&[batch, filters / 2, state_size], "state")?;
@@ -860,11 +860,11 @@ fn state_index(
     (((batch * channels + channel) * tokens + token) * state_size) + state
 }
 
-fn split_two_mut<'a>(
-    values: &'a mut [f32],
+fn split_two_mut(
+    values: &mut [f32],
     first: Range<usize>,
     second: Range<usize>,
-) -> (&'a mut [f32], &'a mut [f32]) {
+) -> (&mut [f32], &mut [f32]) {
     if first.end <= second.start {
         let (before_second, after_second) = values.split_at_mut(second.start);
         (&mut before_second[first], &mut after_second[..second.len()])
@@ -1079,7 +1079,7 @@ fn msa_forward(
     block_size: usize,
     topk: usize,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<bool>, bool), String> {
-    if heads == 0 || channels % heads != 0 || block_size == 0 || topk == 0 {
+    if heads == 0 || !channels.is_multiple_of(heads) || block_size == 0 || topk == 0 {
         return Err("MambaVision MSA requires positive block/head geometry".into());
     }
     let dim = channels / heads;

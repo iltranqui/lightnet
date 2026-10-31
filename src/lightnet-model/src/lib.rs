@@ -1,4 +1,5 @@
 //! Shared model description and geometry for the Lightnet runtime.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 #[doc(hidden)]
 pub mod activation_math;

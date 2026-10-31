@@ -273,7 +273,7 @@ where B::Error: std::fmt::Display {
         validate_params(spec, params, layer.input_shape)?;
         if layer.input_shape != layer.output_shape || spec.filters != layer.input_shape.channels
             || !spec.drop_path.is_finite() || !(0.0..1.0).contains(&spec.drop_path)
-            || spec.dwconv_size == 0 || spec.dwconv_size % 2 == 0 || schedule(spec).is_empty() {
+            || spec.dwconv_size == 0 || spec.dwconv_size.is_multiple_of(2) || schedule(spec).is_empty() {
             return Err(Error::InvalidConfig("[clifford] invalid GPU geometry or configuration".to_owned()));
         }
         let keep = 1.0 / (1.0 - spec.drop_path);

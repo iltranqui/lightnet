@@ -146,7 +146,7 @@ impl<B: F32TensorOpsBackend> GpuExecutableNetwork<B> where B::Error: std::fmt::D
                 else { self.backend.upload_f32(&[r.len()], &params.values[r.clone()]) }
                 .map_err(|e| backend_error("upload DPT weights", e))).collect::<Result<Vec<_>>>()?, None)
         };
-        let weights = device_weights.into_iter().map(|w| Some(w)).collect();
+        let weights = device_weights.into_iter().map(Some).collect();
         let mut builder = Builder { be: &self.backend, config, cache: DeviceCache {
             geometry, layout, weights, resident_generation, nodes: vec![Node { value: input.clone(),
                 shape: tensor_backend_shape(layer.input_shape), op: Op::Input }] } };

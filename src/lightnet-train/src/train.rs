@@ -1135,13 +1135,12 @@ pub fn compute_yolo_training_loss_with_state(
     // C++ `backward_yolo_layer_gpu`: `delta_normalizer` scales the delta only when it is
     // propagated (after the cost above has been taken from the unscaled delta).
     for (head, spec) in &heads {
-        if spec.delta_normalizer != 1.0 {
-            if let Some(seed) = seeds[head.layer_index].as_mut() {
+        if spec.delta_normalizer != 1.0
+            && let Some(seed) = seeds[head.layer_index].as_mut() {
                 for delta in &mut seed.data {
                     *delta *= spec.delta_normalizer;
                 }
             }
-        }
     }
 
     Ok(YoloTrainingLoss {

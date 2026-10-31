@@ -870,7 +870,7 @@ impl ExecutableNetwork {
                         let (output, activation_input) = forward_convolutional_with_cache(
                             &spec.expert,
                             expert,
-                            &current_input,
+                            current_input,
                             layer.output_shape,
                         );
                         // `TensorShape::element_count()` is per image, which is

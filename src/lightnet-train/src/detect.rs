@@ -877,7 +877,7 @@ pub fn decode_obb_yolo_head(
             }
 
             let bbox = decode_obb_bbox(
-                data[(anchor_base + 0) * stride + index],
+                data[anchor_base * stride + index],
                 data[(anchor_base + 1) * stride + index],
                 data[(anchor_base + 2) * stride + index],
                 data[(anchor_base + 3) * stride + index],

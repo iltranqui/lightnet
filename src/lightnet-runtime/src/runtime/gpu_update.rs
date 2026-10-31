@@ -709,7 +709,7 @@ where
             prepare_muon_layer_gradients(
                 &layer.kind,
                 options,
-                &mut self.params[index],
+                &self.params[index],
                 &mut buffers[index],
             )?;
             let layer_adam = AdamParams {
@@ -1314,11 +1314,11 @@ where
                 let supports_device_moe_optimizer =
                     match (&layer.kind, self.params.get(layer_index)) {
                         (LayerKind::Moe(spec), Some(LayerParams::Moe(moe))) => {
-                            let bn_matches = moe.experts.len() == spec.experts
+                            
+                            moe.experts.len() == spec.experts
                                 && moe.experts.iter().all(|expert| {
                                     expert.batch_norm.is_some() == spec.expert.batch_normalize
-                                });
-                            bn_matches
+                                })
                         }
                         _ => false,
                     };
@@ -1949,15 +1949,13 @@ where
         // Oxide forward pass.
         let mut cache = self.device_conv_params.borrow_mut();
         for (index, layer) in self.network.layers.iter().enumerate() {
-            if (matches!(layer.kind, LayerKind::EmlConvolutional(_))
+            if ((matches!(layer.kind, LayerKind::EmlConvolutional(_))
                 && !device_eml_layers.get(index).copied().unwrap_or(false))
                 || (matches!(layer.kind, LayerKind::Moe(_))
-                    && !device_moe_layers.get(index).copied().unwrap_or(false))
-            {
-                if let Some(slots) = cache.get_mut(index) {
+                    && !device_moe_layers.get(index).copied().unwrap_or(false)))
+                && let Some(slots) = cache.get_mut(index) {
                     slots.clear();
                 }
-            }
         }
         Ok(())
     }
@@ -2533,7 +2531,7 @@ where
         // device-updated EML branches keep their refreshed branch slots.
         let mut cache = self.device_conv_params.borrow_mut();
         for (index, layer) in self.network.layers.iter().enumerate() {
-            if (matches!(layer.kind, LayerKind::EmlConvolutional(_))
+            if ((matches!(layer.kind, LayerKind::EmlConvolutional(_))
                 && !preserve_device_eml_params
                     .get(index)
                     .copied()
@@ -2542,12 +2540,10 @@ where
                     && !preserve_device_moe_params
                         .get(index)
                         .copied()
-                        .unwrap_or(false))
-            {
-                if let Some(slots) = cache.get_mut(index) {
+                        .unwrap_or(false)))
+                && let Some(slots) = cache.get_mut(index) {
                     slots.clear();
                 }
-            }
         }
         Ok(())
     }

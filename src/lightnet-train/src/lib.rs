@@ -6,6 +6,7 @@
 //! This crate sits above `lightnet-runtime` and re-exports everything below it
 //! (`pub use lightnet_runtime::*`), so `crate::runtime::...`, `crate::model::...`
 //! and the other module paths keep working inside the moved sources.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 pub use lightnet_runtime::*;
 

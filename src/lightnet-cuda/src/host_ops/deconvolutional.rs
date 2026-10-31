@@ -41,7 +41,7 @@ pub fn forward(
                     for c in 0..channels {
                         for ky in 0..kernel_size {
                             let iy_num = oy as isize - ky as isize;
-                            if iy_num < 0 || iy_num as usize % stride != 0 {
+                            if iy_num < 0 || !(iy_num as usize).is_multiple_of(stride) {
                                 continue;
                             }
                             let iy = iy_num as usize / stride;
@@ -50,7 +50,7 @@ pub fn forward(
                             }
                             for kx in 0..kernel_size {
                                 let ix_num = ox as isize - kx as isize;
-                                if ix_num < 0 || ix_num as usize % stride != 0 {
+                                if ix_num < 0 || !(ix_num as usize).is_multiple_of(stride) {
                                     continue;
                                 }
                                 let ix = ix_num as usize / stride;

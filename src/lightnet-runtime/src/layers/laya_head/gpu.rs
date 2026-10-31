@@ -33,7 +33,7 @@ where
     let heads = spec.heads;
     let layers = spec.n_layers;
     let ffn_dim = spec.ffn_dim;
-    if input_dims[2] != 1 || hidden == 0 || heads == 0 || hidden % heads != 0 {
+    if input_dims[2] != 1 || hidden == 0 || heads == 0 || !hidden.is_multiple_of(heads) {
         return Err(Error::InvalidConfig(format!(
             "[laya_head] incompatible input geometry {input_dims:?} for hidden={hidden}, heads={heads}"
         )));

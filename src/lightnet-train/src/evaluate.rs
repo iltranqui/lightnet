@@ -269,7 +269,7 @@ impl ObbValidationDataset {
                         *y /= image.shape.height as f32;
                     }
                     ObbDetectionGeometry::CarpnQuad(vertices) => {
-                        for point in vertices.chunks_exact_mut(2) {
+                        for point in vertices.as_chunks_mut::<2>().0 {
                             point[0] /= image.shape.width as f32;
                             point[1] /= image.shape.height as f32;
                         }

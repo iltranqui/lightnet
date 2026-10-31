@@ -3,6 +3,7 @@
 //! This crate does not require a CUDA driver for CPU builds.  It defines the
 //! operation traits and tensor metadata needed by the core executor; the
 //! optional cuTile bridge supplies a concrete device implementation.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 // Same pinned-nightly exact-erf reference as lightnet-core's LAYA math.
 #![feature(float_erf)]
@@ -4289,7 +4290,7 @@ pub trait F32TensorOpsBackend {
         heads: usize,
     ) -> Result<(Self::Tensor, Self::Tensor), Self::Error> {
         assert!(
-            batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels % heads == 0,
+            batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels.is_multiple_of(heads),
             "flash_attention_forward_f32: invalid dimensions"
         );
         let rows = batch * tokens;
@@ -4331,7 +4332,7 @@ pub trait F32TensorOpsBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         let _ = config;
-        assert!(batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels % heads == 0);
+        assert!(batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels.is_multiple_of(heads));
         assert!(
             channels / heads <= 128,
             "LayaHead attention head dim exceeds 128"
@@ -4599,7 +4600,7 @@ pub trait F32TensorOpsBackend {
         config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {
         let _ = config;
-        assert!(batch > 0 && sequence > 0 && hidden > 0 && heads > 0 && hidden % heads == 0);
+        assert!(batch > 0 && sequence > 0 && hidden > 0 && heads > 0 && hidden.is_multiple_of(heads));
         assert_eq!(output_shape, [batch * sequence, hidden]);
         let hd = hidden / heads;
         assert_eq!(hd % 2, 0);
@@ -4742,7 +4743,7 @@ pub trait F32TensorOpsBackend {
         heads: usize,
     ) -> Result<Self::Tensor, Self::Error> {
         assert!(
-            batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels % heads == 0,
+            batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels.is_multiple_of(heads),
             "flash_attention_backward_f32: invalid dimensions"
         );
         let rows = batch * tokens;
@@ -5183,7 +5184,7 @@ pub trait F32TensorOpsBackend {
     ) -> Result<Self::Tensor, Self::Error> {
         let _ = config;
         assert!(
-            shape.len() == 4 && groups > 0 && shape[1] % groups == 0,
+            shape.len() == 4 && groups > 0 && shape[1].is_multiple_of(groups),
             "channel_shuffle_f32: bad shape {shape:?} or groups {groups}"
         );
         let (rows, cols) = if inverse {

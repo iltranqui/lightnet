@@ -141,7 +141,7 @@ fn layout(
             "filters, groups, size, strides, and dilation must be positive",
         ));
     }
-    if input_shape.channels % spec.groups != 0 || spec.filters % spec.groups != 0 {
+    if !input_shape.channels.is_multiple_of(spec.groups) || !spec.filters.is_multiple_of(spec.groups) {
         return Err(invalid(
             "groups must divide both input channels and filters",
         ));

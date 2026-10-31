@@ -3528,7 +3528,7 @@ fn parse_recursive_block_spec(
             section.name
         )));
     }
-    if lattice_group > 1 && input_shape.channels % lattice_group != 0 {
+    if lattice_group > 1 && !input_shape.channels.is_multiple_of(lattice_group) {
         return Err(Error::InvalidConfig(format!(
             "[{}] at line {line}: lattice_group={lattice_group} must divide input channels={}",
             section.name, input_shape.channels
@@ -3958,8 +3958,8 @@ fn parse_depth_anything_spec(
             )));
         }
         let blob = bytes[HEADER_BYTES..]
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+            .as_chunks::<4>().0.iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect::<Vec<_>>();
         spec.external_weights = Some(
             crate::depth_anything::geometry::DepthAnythingWeights::from_blob(&blob, &geometry).map_err(
@@ -4400,7 +4400,7 @@ fn parse_layer_kind(
                 } else if configured.len() == required_directional_anchors {
                     let mut anchors = Vec::with_capacity(required_anchors);
                     let mut offsets = Vec::with_capacity(total);
-                    for anchor in configured.chunks_exact(4) {
+                    for anchor in configured.as_chunks::<4>().0 {
                         anchors.extend_from_slice(&anchor[..2]);
                         if !anchor[2].is_finite() || !anchor[3].is_finite() {
                             return Err(Error::InvalidConfig(format!(
@@ -4572,7 +4572,7 @@ fn parse_layer_kind(
             }
             let mut candidates = section.get_usize("candidates", 0)?;
             if candidates == 0 {
-                if inputs % groups != 0 {
+                if !inputs.is_multiple_of(groups) {
                     return Err(Error::InvalidConfig(format!(
                         "[jev_ce] at line {line}: cannot infer candidates, {inputs} outputs are not divisible by groups={groups}"
                     )));
@@ -4833,7 +4833,7 @@ fn parse_layer_kind(
             })
         }
         "yolox" | "ppyoloe" | "yolonas" => {
-            let spec = parse_modern_yolo_spec(&section)?;
+            let spec = parse_modern_yolo_spec(section)?;
             match spec.kind {
                 ModernYoloKind::Yolox => LayerKind::Yolox(spec),
                 ModernYoloKind::Ppyoloe => LayerKind::Ppyoloe(spec),
@@ -4841,16 +4841,16 @@ fn parse_layer_kind(
             }
         }
         "swin" | "swin_block" | "transformer" | "transformer_block" => {
-            LayerKind::Swin(parse_swin_spec(&section, current)?)
+            LayerKind::Swin(parse_swin_spec(section, current)?)
         }
         "tucker" | "tucker_attention" | "tucker_attn" => {
-            LayerKind::TuckerAttention(parse_tucker_attention_spec(&section, current)?)
+            LayerKind::TuckerAttention(parse_tucker_attention_spec(section, current)?)
         }
         "mambavision" | "mambavision_block" => {
-            LayerKind::MambaVision(parse_mambavision_spec(&section, current)?)
+            LayerKind::MambaVision(parse_mambavision_spec(section, current)?)
         }
         "kimi_kda" | "kimi_delta_attention" => {
-            LayerKind::KimiKda(parse_kimi_kda_spec(&section, current)?)
+            LayerKind::KimiKda(parse_kimi_kda_spec(section, current)?)
         }
         "vit" => {
             let line = section.line;
@@ -5454,7 +5454,7 @@ fn infer_output_shape(
             Ok(TensorShape::new(width, height, spec.filters, current.batch))
         }
         LayerKind::Dcnv4(spec) => {
-            if current.channels == 0 || spec.groups == 0 || current.channels % spec.groups != 0 {
+            if current.channels == 0 || spec.groups == 0 || !current.channels.is_multiple_of(spec.groups) {
                 return Err(Error::InvalidConfig(format!(
                     "[dcnv4] layer #{layer_index}: groups must be positive and divide input channels"
                 )));
@@ -5571,7 +5571,7 @@ fn infer_output_shape(
             }
             if spec.filters == 0
                 || spec.groups == 0
-                || current.channels % spec.groups != 0
+                || !current.channels.is_multiple_of(spec.groups)
                 || spec.filters % spec.groups != 0
             {
                 return Err(Error::InvalidConfig(format!(
@@ -5612,7 +5612,7 @@ fn infer_output_shape(
                 || conv.stride_y == 0
                 || conv.dilation == 0
                 || conv.groups == 0
-                || current.channels % conv.groups != 0
+                || !current.channels.is_multiple_of(conv.groups)
                 || conv.filters % conv.groups != 0
             {
                 return Err(Error::InvalidConfig(format!(
@@ -6043,7 +6043,7 @@ fn infer_output_shape(
             ))
         }
         LayerKind::ChannelShuffle(spec) => {
-            if spec.groups == 0 || current.channels % spec.groups != 0 {
+            if spec.groups == 0 || !current.channels.is_multiple_of(spec.groups) {
                 return Err(Error::InvalidConfig(format!(
                     "channel_shuffle layer #{layer_index} requires channels={} divisible by groups={}",
                     current.channels, spec.groups
@@ -7125,7 +7125,7 @@ fn parse_graph_conv_spec(section: &RawSection, input: TensorShape) -> Result<Gra
     let stride_y = usize::try_from(stride_y).map_err(|_| invalid("stride_y is out of range"))?;
     let dilation = usize::try_from(dilation).map_err(|_| invalid("dilation is out of range"))?;
     let padding = usize::try_from(raw_padding).map_err(|_| invalid("padding is out of range"))?;
-    if input.channels % groups != 0 || filters % groups != 0 {
+    if !input.channels.is_multiple_of(groups) || filters % groups != 0 {
         return Err(invalid(
             "groups must divide both input channels and filters",
         ));
@@ -7759,7 +7759,7 @@ fn parse_dsconv_spec(section: &RawSection, input: TensorShape) -> Result<DsConvS
     if !(0.0..1.0).contains(&drop_prob) {
         return Err(invalid("drop_prob must be in [0, 1)"));
     }
-    if morph < 0 || morph > 2 {
+    if !(0..=2).contains(&morph) {
         morph = 0;
     }
     if morph == 2 && filters < 2 {
@@ -7934,7 +7934,7 @@ fn parse_deform_conv_spec(section: &RawSection, input: TensorShape) -> Result<De
     let stride_y = usize::try_from(stride_y).map_err(|_| invalid("stride_y must be positive"))?;
     let filters = filters as usize;
     let groups = groups as usize;
-    if input.channels % groups != 0 || filters % groups != 0 {
+    if !input.channels.is_multiple_of(groups) || !filters.is_multiple_of(groups) {
         return Err(invalid(
             "groups must divide both input channels and filters",
         ));
@@ -8024,7 +8024,7 @@ fn parse_dcnv4_spec(section: &RawSection, input: TensorShape) -> Result<Dcnv4Spe
     if input.width == 0 || input.height == 0 || input.channels == 0 {
         return Err(invalid("preceding layer must output a non-empty image"));
     }
-    if groups == 0 || input.channels % groups != 0 {
+    if groups == 0 || !input.channels.is_multiple_of(groups) {
         return Err(invalid(&format!(
             "groups={groups} must evenly divide input channels={}",
             input.channels
@@ -8116,7 +8116,7 @@ fn parse_swin_spec(section: &RawSection, input: TensorShape) -> Result<SwinSpec>
             section.name
         )));
     }
-    if input.channels % heads != 0 {
+    if !input.channels.is_multiple_of(heads) {
         return Err(Error::InvalidConfig(format!(
             "[{}] at line {line}: input channels={} must be divisible by heads={heads}",
             section.name, input.channels
@@ -8330,7 +8330,7 @@ fn parse_tucker_attention_spec(
             section.name, input.channels
         )));
     }
-    if input.channels % heads != 0 {
+    if !input.channels.is_multiple_of(heads) {
         return Err(Error::InvalidConfig(format!(
             "[{}] at line {line}: input channels={} must be divisible by heads={heads}",
             section.name, input.channels

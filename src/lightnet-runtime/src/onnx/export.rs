@@ -129,8 +129,8 @@ pub fn export_onnx(
                     let clean = format!("layer_{index:03}_clean");
                     let zero = format!("layer_{index:03}_zero");
                     exporter.add_f32(&zero, &[], &[0.0]);
-                    exporter.add_node("IsNaN", &nan, &[input.clone()], &nan, vec![]);
-                    exporter.add_node("IsInf", &inf, &[input.clone()], &inf, vec![]);
+                    exporter.add_node("IsNaN", &nan, std::slice::from_ref(&input), &nan, vec![]);
+                    exporter.add_node("IsInf", &inf, std::slice::from_ref(&input), &inf, vec![]);
                     exporter.add_node("Or", &invalid, &[nan, inf], &invalid, vec![]);
                     exporter.add_node("Where", &clean, &[invalid, zero, input], &clean, vec![]);
                     exporter.add_node("Sigmoid", &output, &[clean], &output, vec![]);
@@ -164,7 +164,7 @@ pub fn export_onnx(
     let input = value_info_typed("input", &input_dims, options.fp16);
     let segmentation_heads: Vec<_> = network.layers.iter().enumerate()
         .filter(|(index, layer)| matches!(layer.kind, LayerKind::Segmentation(_)) || (*index + 1 == network.layers.len() && matches!(layer.kind, LayerKind::Logistic | LayerKind::Softmax { spatial: true, .. })))
-        .map(|(index, layer)| (index, layer.output_shape.clone()))
+        .map(|(index, layer)| (index, layer.output_shape))
         .collect();
     let outputs = if !segmentation_heads.is_empty() {
         let mut results = Vec::with_capacity(segmentation_heads.len());
@@ -253,7 +253,7 @@ impl Exporter<'_> {
         };
         let input_channels = layer.input_shape.channels;
         let groups = spec.groups.max(1);
-        if input_channels % groups != 0 || spec.filters % groups != 0 {
+        if !input_channels.is_multiple_of(groups) || !spec.filters.is_multiple_of(groups) {
             return Err(unsupported(
                 index,
                 "convolution with invalid group dimensions",
@@ -363,7 +363,7 @@ impl Exporter<'_> {
             Activation::Mish => self.add_node("Mish", &name, &[input], &output, vec![]),
             Activation::Swish => {
                 let sigmoid = format!("{name}_sigmoid");
-                self.add_node("Sigmoid", &sigmoid, &[input.clone()], &sigmoid, vec![]);
+                self.add_node("Sigmoid", &sigmoid, std::slice::from_ref(&input), &sigmoid, vec![]);
                 self.add_node("Mul", &name, &[input, sigmoid], &output, vec![]);
             }
             Activation::Relu6 => {
@@ -416,7 +416,7 @@ impl Exporter<'_> {
                     return Err(unsupported(index, "route group_id out of range"));
                 }
                 let channels = self.network.layers[sources[0]].output_shape.channels;
-                if channels % groups != 0 {
+                if !channels.is_multiple_of(groups) {
                     return Err(unsupported(
                         index,
                         "route groups do not divide source channels",

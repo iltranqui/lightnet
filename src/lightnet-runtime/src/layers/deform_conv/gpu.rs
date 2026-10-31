@@ -617,8 +617,8 @@ where
             for (dst, src) in train.offset_bias_updates.iter_mut().zip(d_ob) {
                 *dst += src;
             }
-            if let (Some(dw), Some(db)) = (d_mw, d_mb) {
-                if let (Some(dst_w), Some(dst_b)) = (
+            if let (Some(dw), Some(db)) = (d_mw, d_mb)
+                && let (Some(dst_w), Some(dst_b)) = (
                     train.mask_weight_updates.as_mut(),
                     train.mask_bias_updates.as_mut(),
                 ) {
@@ -629,7 +629,6 @@ where
                         *dst += src;
                     }
                 }
-            }
         }
         self.accumulate_previous_gpu_gradient(
             layer.index,

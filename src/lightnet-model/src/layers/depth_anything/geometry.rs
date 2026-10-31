@@ -45,13 +45,13 @@ impl DepthAnythingGeometry {
                 "depth_anything dimensions, depth, heads, and taps must be positive".into(),
             );
         }
-        if self.dim % self.heads != 0 {
+        if !self.dim.is_multiple_of(self.heads) {
             return Err(format!(
                 "depth_anything dim={} must be divisible by heads={}",
                 self.dim, self.heads
             ));
         }
-        if self.height % self.patch_size != 0 || self.width % self.patch_size != 0 {
+        if !self.height.is_multiple_of(self.patch_size) || !self.width.is_multiple_of(self.patch_size) {
             return Err(format!(
                 "depth_anything input {}x{} must be divisible by patch_size={}",
                 self.width, self.height, self.patch_size

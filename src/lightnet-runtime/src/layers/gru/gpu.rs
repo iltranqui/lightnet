@@ -41,7 +41,7 @@ where
         let mut tape=Vec::with_capacity(spec.steps);let mut outputs=Vec::with_capacity(spec.steps);
         for t in 0..spec.steps {
             let x=be.sequence_slice_f32(input,&tensor_backend_shape(layer.input_shape),t,spec.steps,&[batch,ins],config).map_err(err)?;
-            let lin=|x:&B::Tensor,i:usize|be.connected_f32(x,&weights[2*i+1],&weights[2*i],batch,if i%2==0{ins}else{outs},outs,config).map_err(err);
+            let lin=|x:&B::Tensor,i:usize|be.connected_f32(x,&weights[2*i+1],&weights[2*i],batch,if i.is_multiple_of(2){ins}else{outs},outs,config).map_err(err);
             let gate=|a:B::Tensor,b:B::Tensor|->Result<B::Tensor>{
                 let pre=be.vector_add_f32(&a,&b,config).map_err(err)?;
                 be.activation_f32(&pre,F32ActivationKind::Logistic,config).map_err(err)
@@ -85,7 +85,7 @@ where
             let dz=gate_grad(&mul(&dh,&difference)?,&step.z)?;
             let dn=gate_grad(&mul(&dh,&complement(&step.z)?)?,&step.candidate)?;
             let mut lin=|x:&B::Tensor,dy:&B::Tensor,i:usize|->Result<B::Tensor>{
-                let(dx,dw,db)=be.connected_backward_f32(x,&cache.weights[2*i+1],dy,batch,if i%2==0{ins}else{outs},outs,config).map_err(err)?;
+                let(dx,dw,db)=be.connected_backward_f32(x,&cache.weights[2*i+1],dy,batch,if i.is_multiple_of(2){ins}else{outs},outs,config).map_err(err)?;
                 gradients[2*i]=add(&gradients[2*i],&db)?;
                 gradients[2*i+1]=add(&gradients[2*i+1],&dw)?;Ok(dx)
             };

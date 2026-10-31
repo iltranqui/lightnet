@@ -95,15 +95,15 @@ fn validate_geometry(
     let groups = spec.groups.max(1);
     if spec.filters == 0
         || spec.size == 0
-        || spec.size % 2 == 0
+        || spec.size.is_multiple_of(2)
         || spec.stride_x == 0
         || spec.stride_y == 0
         || spec.dilation == 0
         || input.channels == 0
         || input.height == 0
         || input.width == 0
-        || input.channels % groups != 0
-        || spec.filters % groups != 0
+        || !input.channels.is_multiple_of(groups)
+        || !spec.filters.is_multiple_of(groups)
         || !matches!(spec.edge_mode, 0 | 1)
     {
         return Err(Error::InvalidConfig(

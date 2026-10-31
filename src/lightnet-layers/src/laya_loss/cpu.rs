@@ -175,7 +175,7 @@ pub fn laya_loss_compute(
             }
         }
     }
-    let mut loss = ce_sum / 1.0f64.max(n_real as f64) as f64;
+    let mut loss = ce_sum / 1.0f64.max(n_real as f64);
     if mode != 1 {
         return Ok(LayaLossOutput {
             loss: loss as f32,

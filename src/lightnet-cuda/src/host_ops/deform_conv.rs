@@ -67,7 +67,7 @@ pub struct OffsetStats {
 }
 
 pub fn offset_stats(raw: &[f32], per_batch: usize, max_offset: f32) -> Result<OffsetStats, String> {
-    if per_batch == 0 || raw.is_empty() || raw.len() % per_batch != 0 {
+    if per_batch == 0 || raw.is_empty() || !raw.len().is_multiple_of(per_batch) {
         return Err("offset_stats requires a positive per_batch that divides the input".to_owned());
     }
     if !max_offset.is_finite() || max_offset <= 0.0 {
@@ -126,7 +126,7 @@ pub fn offset_envelope(
         .checked_mul(spatial)
         .filter(|&v| v > 0)
         .ok_or_else(|| "offset_envelope requires positive planes and spatial".to_owned())?;
-    if raw.is_empty() || raw.len() % per_batch != 0 {
+    if raw.is_empty() || !raw.len().is_multiple_of(per_batch) {
         return Err("offset_envelope: raw is not a multiple of planes*spatial".to_owned());
     }
     let batch = raw.len() / per_batch;
@@ -213,7 +213,7 @@ pub fn accumulate(
 ) -> Result<Vec<f32>, String> {
     let kernels = g.kernels();
     let plane = g.plane();
-    if g.channels % g.channels_per_group != 0 || g.filters % g.filters_per_group != 0 {
+    if !g.channels.is_multiple_of(g.channels_per_group) || !g.filters.is_multiple_of(g.filters_per_group) {
         return Err("deform accumulate: groups must divide channels and filters".to_owned());
     }
     let input_len = g
@@ -227,7 +227,7 @@ pub fn accumulate(
     if input.len() != input_len
         || offsets.len() != offset_len
         || weights.len() != weight_len
-        || masks.map_or(false, |m| m.len() != mask_len)
+        || masks.is_some_and(|m| m.len() != mask_len)
     {
         return Err("deform accumulate: operand length mismatch".to_owned());
     }
@@ -306,7 +306,7 @@ pub fn accumulate_backward(
         || offsets.len() != offset_len
         || weights.len() != weight_len
         || output_grad.len() != g.batch * g.filters * plane
-        || masks.map_or(false, |m| m.len() != mask_len)
+        || masks.is_some_and(|m| m.len() != mask_len)
     {
         return Err("deform accumulate_backward: operand length mismatch".to_owned());
     }
@@ -683,7 +683,7 @@ pub fn offset_envelope_backward(
             "offset_envelope_backward requires positive planes and spatial".to_owned()
         })?;
     if raw.is_empty()
-        || raw.len() % per_batch != 0
+        || !raw.len().is_multiple_of(per_batch)
         || output_grad.len() != raw.len()
         || mean.len() != raw.len() / per_batch
         || inv_std.len() != mean.len()
@@ -803,7 +803,7 @@ pub fn offset_normalization_backward(
 ) -> Result<Vec<f32>, String> {
     if per_batch == 0
         || stage1.is_empty()
-        || stage1.len() % per_batch != 0
+        || !stage1.len().is_multiple_of(per_batch)
         || gradient.len() != stage1.len()
     {
         return Err("offset_normalization_backward: length mismatch".to_owned());
@@ -1326,7 +1326,7 @@ pub fn offset_envelope_pre_backward(
             "offset_envelope_pre_backward requires positive planes and spatial".to_owned()
         })?;
     if raw.is_empty()
-        || raw.len() % per_batch != 0
+        || !raw.len().is_multiple_of(per_batch)
         || output_grad.len() != raw.len()
         || mean.len() != raw.len() / per_batch
         || inv_std.len() != mean.len()

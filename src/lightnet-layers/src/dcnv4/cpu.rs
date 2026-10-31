@@ -83,7 +83,7 @@ fn layout(input_shape: TensorShape, spec: &Dcnv4Spec) -> Result<Layout> {
             spec.filters, input_shape.channels
         )));
     }
-    if spec.groups == 0 || input_shape.channels % spec.groups != 0 {
+    if spec.groups == 0 || !input_shape.channels.is_multiple_of(spec.groups) {
         return Err(invalid(format!(
             "groups={} must divide input channels={}",
             spec.groups, input_shape.channels

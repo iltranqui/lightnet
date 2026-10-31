@@ -48,7 +48,7 @@ pub(crate) fn geometry(layer: &Layer, spec: &SwinSpec) -> SwinGeometry {
 pub(crate) fn supported(g: &SwinGeometry) -> bool {
     g.heads > 0
         && g.window > 0
-        && g.channels % g.heads == 0
+        && g.channels.is_multiple_of(g.heads)
         && device_activation(&g.activation).is_some()
 }
 

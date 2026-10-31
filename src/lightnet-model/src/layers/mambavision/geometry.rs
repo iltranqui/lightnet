@@ -64,10 +64,10 @@ impl MambaVisionGeometry {
         if self.batch == 0 || self.channels == 0 || self.height == 0 || self.width == 0 {
             return Err("MambaVision requires a nonempty BxCxHxW input".into());
         }
-        if self.filters < 2 || self.filters % 2 != 0 {
+        if self.filters < 2 || !self.filters.is_multiple_of(2) {
             return Err("MambaVision filters must be even and >= 2".into());
         }
-        if self.state_size == 0 || self.conv_size == 0 || self.conv_size % 2 == 0 {
+        if self.state_size == 0 || self.conv_size == 0 || self.conv_size.is_multiple_of(2) {
             return Err(
                 "MambaVision state must be positive and conv_size must be positive odd".into(),
             );
@@ -75,7 +75,7 @@ impl MambaVisionGeometry {
         if self.dt_rank == 0 || self.ffn_ratio == 0 || self.msa_heads == 0 {
             return Err("MambaVision dt_rank, ffn_ratio, and msa_heads must be positive".into());
         }
-        if self.filters % self.msa_heads != 0 {
+        if !self.filters.is_multiple_of(self.msa_heads) {
             return Err("MambaVision filters must be divisible by msa_heads".into());
         }
         let tokens = checked_product(&[self.height, self.width], "token count")?;
@@ -201,10 +201,10 @@ impl MambaOffsets {
         dt_rank: usize,
         ffn_ratio: usize,
     ) -> Result<Self, String> {
-        if channels == 0 || filters < 2 || filters % 2 != 0 {
+        if channels == 0 || filters < 2 || !filters.is_multiple_of(2) {
             return Err("MambaVision parameters require channels > 0 and even filters >= 2".into());
         }
-        if state_size == 0 || conv_size == 0 || conv_size % 2 == 0 || dt_rank == 0 || ffn_ratio == 0
+        if state_size == 0 || conv_size == 0 || conv_size.is_multiple_of(2) || dt_rank == 0 || ffn_ratio == 0
         {
             return Err("MambaVision parameter geometry contains a zero/invalid dimension".into());
         }

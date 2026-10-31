@@ -47,7 +47,7 @@ pub fn dropout_unit(seed: u64, index: u64) -> f32 {
 /// Softmax over every contiguous `group_size` run of `x`.
 pub fn softmax(x: &[f32], group_size: usize) -> Vec<f32> {
     assert!(
-        group_size > 0 && x.len() % group_size == 0,
+        group_size > 0 && x.len().is_multiple_of(group_size),
         "softmax: bad group size"
     );
     let mut out = vec![0.0f32; x.len()];
@@ -172,7 +172,7 @@ pub fn flash_attention_forward(
     heads: usize,
 ) -> (Vec<f32>, Vec<f32>) {
     assert!(
-        batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels % heads == 0,
+        batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels.is_multiple_of(heads),
         "flash_attention_forward: invalid dimensions"
     );
     let rows = batch * tokens;
@@ -260,7 +260,7 @@ pub fn flash_attention_backward(
     heads: usize,
 ) -> Vec<f32> {
     assert!(
-        batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels % heads == 0,
+        batch > 0 && tokens > 0 && channels > 0 && heads > 0 && channels.is_multiple_of(heads),
         "flash_attention_backward: invalid dimensions"
     );
     let rows = batch * tokens;
@@ -395,7 +395,7 @@ pub fn flash_attention_backward(
 /// Adding the result to the layer input is the forward shortcut; applying it
 /// to the layer gradient gives the gradient of the (cropped/padded) source.
 pub fn shortcut_fit(x: &[f32], batch: usize, to_len: usize) -> Vec<f32> {
-    assert!(batch > 0 && x.len() % batch == 0, "shortcut_fit: bad batch");
+    assert!(batch > 0 && x.len().is_multiple_of(batch), "shortcut_fit: bad batch");
     let from_len = x.len() / batch;
     let copied = from_len.min(to_len);
     let mut out = vec![0.0f32; batch * to_len];
@@ -412,7 +412,7 @@ pub fn shortcut_fit(x: &[f32], batch: usize, to_len: usize) -> Vec<f32> {
 /// **output**, so the caller passes the forward's result rather than its logits.
 pub fn softmax_backward(y: &[f32], dy: &[f32], group_size: usize) -> Vec<f32> {
     assert!(
-        group_size > 0 && y.len() == dy.len() && y.len() % group_size == 0,
+        group_size > 0 && y.len() == dy.len() && y.len().is_multiple_of(group_size),
         "softmax backward: bad group size"
     );
     let mut dx = vec![0.0f32; y.len()];
@@ -680,11 +680,11 @@ pub fn constrain(x: &[f32], limit: f32) -> Vec<f32> {
 /// `f_size % 32 == 0`, otherwise the input is returned unchanged.
 pub fn gradient_centralization(x: &[f32], f_size: usize) -> Vec<f32> {
     assert!(
-        f_size > 0 && x.len() % f_size == 0,
+        f_size > 0 && x.len().is_multiple_of(f_size),
         "gradient_centralization: bad filter size"
     );
     let mut out = x.to_vec();
-    if f_size % 32 != 0 {
+    if !f_size.is_multiple_of(32) {
         return out;
     }
     for filter in out.chunks_mut(f_size) {
@@ -1156,7 +1156,7 @@ pub fn batchnorm_train_forward(
     keep: f32,
 ) -> BatchNormTrainHost {
     assert!(
-        channels > 0 && spatial > 0 && x.len() % (channels * spatial) == 0,
+        channels > 0 && spatial > 0 && x.len().is_multiple_of(channels * spatial),
         "batchnorm: bad layout"
     );
     assert!(
@@ -1210,7 +1210,7 @@ pub fn batchnorm_train_backward(
         channels > 0
             && spatial > 0
             && dy.len() == x_hat.len()
-            && dy.len() % (channels * spatial) == 0
+            && dy.len().is_multiple_of(channels * spatial)
             && variance.len() == channels
             && scales.len() == channels,
         "batchnorm backward: bad layout"

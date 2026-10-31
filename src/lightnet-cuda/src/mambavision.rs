@@ -221,7 +221,7 @@ pub fn msa_forward(
     block_size: usize,
     topk: usize,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<bool>, bool), String> {
-    if heads == 0 || channels % heads != 0 || block_size == 0 || topk == 0 {
+    if heads == 0 || !channels.is_multiple_of(heads) || block_size == 0 || topk == 0 {
         return Err("MambaVision MSA requires positive block/head geometry".into());
     }
     let dim = channels / heads;
