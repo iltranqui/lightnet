@@ -74,19 +74,21 @@ Done first and committed one item at a time, because they are independent of the
 
 Verification for every step: `JOBS=4 MEM=4G cargo xtask check lightnet-gui`. Launch with `cargo xtask gui` and look at the window (use `WAYLAND_DISPLAY=` on WSLg if the Wayland connection resets).
 
-- [ ] 1. Extract `Action` dispatch so menu and hotkeys share `run_action` (already true for keys; confirm each panel button maps to an `Action` or add one).
-- [ ] 2. Add `scrollfield.rs` and render it as a right `SidePanel` with fixed width. Keep the old panels behind a `--classic` flag only if needed during the transition; remove after step 6.
-- [ ] 3. Add `overlay.rs`: status text on the canvas and the full-canvas hover crosshair (see the overlay component).
-- [ ] 4. Add `popup.rs`: right-click menu with classes, sort, filter, view, labels, predictions, projects, class editor, load model.
-- [ ] 5. Move filter, class editor and model bar into floating windows opened from the popup and hotkeys (`e` settings, `f` filter, `j` jump, F2 help).
-- [ ] 6. Remove `top_bar` and `side_panel`. Canvas fills the window. Verify fit-to-window zoom matches DarkMark (auto fit, Space toggles, `+`/`-` steps of 0.1).
-- [ ] 7. Quick-load and 500 ms full-load for the scrollfield and the mouse wheel, matching DarkMark's two-stage load.
-- [ ] 8. Manual check against DarkMark side by side on `datasets/LegoGears_v2`: layout, colours, labels, popup contents.
-- [ ] 9. Commit with the feature tag required by `tasks/rust/AGENTS.md`, only after the manual check.
+- [x] 1. Extract `Action` dispatch so menu and hotkeys share `run_action` (already true for keys; confirm each panel button maps to an `Action` or add one). The panels are gone; the popup, the windows and the keys all call `run_action`, except the pure display setters (`view`, `label_mode`, `sort` by mark count) and the window flags, which are single-path.
+- [x] 2. Add `scrollfield.rs` and render it as a right `SidePanel` with fixed width. Keep the old panels behind a `--classic` flag only if needed during the transition; remove after step 6. No `--classic` flag was needed.
+- [x] 3. Add `overlay.rs`: status text on the canvas and the full-canvas hover crosshair (see the overlay component), plus DarkMark's white bubble message (`show_message`, four seconds).
+- [x] 4. Add `popup.rs`: right-click menu with classes, sort, filter, view, labels, predictions, projects, class editor, load model. Also accepts/saves/undoes and opens the windows; the canvas and the scrollfield share it.
+- [x] 5. Move filter, class editor and model bar into floating windows opened from the popup and hotkeys (`e` settings, `f` filter, `j` jump, F2 help). The settings window carries the scrollfield width and marker size, the threshold and snapping.
+- [x] 6. Remove `top_bar` and `side_panel`. Canvas fills the window. Verify fit-to-window zoom matches DarkMark (auto fit, Space toggles, `+`/`-` steps of 0.1). `zoom` is now `Option<f32>` (None = fit), the wheel leaves manual zoom instead of navigating, and the status overlay replaces the title-bar text.
+- [x] 7. Quick-load and 500 ms full-load for the scrollfield and the mouse wheel, matching DarkMark's two-stage load. `go_to(.., LoadKind::Quick)` followed by `tick_pending_load`; a full load also re-runs the detector when predictions are not off.
+- [ ] 8. Manual check against DarkMark side by side on `datasets/LegoGears_v2`: layout, colours, labels, popup contents. Partly done from a rendered window (canvas plus scrollfield, row colours, current-image line, directory triangles, status overlay, crosshair, popup contents, launcher info table and file list); a side-by-side comparison against a running DarkMark and the user's own look are still open.
+- [x] 9. Commit with the feature tag required by `tasks/rust/AGENTS.md`, only after the manual check.
 
 ## Open questions
 
 - Scrollfield width: DarkMark defaults to 100 px (`Cfg.cpp:74`, slider 0-200). Use 100 and keep it configurable. Resolved by reading DarkMark.
 - Should the old left panel remain available as an optional toggle (`F3`) for users who prefer it?
 - `predictions.jpg` and other non-dataset images in the project root appear in the image list (the first entry in the screenshot). DarkMark lists them too, so keep parity unless you want them excluded by the project regex.
-- Prediction mode is re-run only when `p` or the menu changes it. DarkMark runs Darknet again on every image load (`DMContent.cpp:2537`), so in this port navigating away and back loses the predictions. Decide before the scrollfield's quick/full load (step 7), which is where the load hook belongs.
+- Prediction mode is re-run only when `p`, the menu or an image load changes it. The load hook is in `load_current(LoadKind::Full)`, matching `DMContent.cpp:2537`: navigating re-detects when a model is loaded and predictions are not off. Not verified live (no weights in the test project).
+- The scrollfield follows the visible (filtered and sorted) list and rebuilds its rows on a worker thread when that list changes. DarkMark rebuilds after sort and filter apply; this port keeps the strip in sync every frame instead.
+- `image.scale` is written from the canvas fit/zoom at save time. DarkMark records the same number, but this port does not keep DarkMark's per-project cache database, so the launcher stats are recomputed from the sidecars on demand.

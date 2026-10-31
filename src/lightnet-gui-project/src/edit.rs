@@ -190,7 +190,7 @@ impl Editor {
         best.map(|(index, corner, _)| (index, corner))
     }
 
-    pub fn press(&mut self, point: Point, mods: Mods, double_click: bool) {
+    pub fn press(&mut self, point: Point, mods: Mods, double_click: bool) -> bool {
         let point = self.clamp_point(point);
         if double_click && self.most_recent_size.0 >= MIN_SIZE && self.most_recent_size.1 >= MIN_SIZE {
             self.push_undo();
@@ -206,13 +206,14 @@ impl Editor {
             if let Some(mark) = mark {
                 self.marks.push(mark);
                 self.selected = Some(self.marks.len() - 1);
+                return true;
             }
-            return;
+            return false;
         }
 
         self.selected = self.hit_test(point);
         if mods.ctrl {
-            return; // Ctrl+drag pans; the GUI handles it.
+            return false; // Ctrl+drag pans; the GUI handles it.
         }
         if let Some((index, corner)) = self.corner_hit(point) {
             self.push_undo();
@@ -225,10 +226,11 @@ impl Editor {
                 press: point,
             });
             self.preview = Some((opposite, point));
-            return;
+            return true;
         }
         self.drag = Some(Drag::New { anchor: point });
         self.preview = Some((point, point));
+        false
     }
 
     pub fn drag(&mut self, point: Point) {

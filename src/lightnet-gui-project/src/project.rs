@@ -16,6 +16,19 @@ use regex::Regex;
 
 use crate::annotation::Annotation;
 
+#[derive(Clone, Debug, Default)]
+pub struct ProjectStats {
+    pub images: usize,
+    /// Images with at least one real mark.
+    pub annotated: usize,
+    /// Images flagged `completely_empty`.
+    pub negative: usize,
+    pub marks: usize,
+    pub per_class: Vec<usize>,
+    pub newest_markup: Option<std::time::SystemTime>,
+    pub oldest_markup: Option<std::time::SystemTime>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ImageEntry {
     pub path: PathBuf,
@@ -143,6 +156,44 @@ impl Project {
                 self.mark_counts[index] = count;
             }
         }
+    }
+
+    /// Project totals for the launcher's info table: annotated and negative
+    /// images, mark totals per class, and the newest and oldest markup times.
+    /// Reads every sidecar, so the launcher calls it on demand and not per
+    /// frame.
+    pub fn stats(&self) -> ProjectStats {
+        let mut stats = ProjectStats {
+            images: self.images.len(),
+            per_class: vec![0; self.classes.len()],
+            ..ProjectStats::default()
+        };
+        for entry in &self.images {
+            if let Ok(modified) = fs::metadata(&entry.json_path).and_then(|metadata| metadata.modified()) {
+                stats.newest_markup = Some(stats.newest_markup.map_or(modified, |value| value.max(modified)));
+                stats.oldest_markup = Some(stats.oldest_markup.map_or(modified, |value| value.min(modified)));
+            }
+            let Ok(text) = fs::read_to_string(&entry.json_path) else {
+                continue;
+            };
+            let Ok(annotation) = Annotation::from_json(&text) else {
+                continue;
+            };
+            if annotation.completely_empty {
+                stats.negative += 1;
+            }
+            let count = annotation.real_marks().count();
+            if count > 0 {
+                stats.annotated += 1;
+                stats.marks += count;
+            }
+            for mark in annotation.real_marks() {
+                if let Some(slot) = stats.per_class.get_mut(mark.class_id) {
+                    *slot += 1;
+                }
+            }
+        }
+        stats
     }
 
     /// Loads the annotation for `index`, preferring the JSON sidecar and falling

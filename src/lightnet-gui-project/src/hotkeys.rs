@@ -72,12 +72,19 @@ pub enum Action {
     /// `A`: accept the selected prediction only (`:1586`).
     AcceptSelected,
     /// `,` / `.`: signed normalized size delta applied to every mark (`:1606`).
-    Scale(f32),
+    Scale(f64),
     /// `p`: off -> auto -> off; `On` is skipped and reachable only from the menu
     /// (`:1687-1691`).
     TogglePredictions,
     /// Menu-only prediction mode: 0 off, 1 on, 2 auto (`EToggle`, `Cfg.hpp:12-18`).
     SetPredictions(u8),
+    /// Class pick from the popup menu: an absolute index, without the digit
+    /// key's Ctrl/Alt offsets (`set_class`, `:2081`).
+    SetClass(usize),
+    /// `e`: settings window. DarkMark saves first and returns false (`:2041`).
+    Settings,
+    /// `f`: save when dirty, then the filter window (`:2030-2046`).
+    Filter,
     ToggleMarks,
     /// `o`: mass-delete click-drag mode (`:1736`).
     MassDelete,
@@ -178,6 +185,8 @@ pub fn map_key(input: KeyInput) -> Option<Action> {    let mods = input.mods;
         Key::Char('.') => Some(Action::Scale(0.01)),
         Key::Char('p') => Some(Action::TogglePredictions),
         Key::Char('m') => Some(Action::ToggleMarks),
+        Key::Char('e') => Some(Action::Settings),
+        Key::Char('f') => Some(Action::Filter),
         Key::Char('o') => Some(Action::MassDelete),
         Key::Char('P') => Some(Action::Homography),
         Key::Char('`') => Some(Action::Merge),
@@ -230,6 +239,8 @@ mod tests {
             (Key::Char('.'), Action::Scale(0.01)),
             (Key::Char('p'), Action::TogglePredictions),
             (Key::Char('m'), Action::ToggleMarks),
+            (Key::Char('e'), Action::Settings),
+            (Key::Char('f'), Action::Filter),
             (Key::Char('o'), Action::MassDelete),
             (Key::Char('P'), Action::Homography),
             (Key::Char('`'), Action::Merge),

@@ -21,5 +21,5 @@ pub mod undo;
 pub use annotation::{Annotation, Mark, Point, VERSION};
 pub use edit::{Editor, Mods};
 pub use filter::{Filter, SortKey, Tri};
-pub use project::{ImageEntry, Project};
+pub use project::{ImageEntry, Project, ProjectStats};
 pub use undo::UndoStack;
