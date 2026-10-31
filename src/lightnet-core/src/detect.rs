@@ -1142,8 +1142,16 @@ pub fn decode_modern_detections(
                 }
             }
             LayerKind::Ppyoloe(spec) | LayerKind::Yolonas(spec) => {
-                let layout =
+                // A device-decoded head arrives as `[box x, y, w, h | objectness | classes]`
+                // (`modern_yolo_predecode_f32`): `classes + 5` channels where the full head has
+                // `4 * (reg_max + 1) + classes + 1`, which is never the same because
+                // `reg_max >= 1`. Its box channels are read directly.
+                let predecoded = head.output.shape.channels == spec.classes + 5;
+                let mut layout =
                     crate::modern_yolo::ModernLayout::for_spec(head.output.shape.batch, w, h, spec);
+                if predecoded {
+                    layout.coords = 4;
+                }
                 if head.output.data.len() != layout.len() {
                     return Err(Error::InvalidConfig(format!(
                         "distribution head tensor length mismatch: expected {}, got {}",
@@ -1178,13 +1186,24 @@ pub fn decode_modern_detections(
                             if score <= options.confidence_threshold {
                                 continue;
                             }
-                            let box_ = crate::modern_yolo::decode_modern_box(
-                                &head.output.data,
-                                &layout,
-                                0,
-                                n,
-                                loc,
-                            );
+                            let box_ = if predecoded {
+                                let at = layout.box_index(0, n, loc);
+                                let stride = layout.spatial();
+                                crate::modern_yolo::ModernBox {
+                                    x: head.output.data[at],
+                                    y: head.output.data[at + stride],
+                                    w: head.output.data[at + 2 * stride],
+                                    h: head.output.data[at + 3 * stride],
+                                }
+                            } else {
+                                crate::modern_yolo::decode_modern_box(
+                                    &head.output.data,
+                                    &layout,
+                                    0,
+                                    n,
+                                    loc,
+                                )
+                            };
                             detections.push(Detection {
                                 class_id: c,
                                 confidence: score,

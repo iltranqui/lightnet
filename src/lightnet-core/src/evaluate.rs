@@ -73,12 +73,17 @@ impl ValidationDataset {
             .iter()
             .filter_map(|l| match &l.kind {
                 LayerKind::Yolo(s) | LayerKind::GaussianYolo(s) => Some(s.classes),
+                // The anchor-free heads decode into the same `Detection`s (`detect.rs`).
+                LayerKind::Yolox(s) | LayerKind::Ppyoloe(s) | LayerKind::Yolonas(s) => {
+                    Some(s.classes)
+                }
+                LayerKind::CenterNet(s) => Some(s.classes),
                 _ => None,
             })
             .collect();
         let classes = *heads
             .first()
-            .ok_or_else(|| invalid("-map requires YOLO heads"))?;
+            .ok_or_else(|| invalid("-map requires YOLO, YOLOX, PP-YOLOE, YOLO-NAS or CenterNet heads"))?;
         if classes == 0
             || heads.iter().any(|c| *c != classes)
             || data.classes.is_some_and(|c| c != classes)

@@ -75,6 +75,8 @@ mod gpu_forward_compact;
 mod gpu_backward;
 mod gpu_backward_support;
 mod gpu_dense_loss;
+mod gpu_dense_head_loss;
+pub use gpu_dense_head_loss::GpuDenseHeadLoss;
 mod gpu_yolo_loss;
 pub use gpu_yolo_loss::GpuYoloLoss;
 mod gpu_params;

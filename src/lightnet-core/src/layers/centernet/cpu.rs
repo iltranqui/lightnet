@@ -397,7 +397,9 @@ pub fn centernet_train_batch(
             truth.len()
         )));
     }
-    let mut delta = vec![0.0f32; l.outputs()];
+    // `ct_index` is a whole-batch index, so the delta spans the batch; the caller
+    // slices image `b` out of it.
+    let mut delta = vec![0.0f32; l.len()];
     let mut hm_target = vec![0.0f32; l.batch * l.classes * spatial];
     let mut hm_weight = vec![1.0f32; l.batch * l.classes * spatial];
     let (mut hm_loss, mut wh_loss, mut off_loss) = (0.0f32, 0.0f32, 0.0f32);
@@ -479,7 +481,8 @@ pub fn centernet_train_batch(
     // ---- 2. heatmap focal loss over every cell ----
     let focal_alpha = spec.focal_alpha.max(0.0);
     let focal_beta = spec.focal_beta.max(0.0);
-    for bb in 0..l.batch {
+    // Only image `b`'s targets were drawn; the other images belong to their own call.
+    for bb in b..b + 1 {
         for c in 0..l.classes {
             for loc in 0..spatial {
                 let hti = (bb * l.classes + c) * spatial + loc;
@@ -608,7 +611,10 @@ pub fn centernet_training_delta(
     for b in 0..l.batch {
         let batch = centernet_train_batch(output, truth, l, spec, settings, b)?;
         let out = l.outputs();
-        for (dst, src) in delta[b * out..(b + 1) * out].iter_mut().zip(&batch.delta) {
+        for (dst, src) in delta[b * out..(b + 1) * out]
+            .iter_mut()
+            .zip(&batch.delta[b * out..(b + 1) * out])
+        {
             *dst += src;
         }
         hm_loss += batch.hm_loss;
@@ -951,5 +957,35 @@ mod tests {
         assert_eq!(smooth_l1_grad(0.5), 0.5);
         assert_eq!(smooth_l1_grad(2.0), 1.0);
         assert_eq!(smooth_l1_grad(-2.0), -1.0);
+    }
+
+    /// Regression: the delta buffer used to hold one image while the focal loss wrote the whole
+    /// batch, which indexed out of range from batch 2 up.
+    #[test]
+    fn a_batch_of_two_trains_each_image_separately() {
+        let one = layout(1, 4, 4);
+        let two = CenterNetLayout { batch: 2, ..one };
+        let mut s = spec(1);
+        s.max_boxes = 1;
+        let settings = CenterNetSettings {
+            net_width: 64,
+            net_height: 64,
+            ..CenterNetSettings::default()
+        };
+        let x1 = centernet_forward(&vec![0.0f32; one.len()], &one);
+        let mut x2 = x1.clone();
+        x2.extend_from_slice(&x1);
+        let row = [0.5, 0.5, 0.25, 0.25, 0.0, 0.0];
+        let (delta1, cost1, positives1) =
+            centernet_training_delta(&x1, &row, &one, &s, &settings).unwrap();
+        let mut truth2 = row.to_vec();
+        truth2.extend_from_slice(&row);
+        let (delta2, cost2, positives2) =
+            centernet_training_delta(&x2, &truth2, &two, &s, &settings).unwrap();
+        assert_eq!(positives2, 2 * positives1);
+        let out = one.outputs();
+        assert_eq!(&delta2[..out], &delta1[..]);
+        assert_eq!(&delta2[out..], &delta1[..], "image 1 must carry its own delta");
+        assert!((cost2 - cost1).abs() < 1e-5, "cost is per image: {cost2} vs {cost1}");
     }
 }

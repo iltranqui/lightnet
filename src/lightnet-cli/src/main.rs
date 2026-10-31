@@ -3273,7 +3273,23 @@ fn run_detector_train_gpu(
             let start = profile.as_ref().map(|_| Instant::now());
             // LIGHTNET_YOLO_GPU=1 opts into the native CIoU loss with device-resident
             // seeds; unsupported configurations fall back to the host loss.
-            let dense = if network_uses_dense_heads(&executable.network) {
+            // The dense box-table heads ([yolox], [ppyoloe], [yolonas], [centernet]) train on the
+            // device by default; LIGHTNET_DENSE_GPU=0 forces the host loss, which is also the
+            // fallback when the backend has no native loss.
+            let gpu_dense = if network_uses_dense_heads(&executable.network)
+                && std::env::var("LIGHTNET_DENSE_GPU").map_or(true, |v| v != "0")
+            {
+                executable.compute_dense_head_training_loss_gpu(&forward, &batch.labels)?
+            } else {
+                None
+            };
+            if batch_num == 0 && network_uses_dense_heads(&executable.network) {
+                println!(
+                    "dense-head loss: {}",
+                    if gpu_dense.is_some() { "native device" } else { "host fallback" }
+                );
+            }
+            let dense = if gpu_dense.is_none() && network_uses_dense_heads(&executable.network) {
                 let truth = dense_head_truth(&executable.network, &batch.labels)?;
                 Some(lightnet_core::compute_dense_training_loss_at(
                     &executable.network,
@@ -3286,13 +3302,14 @@ fn run_detector_train_gpu(
                 None
             };
             let gpu_yolo = if dense.is_none()
+                && gpu_dense.is_none()
                 && std::env::var("LIGHTNET_YOLO_GPU").is_ok_and(|v| v != "0")
             {
                 executable.compute_yolo_training_loss_gpu(&forward, &batch.labels)?
             } else {
                 None
             };
-            let host_yolo = if dense.is_none() && gpu_yolo.is_none() {
+            let host_yolo = if dense.is_none() && gpu_dense.is_none() && gpu_yolo.is_none() {
                 Some(compute_yolo_training_loss_with_state(
                     &executable.network,
                     &forward.cpu_forward,
@@ -3307,7 +3324,10 @@ fn run_detector_train_gpu(
                 phase_ms[2] += start.elapsed().as_secs_f64() * 1000.0;
             }
             let start = profile.as_ref().map(|_| Instant::now());
-            if let Some(dense) = &dense {
+            if let Some(gpu) = &gpu_dense {
+                iter_loss += gpu.loss;
+                executable.backward_accumulate_device_seeded_gpu(&forward, &gpu.device_seeds)?;
+            } else if let Some(dense) = &dense {
                 iter_loss += dense.loss;
                 executable
                     .backward_accumulate_seeded_gpu(&forward, &dense.layer_output_gradient_seeds)?;

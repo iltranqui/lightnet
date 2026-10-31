@@ -12,6 +12,9 @@ source tools/lib_cap.sh  # cwd is the repo root here
 oxide_arch_hint
 MEM="${MEM:-3G}"
 export RUSTUP_TOOLCHAIN=nightly-2026-08-28
+# Incremental codegen leaves the test binary with an undefined hidden `anon.*.llvm.*` symbol
+# (seen from swin `Arc<[usize]>::drop_slow`); a non-incremental build links.
+export CARGO_INCREMENTAL=0
 
 if [[ ! -x target/debug/cargo-oxide ]]; then
     printf 'Building cargo-oxide helper (missing after a clean build)...\n'

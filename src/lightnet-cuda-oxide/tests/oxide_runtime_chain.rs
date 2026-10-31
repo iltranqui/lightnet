@@ -8891,3 +8891,116 @@ fn conv_gpu_muon_device_update_matches_cpu_over_two_steps() {
         }
     }
 }
+
+/// Native `[yolox]` / `[ppyoloe]` / `[yolonas]` / `[centernet]` loss against the Rust CPU dense loss on a
+/// batch of two images (the second image catches batch-offset mistakes), including nested truths that
+/// collide on the same cells. The CPU loss is the reference; there is no compiled `raptor-fp4` golden.
+#[test]
+fn native_dense_head_loss_matches_cpu_loss_across_heads() {
+    use lightnet_core::YoloLabel;
+    use lightnet_core::train::dense_head_truth;
+
+    let label = |class_id: usize, x: f32, y: f32, w: f32, h: f32| YoloLabel { class_id, x, y, w, h };
+    let labels = vec![
+        vec![label(0, 0.5, 0.5, 0.5, 0.5), label(1, 0.52, 0.5, 0.2, 0.2), label(1, 0.2, 0.25, 0.15, 0.2)],
+        vec![label(1, 0.7, 0.6, 0.3, 0.25)],
+    ];
+    // (name, filters, head section)
+    let heads: [(&str, usize, &str); 5] = [
+        ("yolox", 7, "[yolox]\nclasses=2\nmax=8\n"),
+        ("ppyoloe", 23, "[ppyoloe]\nclasses=2\nmax=8\nreg_max=4\n"),
+        ("yolonas", 23, "[yolonas]\nclasses=2\nmax=8\nreg_max=4\n"),
+        ("yolonas vfl", 23, "[yolonas]\nclasses=2\nmax=8\nreg_max=4\nvfl_gamma=1.5\nmin_object_cells=2\n"),
+        ("centernet", 6, "[centernet]\nclasses=2\nmax=8\n"),
+    ];
+    for (name, filters, head) in heads {
+        let cfg = format!(
+            "[net]\nbatch=2\nwidth=16\nheight=16\nchannels=1\n\
+             [convolutional]\nfilters={filters}\nsize=1\nactivation=linear\n{head}"
+        );
+        let mut cpu = ExecutableNetwork::new(network(&cfg));
+        fill_params(&mut cpu.params);
+        let mut gpu = GpuExecutableNetwork::new(network(&cfg), OxideBackend::new().expect("Oxide backend"));
+        gpu.params = cpu.params.clone();
+        let input = patterned(cpu.network.net.input_shape());
+
+        let cpu_forward = cpu.forward_training(&input).expect("CPU dense forward");
+        let gpu_forward = gpu.forward_training_with_state(&input).expect("native dense forward");
+        let truth = dense_head_truth(&cpu.network, &labels).expect("dense truth");
+        let host = compute_dense_training_loss(&cpu.network, &cpu_forward, &input, &truth)
+            .expect("CPU dense loss");
+        let native = gpu
+            .compute_dense_head_training_loss_gpu(&gpu_forward, &labels)
+            .expect("native dense loss")
+            .unwrap_or_else(|| panic!("{name}: native loss declined a supported case"));
+
+        for (index, (host_seed, gpu_seed)) in host
+            .layer_output_gradient_seeds
+            .iter()
+            .zip(&native.device_seeds)
+            .enumerate()
+        {
+            match (host_seed, gpu_seed) {
+                (None, None) => {}
+                (Some(host_seed), Some(gpu_seed)) => {
+                    let gpu_host = gpu.backend.download_f32(gpu_seed).expect("download dense seed");
+                    close(&format!("{name}: head #{index} seed"), &host_seed.data, &gpu_host, 2e-3);
+                }
+                _ => panic!("{name}: head #{index} seed presence mismatch"),
+            }
+        }
+        close(&format!("{name}: loss"), &[host.loss], &[native.loss], 2e-3 * host.loss.abs().max(1.0));
+    }
+}
+
+/// The device box decode of the distribution heads against the host `decode_modern_box`, on two images.
+#[test]
+fn distribution_head_device_decode_matches_host_decode() {
+    use lightnet_core::modern_yolo::{ModernLayout, decode_modern_box};
+    use lightnet_core::LayerKind;
+
+    for (name, head, kind) in [
+        ("ppyoloe", "[ppyoloe]\nclasses=2\nreg_max=4\n", 1u32),
+        ("yolonas", "[yolonas]\nclasses=2\nreg_max=4\n", 2u32),
+    ] {
+        let cfg = format!(
+            "[net]\nbatch=2\nwidth=16\nheight=16\nchannels=1\n\
+             [convolutional]\nfilters=23\nsize=1\nactivation=linear\n{head}"
+        );
+        let mut cpu = ExecutableNetwork::new(network(&cfg));
+        fill_params(&mut cpu.params);
+        let mut gpu = GpuExecutableNetwork::new(network(&cfg), OxideBackend::new().expect("Oxide backend"));
+        gpu.params = cpu.params.clone();
+        let input = patterned(cpu.network.net.input_shape());
+        let cpu_forward = cpu.forward_training(&input).expect("CPU forward");
+        let gpu_forward = gpu.forward_training_with_state(&input).expect("native forward");
+
+        let layer = &cpu.network.layers[1];
+        let (LayerKind::Ppyoloe(spec) | LayerKind::Yolonas(spec)) = &layer.kind else {
+            panic!("{name}: expected a distribution head");
+        };
+        let shape = [2, 23, layer.output_shape.height, layer.output_shape.width];
+        let decoded = gpu
+            .backend
+            .modern_yolo_predecode_f32(&gpu_forward.gpu_layer_outputs[1], &shape, spec.classes, spec.coords(), kind, Default::default())
+            .expect("device decode")
+            .unwrap_or_else(|| panic!("{name}: backend declined device decode"));
+        let decoded = gpu.backend.download_f32(&decoded).expect("download decoded head");
+
+        let l = ModernLayout::for_spec(2, layer.output_shape.width, layer.output_shape.height, spec);
+        let spatial = l.spatial();
+        let host_out = &cpu_forward.layer_outputs[1].data;
+        for b in 0..2 {
+            for loc in 0..spatial {
+                let host = decode_modern_box(host_out, &l, b, 0, loc);
+                let at = b * (5 + spec.classes) * spatial + loc;
+                let got = [decoded[at], decoded[at + spatial], decoded[at + 2 * spatial], decoded[at + 3 * spatial]];
+                close(&format!("{name}: box b{b} loc{loc}"), &[host.x, host.y, host.w, host.h], &got, 1e-4);
+                for e in 0..=spec.classes {
+                    let want = host_out[l.entry_index(b, loc, l.coords + e)];
+                    close(&format!("{name}: plane {e} b{b} loc{loc}"), &[want], &[decoded[at + (4 + e) * spatial]], 1e-5);
+                }
+            }
+        }
+    }
+}

@@ -455,8 +455,37 @@ where
             // The modern anchor-free heads need the same host round trip so
             // `detect.rs` can decode them.
             let should_collect_modern = is_modern_head(&layer.kind);
-            let downloaded =
-                if should_download_final || should_collect_yolo || should_collect_modern {
+            // A distribution head decodes its boxes on the device: the host then downloads `5 + classes` channels instead of
+            // `4 * (reg_max + 1) + classes + 1` and skips the per-bin softmax.
+            let predecoded = if should_collect_modern && !should_collect_yolo {
+                match &layer.kind {
+                    LayerKind::Ppyoloe(spec) | LayerKind::Yolonas(spec) => self
+                        .backend
+                        .modern_yolo_predecode_f32(
+                            &output_gpu,
+                            &tensor_backend_shape(layer.output_shape),
+                            spec.classes,
+                            spec.coords(),
+                            if matches!(layer.kind, LayerKind::Ppyoloe(_)) { 1 } else { 2 },
+                            launch_config,
+                        )
+                        .map_err(|err| backend_error("device box decode", err))?
+                        .map(|tensor| (tensor, spec.classes)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let downloaded = if let Some((decoded, classes)) = &predecoded {
+                let shape = layer.output_shape;
+                Some(
+                    self.download_tensor(
+                        decoded,
+                        TensorShape::new(shape.width, shape.height, classes + 5, shape.batch),
+                    )
+                    .map_err(|err| backend_error("download decoded head", err))?,
+                )
+            } else if should_download_final || should_collect_yolo || should_collect_modern {
                     Some(
                         self.download_tensor(&output_gpu, layer.output_shape)
                             .map_err(|err| backend_error("download layer output", err))?,
@@ -483,7 +512,9 @@ where
                         .clone(),
                 });
             }
-            if should_download_final {
+            // A device-decoded head is a compact tensor, not the layer output, so the summary
+            // keeps no final output for it.
+            if should_download_final && predecoded.is_none() {
                 final_output = downloaded;
             }
 

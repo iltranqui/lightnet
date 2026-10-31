@@ -359,6 +359,103 @@ impl YoloImageMetrics {
     }
 }
 
+/// Options of the native `[yolox]` / `[ppyoloe]` / `[yolonas]` training loss.
+///
+/// Mirrors the host `ModernYoloSettings` and `ModernYoloSpec` knobs the host loss reads.
+/// Class multipliers and a class map have no device path; callers fall back to the host.
+#[derive(Clone, Debug, Default)]
+pub struct ModernYoloGpuLossArgs {
+    pub classes: usize,
+    /// Box entries per cell: 4 for YOLOX, `4 * (reg_max + 1)` for the distribution heads.
+    pub coords: usize,
+    /// 0 = YOLOX (SimOTA), 1 = PP-YOLOE (task-aligned), 2 = YOLO-NAS (task-aligned + duplicate decay).
+    pub kind: u32,
+    pub max_boxes: usize,
+    pub truth_size: usize,
+    pub cls_normalizer: f32,
+    pub obj_normalizer: f32,
+    pub iou_normalizer: f32,
+    pub ignore_thresh: f32,
+    pub max_delta: f32,
+    pub label_smooth_eps: f32,
+    pub objectness_smooth: bool,
+    pub min_object_cells: f32,
+    pub vfl_gamma: f32,
+}
+
+/// Per-image sums of the native modern-head loss.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ModernYoloImageMetrics {
+    pub sum_iou: f32,
+    pub sum_iou_loss: f32,
+    pub positives: f32,
+    pub delta_squared: f32,
+    /// Non-zero when the image carried an invalid truth box or class id (the host loss errors).
+    pub invalid_truth: f32,
+}
+
+impl ModernYoloImageMetrics {
+    /// Reads the 5-float device record layout.
+    pub fn from_record(record: &[f32]) -> Self {
+        Self {
+            sum_iou: record[0],
+            sum_iou_loss: record[1],
+            positives: record[2],
+            delta_squared: record[3],
+            invalid_truth: record[4],
+        }
+    }
+}
+
+/// Options of the native `[centernet]` training loss.
+#[derive(Clone, Debug, Default)]
+pub struct CenterNetGpuLossArgs {
+    pub classes: usize,
+    pub max_boxes: usize,
+    pub truth_size: usize,
+    pub net_width: usize,
+    pub net_height: usize,
+    pub center_min_radius: i64,
+    pub anisotropic_gaussian: bool,
+    pub small_ref_size: f32,
+    pub small_boost: f32,
+    pub scale_min_px: f32,
+    pub scale_max_px: f32,
+    pub gaussian_iou: f32,
+    pub focal_alpha: f32,
+    pub focal_beta: f32,
+    pub hm_normalizer: f32,
+    pub wh_normalizer: f32,
+    pub off_normalizer: f32,
+    pub max_delta: f32,
+}
+
+/// Per-image sums of the native CenterNet loss.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CenterNetImageMetrics {
+    pub hm_loss: f32,
+    pub wh_loss: f32,
+    pub off_loss: f32,
+    pub total_iou: f32,
+    pub positives: f32,
+    /// Non-zero when the image carried an invalid truth box or class id (the host loss errors).
+    pub invalid_truth: f32,
+}
+
+impl CenterNetImageMetrics {
+    /// Reads the 6-float device record layout.
+    pub fn from_record(record: &[f32]) -> Self {
+        Self {
+            hm_loss: record[0],
+            wh_loss: record[1],
+            off_loss: record[2],
+            total_iou: record[3],
+            positives: record[4],
+            invalid_truth: record[5],
+        }
+    }
+}
+
 pub trait F32TensorOpsBackend {
     type Error;
     type Tensor: Clone;
@@ -4821,6 +4918,32 @@ pub trait F32TensorOpsBackend {
         &self, _output: &Self::Tensor, _truth: &Self::Tensor, _shape: &[usize],
         _args: &YoloGpuLossArgs, _config: ElementwiseLaunchConfig,
     ) -> Result<Option<(Self::Tensor, Vec<YoloImageMetrics>)>, Self::Error> {
+        Ok(None)
+    }
+    /// Native `[yolox]` / `[ppyoloe]` / `[yolonas]` loss on an activated head (the output of
+    /// [`Self::modern_yolo_forward_f32`]). Returns the whole-batch delta tensor and per-image
+    /// metrics, or `None` when the backend has no native loss.
+    fn modern_yolo_loss_f32(
+        &self, _output: &Self::Tensor, _truth: &Self::Tensor, _shape: &[usize],
+        _args: &ModernYoloGpuLossArgs, _config: ElementwiseLaunchConfig,
+    ) -> Result<Option<(Self::Tensor, Vec<ModernYoloImageMetrics>)>, Self::Error> {
+        Ok(None)
+    }
+    /// Device box decode of an activated `[ppyoloe]` / `[yolonas]` head (`kind` 1 or 2): returns
+    /// `[batch, 5 + classes, H, W]` holding the final centre-size box, then the objectness and class
+    /// planes, or `None` when the backend has no device decode (callers download the full head).
+    fn modern_yolo_predecode_f32(
+        &self, _output: &Self::Tensor, _shape: &[usize], _classes: usize, _coords: usize, _kind: u32,
+        _config: ElementwiseLaunchConfig,
+    ) -> Result<Option<Self::Tensor>, Self::Error> {
+        Ok(None)
+    }
+    /// Native `[centernet]` loss on an activated head (the output of
+    /// [`Self::centernet_forward_f32`]); same contract as [`Self::modern_yolo_loss_f32`].
+    fn centernet_loss_f32(
+        &self, _output: &Self::Tensor, _truth: &Self::Tensor, _shape: &[usize],
+        _args: &CenterNetGpuLossArgs, _config: ElementwiseLaunchConfig,
+    ) -> Result<Option<(Self::Tensor, Vec<CenterNetImageMetrics>)>, Self::Error> {
         Ok(None)
     }
     /// Classic YOLO head activation, using anchor-major NCHW entries.

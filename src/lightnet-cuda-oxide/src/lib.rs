@@ -4921,6 +4921,27 @@ fn clifford_fourier_backward_f32(&self, input: &Self::Tensor, grad: &Self::Tenso
         self.yolo_loss_backend_f32(output, truth, shape, args, config).map(Some)
     }
 
+    fn modern_yolo_loss_f32(
+        &self, output: &Self::Tensor, truth: &Self::Tensor, shape: &[usize],
+        args: &lightnet_cuda::ModernYoloGpuLossArgs, config: ElementwiseLaunchConfig,
+    ) -> Result<Option<(Self::Tensor, Vec<lightnet_cuda::ModernYoloImageMetrics>)>, Self::Error> {
+        self.modern_yolo_loss_backend_f32(output, truth, shape, args, config).map(Some)
+    }
+
+    fn modern_yolo_predecode_f32(
+        &self, output: &Self::Tensor, shape: &[usize], classes: usize, coords: usize, kind: u32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<Option<Self::Tensor>, Self::Error> {
+        self.modern_yolo_predecode_backend_f32(output, shape, classes, coords, kind, config).map(Some)
+    }
+
+    fn centernet_loss_f32(
+        &self, output: &Self::Tensor, truth: &Self::Tensor, shape: &[usize],
+        args: &lightnet_cuda::CenterNetGpuLossArgs, config: ElementwiseLaunchConfig,
+    ) -> Result<Option<(Self::Tensor, Vec<lightnet_cuda::CenterNetImageMetrics>)>, Self::Error> {
+        self.centernet_loss_backend_f32(output, truth, shape, args, config).map(Some)
+    }
+
     fn spatial_softmax_f32(
         &self, input: &Self::Tensor, shape: &[usize], config: ElementwiseLaunchConfig,
     ) -> Result<Self::Tensor, Self::Error> {

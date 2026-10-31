@@ -206,9 +206,814 @@ fn yolo_truth_count(truth: &[f32], batch: usize, d: &[u32]) -> usize {
     t
 }
 
+// ---- Modern anchor-free heads: [yolox] / [ppyoloe] / [yolonas] training loss ----
+//
+// Device port of `layers/modern_yolo/cpu.rs` (`assign_yolox`, `assign_tal_like`, `yolox_train_batch`).
+// `d` packs [width, height, classes, coords, kind, max_boxes, truth_size, batches] (kind 0 YOLOX,
+// 1 PP-YOLOE, 2 YOLO-NAS). `p` packs [cls_normalizer, obj_normalizer, iou_normalizer, ignore_thresh,
+// max_delta, label_smooth_eps, objectness_smooth, min_object_cells, vfl_gamma]. The head output is
+// the activated tensor and the delta covers the whole batch, both `[batch, coords + classes + 1, H, W]`.
+//
+// Per image the scratch holds `MS_SLOT` floats per cell
+//   [truth_index or -1, class_id, quality, iou, tx, ty, tw, th, conflict_score, conflict_area, rank_used, _]
+// then `classes` class-quality floats per cell, then `MS_CAND` candidate floats per cell
+//   [loc, iou, score, cost, used].
+
+const MS_SLOT: usize = 12;
+const MS_CAND: usize = 5;
+const MS_EPS: f32 = 1e-8;
+const MS_BIG: f32 = 3.0e38;
+
+#[device]
+fn ms_per_image(d: &[u32]) -> usize {
+    let s = (d[0] * d[1]) as usize;
+    s * MS_SLOT + s * d[2] as usize + s * MS_CAND
+}
+
+#[device]
+fn ms_entry(d: &[u32], b: usize, entry: usize, loc: usize) -> usize {
+    let s = (d[0] * d[1]) as usize;
+    b * (d[3] as usize + d[2] as usize + 1) * s + entry * s + loc
+}
+
+#[device]
+fn ms_ln(v: f32) -> f32 {
+    v.max(MS_EPS).ln()
+}
+
+#[device]
+fn ms_dfl_expect(out: *const f32, d: &[u32], b: usize, loc: usize, side: usize) -> f32 {
+    let bins = ((d[3] / 4) as usize).max(2);
+    let s = (d[0] * d[1]) as usize;
+    let start = ms_entry(d, b, side * bins, loc);
+    let mut m = f32::NEG_INFINITY;
+    let mut k = 0;
+    while k < bins {
+        m = m.max(yolo_finite(unsafe { *out.add(start + k * s) }));
+        k += 1;
+    }
+    let (mut denom, mut expected) = (0.0f32, 0.0f32);
+    k = 0;
+    while k < bins {
+        let e = (yolo_finite(unsafe { *out.add(start + k * s) }) - m).max(-60.0).min(60.0).exp();
+        denom += e;
+        expected += k as f32 * e;
+        k += 1;
+    }
+    expected / denom.max(MS_EPS)
+}
+
+#[device]
+fn ms_sanitize(bx: YBox) -> YBox {
+    (yolo_finite(bx.0), yolo_finite(bx.1), yolo_finite(bx.2).max(1e-6), yolo_finite(bx.3).max(1e-6))
+}
+
+#[device]
+fn ms_box(out: *const f32, d: &[u32], b: usize, loc: usize) -> YBox {
+    let (w, h) = (d[0] as usize, d[1] as usize);
+    let s = w * h;
+    let (col, row) = ((loc % w) as f32, (loc / w) as f32);
+    if d[4] == 0 {
+        let idx = ms_entry(d, b, 0, loc);
+        unsafe {
+            return ms_sanitize((
+                (col + yolo_finite(*out.add(idx))) / w as f32,
+                (row + yolo_finite(*out.add(idx + s))) / h as f32,
+                yolo_finite(*out.add(idx + 2 * s)).max(-10.0).min(10.0).exp() / w as f32,
+                yolo_finite(*out.add(idx + 3 * s)).max(-10.0).min(10.0).exp() / h as f32,
+            ));
+        }
+    }
+    let (cx, cy) = (col + 0.5, row + 0.5);
+    let left = ms_dfl_expect(out, d, b, loc, 0);
+    let top = ms_dfl_expect(out, d, b, loc, 1);
+    let right = ms_dfl_expect(out, d, b, loc, 2);
+    let bottom = ms_dfl_expect(out, d, b, loc, 3);
+    let (mut l, mut t) = (yolo_finite((cx - left) / w as f32), yolo_finite((cy - top) / h as f32));
+    let (mut r, mut bo) = (yolo_finite((cx + right) / w as f32), yolo_finite((cy + bottom) / h as f32));
+    if r < l { let tmp = l; l = r; r = tmp; }
+    if bo < t { let tmp = t; t = bo; bo = tmp; }
+    ms_sanitize((0.5 * (l + r), 0.5 * (t + bo), (r - l).max(1e-6), (bo - t).max(1e-6)))
+}
+
+/// C++ `box_iou` as used by the modern heads (centre-size boxes).
+#[device]
+fn ms_iou(a: YBox, b: YBox) -> f32 {
+    let iw = ((a.0 + 0.5 * a.2).min(b.0 + 0.5 * b.2) - (a.0 - 0.5 * a.2).max(b.0 - 0.5 * b.2)).max(0.0);
+    let ih = ((a.1 + 0.5 * a.3).min(b.1 + 0.5 * b.3) - (a.1 - 0.5 * a.3).max(b.1 - 0.5 * b.3)).max(0.0);
+    let inter = iw * ih;
+    if inter == 0.0 {
+        return 0.0;
+    }
+    let union = a.2.max(0.0) * a.3.max(0.0) + b.2.max(0.0) * b.3.max(0.0) - inter;
+    if union > 0.0 { inter / union } else { 0.0 }
+}
+
+#[device]
+fn ms_in_center(w: usize, h: usize, loc: usize, t: YBox) -> bool {
+    let gx = (loc % w) as f32 + 0.5;
+    let gy = (loc / w) as f32 + 0.5;
+    (gx - t.0 * w as f32).abs() <= 2.5 && (gy - t.1 * h as f32).abs() <= 2.5
+}
+
+#[device]
+fn ms_in_box(w: usize, h: usize, loc: usize, t: YBox) -> bool {
+    let cx = ((loc % w) as f32 + 0.5) / w as f32;
+    let cy = ((loc / w) as f32 + 0.5) / h as f32;
+    cx >= t.0 - 0.5 * t.2 && cx <= t.0 + 0.5 * t.2 && cy >= t.1 - 0.5 * t.3 && cy <= t.1 + 0.5 * t.3
+}
+
+#[device]
+fn ms_clamped(out: *const f32, index: usize) -> f32 {
+    yolo_finite(unsafe { *out.add(index) }).max(0.0).min(1.0)
+}
+
+// ---- CenterNet training loss ----
+//
+// Device port of `layers/centernet/cpu.rs::centernet_train_batch`. `d` packs [width, height, classes,
+// max_boxes, truth_size, batches, net_width, net_height, center_min_radius, anisotropic]; `p` packs
+// [small_ref_size, small_boost, scale_min_px, scale_max_px, gaussian_iou, focal_alpha, focal_beta,
+// hm_normalizer, wh_normalizer, off_normalizer, max_delta].
+
+#[device]
+fn ct_clamp_delta(v: f32, max_delta: f32) -> f32 {
+    if !v.is_finite() {
+        return 0.0;
+    }
+    if max_delta >= 3.4028235e38 {
+        return v;
+    }
+    v.max(-max_delta).min(max_delta)
+}
+
+#[device]
+fn ct_safe_log(v: f32) -> f32 {
+    v.max(1e-9).ln()
+}
+
+#[device]
+fn ct_smooth_l1_loss(e: f32) -> f32 {
+    let a = e.abs();
+    if a < 1.0 { 0.5 * e * e } else { a - 0.5 }
+}
+
+#[device]
+fn ct_smooth_l1_grad(e: f32) -> f32 {
+    if e > 1.0 { 1.0 } else if e < -1.0 { -1.0 } else { e }
+}
+
+#[device]
+fn ct_gaussian_radius(width: f32, height: f32, min_overlap: f32) -> i32 {
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return 0;
+    }
+    let (w, h) = (width.max(1e-6), height.max(1e-6));
+    let m = min_overlap.max(0.01).min(0.99);
+    let (b1, c1) = (h + w, w * h * (1.0 - m) / (1.0 + m));
+    let d1 = (b1 * b1 - 4.0 * c1).max(0.0);
+    let r1 = (b1 + d1.sqrt()) / 2.0;
+    let (b2, c2) = (2.0 * (h + w), (1.0 - m) * w * h);
+    let d2 = (b2 * b2 - 16.0 * c2).max(0.0);
+    let r2 = (b2 + d2.sqrt()) / 2.0;
+    let (a3, b3, c3) = (4.0 * m, -2.0 * m * (h + w), (m - 1.0) * w * h);
+    let d3 = (b3 * b3 - 4.0 * a3 * c3).max(0.0);
+    let r3 = (b3 + d3.sqrt()) / (2.0 * a3);
+    (r1.min(r2.min(r3)).floor() as i32).max(0)
+}
+
+#[device]
+fn ct_small_weight(p: &[f32], min_side_px: f32) -> f32 {
+    let max_weight = p[1].max(1.0);
+    let ref_px = p[0].max(1.0);
+    if !min_side_px.is_finite() || min_side_px <= 0.0 {
+        return max_weight;
+    }
+    (ref_px / min_side_px.max(1e-3)).max(1.0).min(max_weight)
+}
+
+#[device]
+fn ct_index(d: &[u32], b: usize, entry: usize, loc: usize) -> usize {
+    let s = (d[0] * d[1]) as usize;
+    b * (d[2] as usize + 4) * s + entry * s + loc
+}
+
 #[cuda_module]
 pub mod kernels {
     use super::*;
+
+    /// Modern heads, phase 1: one thread per image runs the SimOTA / task-aligned assignment into `scratch`.
+    #[kernel]
+    pub fn modern_yolo_assign(
+        output: &[f32], truth: &[f32], mut scratch: DisjointSlice<f32>, mut status: DisjointSlice<f32>,
+        d: &[u32], p: &[f32], batches: usize,
+    ) {
+        let b = thread::index_1d().get();
+        if b >= batches { return; }
+        let (w, h) = (d[0] as usize, d[1] as usize);
+        let s = w * h;
+        let (classes, kind, max_boxes, ts) = (d[2] as usize, d[4], d[5] as usize, d[6] as usize);
+        let out = output.as_ptr();
+        let slots = unsafe { scratch.as_mut_ptr().add(b * ms_per_image(d)) };
+        let cq = unsafe { slots.add(s * MS_SLOT) };
+        let cand = unsafe { cq.add(s * classes) };
+        let mut i = 0;
+        while i < s {
+            unsafe {
+                let q = slots.add(i * MS_SLOT);
+                *q = -1.0;
+                *q.add(1) = -1.0;
+                *q.add(8) = -1.0;
+                *q.add(9) = MS_BIG;
+            }
+            i += 1;
+        }
+        let tb = b * max_boxes * ts;
+        let mut err = 0.0f32;
+        let mut t = 0;
+        while t < max_boxes {
+            let o = tb + t * ts;
+            let tx = truth[o];
+            if tx == 0.0 { break; }
+            let (ty, tw, th) = (truth[o + 1], truth[o + 2], truth[o + 3]);
+            if !(tx.is_finite() && ty.is_finite() && tw.is_finite() && th.is_finite()
+                && tx > 0.0 && tx <= 1.0 && ty >= 0.0 && ty <= 1.0 && tw > 0.0 && th > 0.0)
+            {
+                err = 1.0;
+                break;
+            }
+            let class_id = truth[o + 4] as usize;
+            if class_id >= classes { err = 1.0; break; }
+            if kind != 0 && p[7] > 0.0 && (tw * (w as f32) < p[7] || th * (h as f32) < p[7]) {
+                t += 1;
+                continue;
+            }
+            let tbox: YBox = (tx, ty, tw, th);
+            let mut n = 0usize;
+            let mut loc = 0;
+            while loc < s {
+                let center = ms_in_center(w, h, loc, tbox);
+                let ok = if kind == 0 { center } else { ms_in_box(w, h, loc, tbox) || center };
+                if ok {
+                    let pred = ms_box(out, d, b, loc);
+                    let iou = yolo_finite(ms_iou(pred, tbox)).max(0.0).min(1.0);
+                    let obj = ms_clamped(out, ms_entry(d, b, d[3] as usize, loc));
+                    let cls = ms_clamped(out, ms_entry(d, b, d[3] as usize + 1 + class_id, loc));
+                    let (score, cost) = if kind == 0 {
+                        let cost = -ms_ln((cls * obj).max(MS_EPS).sqrt()) + 3.0 * -ms_ln(iou + MS_EPS);
+                        (1.0 / (1.0 + cost), cost)
+                    } else {
+                        let score = (cls * obj).max(MS_EPS) * iou.max(MS_EPS).powf(6.0);
+                        (score, -ms_ln(score + MS_EPS))
+                    };
+                    if score.is_finite() && cost.is_finite() {
+                        unsafe {
+                            let c = cand.add(n * MS_CAND);
+                            *c = loc as f32;
+                            *c.add(1) = iou;
+                            *c.add(2) = score;
+                            *c.add(3) = cost;
+                            *c.add(4) = 0.0;
+                        }
+                        n += 1;
+                    }
+                }
+                loc += 1;
+            }
+            if n == 0 { t += 1; continue; }
+            let truth_area = tw * th;
+            let keep: usize;
+            if kind == 0 {
+                // SimOTA: k = max(1, int(sum of the top-10 IoUs)), then the k cheapest candidates.
+                let top = n.min(10);
+                let mut sum_iou = 0.0f32;
+                let mut r = 0;
+                while r < top {
+                    let (mut best, mut at) = (-1.0f32, n);
+                    i = 0;
+                    while i < n {
+                        let c = unsafe { cand.add(i * MS_CAND) };
+                        if unsafe { *c.add(4) } == 0.0 && unsafe { *c.add(1) } > best {
+                            best = unsafe { *c.add(1) };
+                            at = i;
+                        }
+                        i += 1;
+                    }
+                    unsafe { *cand.add(at * MS_CAND + 4) = 1.0; }
+                    sum_iou += best;
+                    r += 1;
+                }
+                i = 0;
+                while i < n { unsafe { *cand.add(i * MS_CAND + 4) = 0.0; } i += 1; }
+                keep = (sum_iou as usize).max(1).min(n);
+            } else {
+                keep = n.min(13);
+            }
+            let mut r = 0;
+            while r < keep {
+                let (mut best, mut at) = (if kind == 0 { MS_BIG } else { -1.0f32 }, n);
+                i = 0;
+                while i < n {
+                    let c = unsafe { cand.add(i * MS_CAND) };
+                    let (used, cscore, ccost) = unsafe { (*c.add(4), *c.add(2), *c.add(3)) };
+                    // YOLOX keeps the lowest cost, the task-aligned heads the highest score.
+                    let key = if kind == 0 { ccost } else { cscore };
+                    let better = if kind == 0 { key < best } else { key > best };
+                    if used == 0.0 && better {
+                        best = key;
+                        at = i;
+                    }
+                    i += 1;
+                }
+                if at == n { break; }
+                let c = unsafe { cand.add(at * MS_CAND) };
+                unsafe { *c.add(4) = 1.0; }
+                let (cl, ciou, cscore, ccost) = unsafe { (*c as usize, *c.add(1), *c.add(2), *c.add(3)) };
+                let q = unsafe { slots.add(cl * MS_SLOT) };
+                if kind == 0 {
+                    if unsafe { *q } < 0.0 || ccost < -unsafe { *q.add(2) } {
+                        unsafe {
+                            *q = t as f32;
+                            *q.add(1) = class_id as f32;
+                            *q.add(2) = -ccost;
+                            *q.add(3) = ciou;
+                            *q.add(4) = tx;
+                            *q.add(5) = ty;
+                            *q.add(6) = tw;
+                            *q.add(7) = th;
+                        }
+                    }
+                } else {
+                    let quality = ciou.max(0.05).min(1.0);
+                    unsafe {
+                        let slot_cq = cq.add(cl * classes + class_id);
+                        if quality > *slot_cq { *slot_cq = quality; }
+                    }
+                    let smaller = truth_area < unsafe { *q.add(9) } - MS_EPS;
+                    let tied = (truth_area - unsafe { *q.add(9) }).abs() <= MS_EPS && cscore > unsafe { *q.add(8) };
+                    if smaller || tied {
+                        unsafe {
+                            *q.add(9) = truth_area;
+                            *q.add(8) = cscore;
+                            *q = t as f32;
+                            *q.add(1) = class_id as f32;
+                            *q.add(2) = quality;
+                            *q.add(3) = ciou;
+                            *q.add(4) = tx;
+                            *q.add(5) = ty;
+                            *q.add(6) = tw;
+                            *q.add(7) = th;
+                        }
+                    }
+                }
+                r += 1;
+            }
+            t += 1;
+        }
+        if kind == 0 {
+            // YOLOX trains with hard class labels.
+            i = 0;
+            while i < s {
+                let q = unsafe { slots.add(i * MS_SLOT) };
+                if unsafe { *q } >= 0.0 { unsafe { *q.add(2) = 1.0; } }
+                i += 1;
+            }
+        } else if kind == 2 {
+            // YOLO-NAS: down-weight duplicates of one truth by IoU rank.
+            let mut tr = 0;
+            while tr < max_boxes {
+                let mut rank = 0usize;
+                loop {
+                    let (mut best, mut at) = (-1.0f32, s);
+                    i = 0;
+                    while i < s {
+                        let q = unsafe { slots.add(i * MS_SLOT) };
+                        if unsafe { *q } == tr as f32 && unsafe { *q.add(10) } == 0.0 && unsafe { *q.add(3) } > best {
+                            best = unsafe { *q.add(3) };
+                            at = i;
+                        }
+                        i += 1;
+                    }
+                    if at == s { break; }
+                    let q = unsafe { slots.add(at * MS_SLOT) };
+                    unsafe {
+                        *q.add(10) = 1.0;
+                        *q.add(2) = (best * (-0.35f32 * rank as f32).exp()).max(0.02).min(1.0);
+                    }
+                    rank += 1;
+                }
+                tr += 1;
+            }
+        }
+        // SAFETY: one thread owns each image's status slot.
+        unsafe { *status.as_mut_ptr().add(b) = err; }
+    }
+
+    /// Modern heads, phase 2: one thread per cell turns the assignment into deltas and per-cell stats.
+    #[kernel]
+    pub fn modern_yolo_delta(
+        output: &[f32], truth: &[f32], scratch: &[f32], mut delta: DisjointSlice<f32>,
+        mut stats: DisjointSlice<f32>, d: &[u32], p: &[f32], batches: usize,
+    ) {
+        let g = thread::index_1d().get();
+        let (w, h) = (d[0] as usize, d[1] as usize);
+        let s = w * h;
+        if g >= batches * s { return; }
+        let (b, loc) = (g / s, g % s);
+        let (classes, kind, max_boxes, ts) = (d[2] as usize, d[4], d[5] as usize, d[6] as usize);
+        let coords = d[3] as usize;
+        let out = output.as_ptr();
+        let del = delta.as_mut_ptr();
+        let base = b * ms_per_image(d);
+        let q = base + loc * MS_SLOT;
+        let obj_idx = ms_entry(d, b, coords, loc);
+        let obj_out = yolo_finite(unsafe { *out.add(obj_idx) });
+        let truth_index = scratch[q];
+        if truth_index < 0.0 {
+            let pred = ms_box(out, d, b, loc);
+            let tb = b * max_boxes * ts;
+            let mut best = 0.0f32;
+            let mut t = 0;
+            while t < max_boxes {
+                let o = tb + t * ts;
+                if truth[o] == 0.0 { break; }
+                let iou = yolo_finite(ms_iou(pred, (truth[o], truth[o + 1], truth[o + 2], truth[o + 3]))).max(0.0).min(1.0);
+                best = best.max(iou);
+                t += 1;
+            }
+            let target = if best > p[3] {
+                if p[6] != 0.0 { best } else { return; }
+            } else {
+                0.0
+            };
+            let dv = p[1] * (target.max(0.0).min(1.0) - obj_out);
+            if dv.is_finite() { unsafe { *del.add(obj_idx) += dv; } }
+            return;
+        }
+        let class_id = scratch[q + 1] as usize;
+        let quality = scratch[q + 2].max(0.0).min(1.0);
+        let iou = scratch[q + 3];
+        let tbox: YBox = (scratch[q + 4], scratch[q + 5], scratch[q + 6], scratch[q + 7]);
+        let obj_target = if kind == 0 { 1.0 } else { quality };
+        let dv = p[1] * (obj_target.max(0.0).min(1.0) - obj_out);
+        if dv.is_finite() { unsafe { *del.add(obj_idx) += dv; } }
+        let use_vfl = p[8] > 0.0 && kind != 0;
+        let cq_base = base + s * MS_SLOT + loc * classes;
+        let mut c = 0;
+        while c < classes {
+            let raw = if kind == 0 {
+                if c == class_id { quality } else { 0.0 }
+            } else {
+                scratch[cq_base + c].max(0.0).min(1.0)
+            };
+            let mut target = raw;
+            if p[5] != 0.0 && !use_vfl { target = target * (1.0 - p[5]) + 0.5 * p[5]; }
+            let idx = ms_entry(d, b, coords + 1 + c, loc);
+            let pr = yolo_finite(unsafe { *out.add(idx) }).max(0.0).min(1.0);
+            let mut dc = p[0] * (target - pr);
+            if use_vfl {
+                dc *= if target > 0.0 { target } else { 0.75 * pr.powf(p[8]) };
+            }
+            if dc.is_finite() { unsafe { *del.add(idx) += dc; } }
+            c += 1;
+        }
+        let normalizer = p[2];
+        if kind != 0 {
+            let bins = (coords / 4).max(2);
+            let max_bin = bins - 1;
+            let (col, row) = ((loc % w) as f32, (loc / w) as f32);
+            let (cx, cy) = (col + 0.5, row + 0.5);
+            let mut side = 0;
+            while side < 4 {
+                let left = (tbox.0 - 0.5 * tbox.2) * w as f32;
+                let top = (tbox.1 - 0.5 * tbox.3) * h as f32;
+                let right = (tbox.0 + 0.5 * tbox.2) * w as f32;
+                let bottom = (tbox.1 + 0.5 * tbox.3) * h as f32;
+                let dist = if side == 0 { cx - left } else if side == 1 { cy - top } else if side == 2 { right - cx } else { bottom - cy };
+                let dist = yolo_finite(dist).max(0.0).min(max_bin as f32 - 1e-4);
+                let left_bin = (dist.floor() as usize).min(max_bin);
+                let right_bin = (left_bin + 1).min(max_bin);
+                let right_weight = dist - left_bin as f32;
+                let left_weight = 1.0 - right_weight;
+                let start = ms_entry(d, b, side * bins, loc);
+                let mut m = f32::NEG_INFINITY;
+                let mut k = 0;
+                while k < bins {
+                    m = m.max(yolo_finite(unsafe { *out.add(start + k * s) }));
+                    k += 1;
+                }
+                let mut denom = 0.0f32;
+                k = 0;
+                while k < bins {
+                    denom += (yolo_finite(unsafe { *out.add(start + k * s) }) - m).max(-60.0).min(60.0).exp();
+                    k += 1;
+                }
+                let denom = denom.max(MS_EPS);
+                k = 0;
+                while k < bins {
+                    let prob = (yolo_finite(unsafe { *out.add(start + k * s) }) - m).max(-60.0).min(60.0).exp() / denom;
+                    let mut target = 0.0f32;
+                    if k == left_bin { target += left_weight; }
+                    if k == right_bin { target += right_weight; }
+                    let dk = normalizer * (target - prob);
+                    if dk.is_finite() { unsafe { *del.add(start + k * s) += dk; } }
+                    k += 1;
+                }
+                side += 1;
+            }
+        } else {
+            let idx = ms_entry(d, b, 0, loc);
+            let (col, row) = ((loc % w) as f32, (loc / w) as f32);
+            let targets = [
+                tbox.0 * w as f32 - col,
+                tbox.1 * h as f32 - row,
+                ms_ln(tbox.2 * w as f32),
+                ms_ln(tbox.3 * h as f32),
+            ];
+            let mut e = 0;
+            while e < 4 {
+                let mut dv = normalizer * (targets[e] - yolo_finite(unsafe { *out.add(idx + e * s) }));
+                if p[4] < 3.4028235e38 { dv = dv.max(-p[4]).min(p[4]); }
+                if dv.is_finite() { unsafe { *del.add(idx + e * s) += dv; } }
+                e += 1;
+            }
+        }
+        // SAFETY: one thread owns each cell's stats slot.
+        unsafe {
+            let st = stats.as_mut_ptr().add(g * 3);
+            *st = iou;
+            *st.add(1) = 1.0 - iou;
+            *st.add(2) = 1.0;
+        }
+    }
+
+    /// Modern heads, phase 3: per-image sums of the cell stats and of the squared delta.
+    #[kernel]
+    pub fn modern_yolo_reduce(
+        delta: &[f32], stats: &[f32], status: &[f32], mut metrics: DisjointSlice<f32>, d: &[u32], batches: usize,
+    ) {
+        let b = thread::index_1d().get();
+        if b >= batches { return; }
+        let s = (d[0] * d[1]) as usize;
+        let outputs = (d[3] as usize + d[2] as usize + 1) * s;
+        let (mut iou, mut iou_loss, mut positives, mut squared) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let mut i = 0;
+        while i < s {
+            let at = (b * s + i) * 3;
+            iou += stats[at];
+            iou_loss += stats[at + 1];
+            positives += stats[at + 2];
+            i += 1;
+        }
+        i = 0;
+        while i < outputs {
+            let v = delta[b * outputs + i];
+            squared += v * v;
+            i += 1;
+        }
+        // SAFETY: one thread owns each image's metrics record.
+        unsafe {
+            let record = metrics.as_mut_ptr().add(b * 5);
+            *record = iou;
+            *record.add(1) = iou_loss;
+            *record.add(2) = positives;
+            *record.add(3) = squared;
+            *record.add(4) = status[b];
+        }
+    }
+
+    /// Inference decode of the distribution heads (`[ppyoloe]`, `[yolonas]`): one thread per cell writes
+    /// `[batch, 5 + classes, H, W]` with the final centre-size box in channels 0..4 and the activated
+    /// objectness and class planes copied behind it. `d` is the layout of `modern_yolo_assign`.
+    #[kernel]
+    pub fn modern_yolo_predecode(
+        output: &[f32], mut decoded: DisjointSlice<f32>, d: &[u32], batches: usize,
+    ) {
+        let g = thread::index_1d().get();
+        let s = (d[0] * d[1]) as usize;
+        if g >= batches * s { return; }
+        let (b, loc) = (g / s, g % s);
+        let (classes, coords) = (d[2] as usize, d[3] as usize);
+        let out = output.as_ptr();
+        let dst = decoded.as_mut_ptr();
+        let pred = ms_box(out, d, b, loc);
+        let base = b * (5 + classes) * s + loc;
+        // SAFETY: each cell owns its column of the decoded tensor.
+        unsafe {
+            *dst.add(base) = pred.0;
+            *dst.add(base + s) = pred.1;
+            *dst.add(base + 2 * s) = pred.2;
+            *dst.add(base + 3 * s) = pred.3;
+            let mut e = 0;
+            while e < classes + 1 {
+                *dst.add(base + (4 + e) * s) = *out.add(ms_entry(d, b, coords + e, loc));
+                e += 1;
+            }
+        }
+    }
+
+    /// CenterNet, phase 1: one thread per image draws the max-blended Gaussian heatmap targets and weights.
+    /// `targets` holds `[batch * classes * H * W]` targets then the same count of weights.
+    #[kernel]
+    pub fn centernet_targets(
+        truth: &[f32], mut targets: DisjointSlice<f32>, mut status: DisjointSlice<f32>,
+        d: &[u32], p: &[f32], batches: usize,
+    ) {
+        let b = thread::index_1d().get();
+        if b >= batches { return; }
+        let (w, h) = (d[0] as usize, d[1] as usize);
+        let s = w * h;
+        let (classes, max_boxes, ts) = (d[2] as usize, d[3] as usize, d[4] as usize);
+        let image = classes * s;
+        let total = batches * image;
+        let tgt = unsafe { targets.as_mut_ptr().add(b * image) };
+        let wgt = unsafe { targets.as_mut_ptr().add(total + b * image) };
+        let mut i = 0;
+        while i < image { unsafe { *wgt.add(i) = 1.0; } i += 1; }
+        let (net_w, net_h) = (d[6] as f32, d[7] as f32);
+        let center_min = d[8] as i32;
+        let tb = b * max_boxes * ts;
+        let mut err = 0.0f32;
+        let mut t = 0;
+        while t < max_boxes {
+            let o = tb + t * ts;
+            let x = truth[o];
+            if x == 0.0 { break; }
+            let (y, tw, th) = (truth[o + 1], truth[o + 2], truth[o + 3]);
+            let class_id = truth[o + 4] as usize;
+            if class_id >= classes { err = 1.0; break; }
+            if !(x.is_finite() && y.is_finite() && tw.is_finite() && th.is_finite())
+                || x <= 0.0 || x > 1.0 || y <= 0.0 || y > 1.0 || tw <= 0.0 || th <= 0.0
+            {
+                err = 1.0;
+                break;
+            }
+            let max_side_px = (tw * net_w).max(th * net_h);
+            if max_side_px < p[2] || max_side_px >= p[3] { t += 1; continue; }
+            let gx = x * w as f32;
+            let gy = y * h as f32;
+            let ix = (gx.floor() as i32).max(0).min(w as i32 - 1);
+            let iy = (gy.floor() as i32).max(0).min(h as i32 - 1);
+            let w_cells = (tw * w as f32).max(1e-6);
+            let h_cells = (th * h as f32).max(1e-6);
+            let small = ct_small_weight(p, (tw * net_w).min(th * net_h));
+            let base_radius = center_min.max(ct_gaussian_radius(w_cells, h_cells, p[4]));
+            let (mut rx, mut ry) = (base_radius, base_radius);
+            if d[9] != 0 {
+                let aspect_x = (w_cells / h_cells).sqrt();
+                let aspect_y = 1.0 / aspect_x;
+                rx = ((base_radius as f32 * aspect_x).round() as i32).max(center_min);
+                ry = ((base_radius as f32 * aspect_y).round() as i32).max(center_min);
+                // ceil(v) as -floor(-v), the safety cap on elongated labels.
+                rx = rx.min(center_min.max((-(-(w_cells * 2.0 + 1.0)).floor()) as i32));
+                ry = ry.min(center_min.max((-(-(h_cells * 2.0 + 1.0)).floor()) as i32));
+            }
+            let (rx, ry) = (rx.max(0), ry.max(0));
+            let sigma_x = ((2.0 * rx as f32 + 1.0) / 6.0).max(1e-6);
+            let sigma_y = ((2.0 * ry as f32 + 1.0) / 6.0).max(1e-6);
+            let inv_x = 1.0 / (2.0 * sigma_x * sigma_x);
+            let inv_y = 1.0 / (2.0 * sigma_y * sigma_y);
+            let cls_base = class_id * s;
+            let mut dy = -ry;
+            while dy <= ry {
+                let yy = iy + dy;
+                if yy >= 0 && yy < h as i32 {
+                    let mut dx = -rx;
+                    while dx <= rx {
+                        let xx = ix + dx;
+                        if xx >= 0 && xx < w as i32 {
+                            let value = (-((dx * dx) as f32 * inv_x + (dy * dy) as f32 * inv_y)).exp();
+                            let at = cls_base + (yy as usize) * w + xx as usize;
+                            unsafe {
+                                if value > *tgt.add(at) {
+                                    *tgt.add(at) = value;
+                                    if small > *wgt.add(at) { *wgt.add(at) = small; }
+                                }
+                            }
+                        }
+                        dx += 1;
+                    }
+                }
+                dy += 1;
+            }
+            t += 1;
+        }
+        // SAFETY: one thread owns each image's status slot.
+        unsafe { *status.as_mut_ptr().add(b) = err; }
+    }
+
+    /// CenterNet, phase 2: one thread per heatmap element writes the focal-loss delta and loss.
+    #[kernel]
+    pub fn centernet_focal(
+        output: &[f32], targets: &[f32], mut delta: DisjointSlice<f32>, mut losses: DisjointSlice<f32>,
+        d: &[u32], p: &[f32], batches: usize,
+    ) {
+        let g = thread::index_1d().get();
+        let s = (d[0] * d[1]) as usize;
+        let classes = d[2] as usize;
+        let image = classes * s;
+        if g >= batches * image { return; }
+        let (b, rem) = (g / image, g % image);
+        let (c, loc) = (rem / s, rem % s);
+        let outi = ct_index(d, b, c, loc);
+        let y = targets[g].max(0.0).min(1.0);
+        let weight = targets[batches * image + g].max(0.0);
+        let pr = output[outi].max(1e-6).min(1.0 - 1e-6);
+        let (grad, loss) = if y >= 0.999 {
+            let focal = (1.0 - pr).powf(p[5]);
+            (weight * focal * (1.0 - pr), p[7] * weight * focal * -ct_safe_log(pr))
+        } else {
+            let neg = (1.0 - y).powf(p[6]);
+            let focal = pr.powf(p[5]);
+            (-weight * neg * focal * pr, p[7] * weight * neg * focal * -ct_safe_log(1.0 - pr))
+        };
+        // SAFETY: each element owns its delta entry and loss slot.
+        unsafe {
+            *delta.as_mut_ptr().add(outi) = ct_clamp_delta(p[7] * grad, p[10]);
+            *losses.as_mut_ptr().add(g) = loss;
+        }
+    }
+
+    /// CenterNet, phase 3: one thread per image regresses size and offset at the true centres and
+    /// writes the per-image metrics `[hm, wh, off, iou, positives, invalid]`.
+    #[kernel]
+    pub fn centernet_regress(
+        output: &[f32], truth: &[f32], losses: &[f32], status: &[f32], mut delta: DisjointSlice<f32>,
+        mut metrics: DisjointSlice<f32>, d: &[u32], p: &[f32], batches: usize,
+    ) {
+        let b = thread::index_1d().get();
+        if b >= batches { return; }
+        let (w, h) = (d[0] as usize, d[1] as usize);
+        let s = w * h;
+        let (classes, max_boxes, ts) = (d[2] as usize, d[3] as usize, d[4] as usize);
+        let (net_w, net_h) = (d[6] as f32, d[7] as f32);
+        let del = delta.as_mut_ptr();
+        let (mut wh_loss, mut off_loss, mut total_iou, mut positives) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let tb = b * max_boxes * ts;
+        let mut t = 0;
+        while t < max_boxes && status[b] == 0.0 {
+            let o = tb + t * ts;
+            let x = truth[o];
+            if x == 0.0 { break; }
+            let (y, tw, th) = (truth[o + 1], truth[o + 2], truth[o + 3]);
+            let class_id = truth[o + 4] as usize;
+            let max_side_px = (tw * net_w).max(th * net_h);
+            if class_id >= classes || max_side_px < p[2] || max_side_px >= p[3] { t += 1; continue; }
+            let gx = x * w as f32;
+            let gy = y * h as f32;
+            let ix = (gx.floor() as i32).max(0).min(w as i32 - 1);
+            let iy = (gy.floor() as i32).max(0).min(h as i32 - 1);
+            let loc = (iy as usize) * w + ix as usize;
+            let weight = ct_small_weight(p, (tw * net_w).min(th * net_h));
+            let target_w = ct_safe_log((tw * w as f32).max(1e-6));
+            let target_h = ct_safe_log((th * h as f32).max(1e-6));
+            let target_ox = gx - ix as f32 - 0.5;
+            let target_oy = gy - iy as f32 - 0.5;
+            let raw_w = output[ct_index(d, b, classes, loc)];
+            let raw_h = output[ct_index(d, b, classes + 1, loc)];
+            let raw_ox = output[ct_index(d, b, classes + 2, loc)];
+            let raw_oy = output[ct_index(d, b, classes + 3, loc)];
+            let ew = yolo_finite(raw_w) - target_w;
+            let eh = yolo_finite(raw_h) - target_h;
+            let eox = yolo_finite(raw_ox) - target_ox;
+            let eoy = yolo_finite(raw_oy) - target_oy;
+            unsafe {
+                *del.add(ct_index(d, b, classes, loc)) += ct_clamp_delta(-p[8] * weight * ct_smooth_l1_grad(ew), p[10]);
+                *del.add(ct_index(d, b, classes + 1, loc)) += ct_clamp_delta(-p[8] * weight * ct_smooth_l1_grad(eh), p[10]);
+                *del.add(ct_index(d, b, classes + 2, loc)) += ct_clamp_delta(-p[9] * weight * ct_smooth_l1_grad(eox), p[10]);
+                *del.add(ct_index(d, b, classes + 3, loc)) += ct_clamp_delta(-p[9] * weight * ct_smooth_l1_grad(eoy), p[10]);
+            }
+            wh_loss += p[8] * weight * (ct_smooth_l1_loss(ew) + ct_smooth_l1_loss(eh));
+            off_loss += p[9] * weight * (ct_smooth_l1_loss(eox) + ct_smooth_l1_loss(eoy));
+            // Decoded box at the centre cell, as `decode_centernet_box`.
+            let ox = yolo_finite(raw_ox).max(-0.75).min(0.75);
+            let oy = yolo_finite(raw_oy).max(-0.75).min(0.75);
+            let px = yolo_finite(((loc % w) as f32 + 0.5 + ox) / w as f32);
+            let py = yolo_finite(((loc / w) as f32 + 0.5 + oy) / h as f32);
+            let pw = yolo_finite(yolo_finite(raw_w).max(-20.0).min(20.0).exp() / w as f32).max(1e-6);
+            let ph = yolo_finite(yolo_finite(raw_h).max(-20.0).min(20.0).exp() / h as f32).max(1e-6);
+            let inter_w = (px + 0.5 * pw).min(x + 0.5 * tw) - (px - 0.5 * pw).max(x - 0.5 * tw);
+            let inter_h = (py + 0.5 * ph).min(y + 0.5 * th) - (py - 0.5 * ph).max(y - 0.5 * th);
+            let inter = inter_w.max(0.0) * inter_h.max(0.0);
+            let union = pw.max(0.0) * ph.max(0.0) + tw.max(0.0) * th.max(0.0) - inter;
+            if union > 0.0 { total_iou += inter / union; }
+            positives += 1.0;
+            t += 1;
+        }
+        let image = classes * s;
+        let mut hm = 0.0f32;
+        let mut i = 0;
+        while i < image { hm += losses[b * image + i]; i += 1; }
+        // SAFETY: one thread owns each image's metrics record.
+        unsafe {
+            let record = metrics.as_mut_ptr().add(b * 6);
+            *record = hm;
+            *record.add(1) = wh_loss;
+            *record.add(2) = off_loss;
+            *record.add(3) = total_iou;
+            *record.add(4) = positives;
+            *record.add(5) = status[b];
+        }
+    }
 
     /// Classic YOLO loss, phase 1: one thread per prediction writes the background
     /// objectness delta, and the `truth_thresh` positives (flagged in `flags`).

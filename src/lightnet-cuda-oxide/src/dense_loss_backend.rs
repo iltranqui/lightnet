@@ -620,4 +620,140 @@ impl OxideBackend {
         Ok((mean, OxideTensorF32::new(delta, shape)))
     }
 
+    /// Native `[yolox]` / `[ppyoloe]` / `[yolonas]` loss: assignment per image, deltas per cell, reduction per image.
+    pub(crate) fn modern_yolo_loss_backend_f32(
+        &self, output: &OxideTensorF32, truth: &OxideTensorF32, shape: &[usize],
+        args: &lightnet_cuda::ModernYoloGpuLossArgs, config: ElementwiseLaunchConfig,
+    ) -> Result<(OxideTensorF32, Vec<lightnet_cuda::ModernYoloImageMetrics>), OxideError> {
+        let op = "modern_yolo_loss_f32";
+        let output_f = self.f32v(output)?;
+        let output = &*output_f;
+        let truth_f = self.f32v(truth)?;
+        let truth = &*truth_f;
+        let channels = args.coords + args.classes + 1;
+        if shape.len() != 4 || shape.contains(&0) || output.shape() != shape || shape[1] != channels
+            || args.classes == 0 || args.kind > 2 || args.max_boxes == 0 || args.truth_size < 5
+            || truth.len() < shape[0] * args.max_boxes * args.truth_size
+        {
+            return Err(shape_err(op, format!("incompatible modern-head shape {shape:?}, classes {}, coords {}", args.classes, args.coords)));
+        }
+        let (batches, spatial) = (shape[0], shape[2] * shape[3]);
+        let per_image = spatial * (12 + args.classes + 5);
+        let dims: Vec<u32> = [shape[3], shape[2], args.classes, args.coords, args.kind as usize, args.max_boxes, args.truth_size, batches]
+            .iter().map(|&v| v as u32).collect();
+        let params = [
+            args.cls_normalizer, args.obj_normalizer, args.iou_normalizer, args.ignore_thresh, args.max_delta,
+            args.label_smooth_eps, if args.objectness_smooth { 1.0 } else { 0.0 }, args.min_object_cells, args.vfl_gamma,
+        ];
+        let dims = DeviceBuffer::<u32>::from_host(&self.stream, &dims)?;
+        let params = DeviceBuffer::<f32>::from_host(&self.stream, &params)?;
+        let mut scratch = self.alloc(batches * per_image)?;
+        let mut status = self.alloc(batches)?;
+        let mut delta = self.alloc(batches * channels * spatial)?;
+        let mut stats = self.alloc(batches * spatial * 3)?;
+        let mut metrics = self.alloc(batches * 5)?;
+        // SAFETY: shapes validated above; each thread owns its image's scratch, status and metrics slots or its
+        // own cell's delta entries and stats slot, and the phases are ordered on one stream.
+        unsafe {
+            self.dense_loss.modern_yolo_assign(
+                &self.stream, launch::elementwise(batches, config),
+                &output.buf, &truth.buf, &mut scratch, &mut status, &dims, &params, batches,
+            ).map_err(launch_err)?;
+            self.dense_loss.modern_yolo_delta(
+                &self.stream, launch::elementwise(batches * spatial, config),
+                &output.buf, &truth.buf, &scratch, &mut delta, &mut stats, &dims, &params, batches,
+            ).map_err(launch_err)?;
+            self.dense_loss.modern_yolo_reduce(
+                &self.stream, launch::elementwise(batches, config),
+                &delta, &stats, &status, &mut metrics, &dims, batches,
+            ).map_err(launch_err)?;
+        }
+        let records = metrics.to_host_vec(&self.stream)?;
+        let per_image_metrics = records.chunks_exact(5).map(lightnet_cuda::ModernYoloImageMetrics::from_record).collect();
+        Ok((OxideTensorF32::new(delta, shape), per_image_metrics))
+    }
+
+    /// Native `[centernet]` loss: heatmap targets per image, focal loss per element, regression per image.
+    pub(crate) fn centernet_loss_backend_f32(
+        &self, output: &OxideTensorF32, truth: &OxideTensorF32, shape: &[usize],
+        args: &lightnet_cuda::CenterNetGpuLossArgs, config: ElementwiseLaunchConfig,
+    ) -> Result<(OxideTensorF32, Vec<lightnet_cuda::CenterNetImageMetrics>), OxideError> {
+        let op = "centernet_loss_f32";
+        let output_f = self.f32v(output)?;
+        let output = &*output_f;
+        let truth_f = self.f32v(truth)?;
+        let truth = &*truth_f;
+        if shape.len() != 4 || shape.contains(&0) || output.shape() != shape || shape[1] != args.classes + 4
+            || args.classes == 0 || args.max_boxes == 0 || args.truth_size < 5
+            || truth.len() < shape[0] * args.max_boxes * args.truth_size
+        {
+            return Err(shape_err(op, format!("incompatible CenterNet shape {shape:?}, classes {}", args.classes)));
+        }
+        let (batches, spatial) = (shape[0], shape[2] * shape[3]);
+        let elements = batches * args.classes * spatial;
+        let dims: Vec<u32> = [
+            shape[3], shape[2], args.classes, args.max_boxes, args.truth_size, batches, args.net_width, args.net_height,
+            args.center_min_radius.max(0) as usize, args.anisotropic_gaussian as usize,
+        ].iter().map(|&v| v as u32).collect();
+        let params = [
+            args.small_ref_size, args.small_boost, args.scale_min_px, args.scale_max_px, args.gaussian_iou,
+            args.focal_alpha.max(0.0), args.focal_beta.max(0.0), args.hm_normalizer, args.wh_normalizer,
+            args.off_normalizer, args.max_delta,
+        ];
+        let dims = DeviceBuffer::<u32>::from_host(&self.stream, &dims)?;
+        let params = DeviceBuffer::<f32>::from_host(&self.stream, &params)?;
+        let mut targets = self.alloc(2 * elements)?;
+        let mut status = self.alloc(batches)?;
+        let mut losses = self.alloc(elements)?;
+        let mut delta = self.alloc(batches * (args.classes + 4) * spatial)?;
+        let mut metrics = self.alloc(batches * 6)?;
+        // SAFETY: shapes validated above; each thread owns disjoint target, delta, loss and metric slots, and the
+        // phases are ordered on one stream.
+        unsafe {
+            self.dense_loss.centernet_targets(
+                &self.stream, launch::elementwise(batches, config),
+                &truth.buf, &mut targets, &mut status, &dims, &params, batches,
+            ).map_err(launch_err)?;
+            self.dense_loss.centernet_focal(
+                &self.stream, launch::elementwise(elements, config),
+                &output.buf, &targets, &mut delta, &mut losses, &dims, &params, batches,
+            ).map_err(launch_err)?;
+            self.dense_loss.centernet_regress(
+                &self.stream, launch::elementwise(batches, config),
+                &output.buf, &truth.buf, &losses, &status, &mut delta, &mut metrics, &dims, &params, batches,
+            ).map_err(launch_err)?;
+        }
+        let records = metrics.to_host_vec(&self.stream)?;
+        let per_image_metrics = records.chunks_exact(6).map(lightnet_cuda::CenterNetImageMetrics::from_record).collect();
+        Ok((OxideTensorF32::new(delta, shape), per_image_metrics))
+    }
+
+    /// Decode the distribution-head box on the device: `[batch, coords + classes + 1, H, W]` activated head
+    /// to `[batch, 5 + classes, H, W]` (final centre-size box, then objectness and class planes).
+    pub(crate) fn modern_yolo_predecode_backend_f32(
+        &self, output: &OxideTensorF32, shape: &[usize], classes: usize, coords: usize, kind: u32,
+        config: ElementwiseLaunchConfig,
+    ) -> Result<OxideTensorF32, OxideError> {
+        let op = "modern_yolo_predecode_f32";
+        let output_f = self.f32v(output)?;
+        let output = &*output_f;
+        if shape.len() != 4 || shape.contains(&0) || output.shape() != shape || shape[1] != coords + classes + 1
+            || classes == 0 || kind == 0 || kind > 2
+        {
+            return Err(shape_err(op, format!("incompatible distribution-head shape {shape:?}, classes {classes}, coords {coords}")));
+        }
+        let (batches, spatial) = (shape[0], shape[2] * shape[3]);
+        let dims: Vec<u32> = [shape[3], shape[2], classes, coords, kind as usize, 0, 0, batches]
+            .iter().map(|&v| v as u32).collect();
+        let dims = DeviceBuffer::<u32>::from_host(&self.stream, &dims)?;
+        let mut decoded = self.alloc_uninit(batches * (5 + classes) * spatial)?;
+        // SAFETY: shapes validated above; one thread owns each cell's column of the decoded tensor.
+        unsafe {
+            self.dense_loss.modern_yolo_predecode(
+                &self.stream, launch::elementwise(batches * spatial, config),
+                &output.buf, &mut decoded, &dims, batches,
+            ).map_err(launch_err)?;
+        }
+        Ok(OxideTensorF32::new(decoded, &[batches, 5 + classes, shape[2], shape[3]]))
+    }
 }

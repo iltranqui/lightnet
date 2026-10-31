@@ -1,6 +1,6 @@
 # Raptor FP4 parity handoff
 
-Last updated: 2026-10-30. This is an **unfinished implementation handoff**, not a parity claim. Nothing in this document has been built, tested, or run on the GPU unless it says so explicitly.
+Last updated: 2026-10-31, against HEAD `f003801`. Sections not marked otherwise still carry 2026-10-30 results; nothing was rebuilt or rerun for this update. This is an **unfinished implementation handoff**, not a parity claim. Nothing in this document has been built, tested, or run on the GPU unless it says so explicitly.
 
 Build status at this revision: `cargo xtask check`, `cargo xtask clippy` and `cargo xtask gpu-check` are clean, the named host and Oxide checks pass (see [Results, 2026-10-30](#results-2026-10-30)), the classic-YOLO loss now matches the Rust CPU loss on twelve GPU cases, and the per-conv FP8 policy with its FP32 head boundary is implemented and pinned by a GPU test. That is still not a parity claim: no Darknet reference comparison, no compiled `raptor-fp4` golden, no training run, and the Region / modern-head / CenterNet training paths are still missing.
 
@@ -11,6 +11,7 @@ Build status at this revision: `cargo xtask check`, `cargo xtask clippy` and `ca
 - [Current state and changes made](#current-state-and-changes-made)
 - [Detection implementation sequence](#detection-implementation-sequence)
 - [Verification and commands](#verification-and-commands)
+- [Dense-head device loss](#dense-head-device-loss-2026-10-31-uncommitted)
 
 ## Objective and reference
 
@@ -49,8 +50,13 @@ Model parsing and validation own configuration semantics. Head kernels own activ
 
 ### Git state
 
-- Work is committed on branch `wip-gpu-parity`, based on `0362beaa` (remote `origin/main`). `4406741` holds the 80 `src/` files. `f1f15d0` and `ed7fcae` follow. `a51d56c` removes the legacy `[detection]` layer. `1a18f24` adds the classic `[yolo]` parity fixes (`mask` default, `max` cap, `x == 0` truth stop, rejection of unhandled keys). HEAD is `1a18f24`.
-- Working tree: `Cargo.lock` and this file are modified and uncommitted; not part of the ported work. The eight untracked drafts listed under "Not started" are still untracked and unbuilt.
+- Work is committed on branch `wip-gpu-parity`, based on `0362beaa` (remote `origin/main`). `4406741` holds the 80 `src/` files. `f1f15d0` and `ed7fcae` follow. `a51d56c` removes the legacy `[detection]` layer. `1a18f24` adds the classic `[yolo]` parity fixes (`mask` default, `max` cap, `x == 0` truth stop, rejection of unhandled keys). Later commits:
+  - `588c228` v0.2.208: per-conv FP8 policy with an f32 head boundary.
+  - `5b14d0c` v0.2.209: host-loss training of `[yolox]`, `[ppyoloe]`, `[yolonas]`, `[centernet]`.
+  - `8604cd4`: device-resident convolution Muon update (`runtime/gpu_conv_muon.rs`) and the device-seed parity test. No version tag.
+  - `0afbaad`: segmentation training wired into `detector train`, plus `train_segmentation_*` xtask commands. No version tag.
+  - `f003801` (HEAD): segmentation mIoU validation, legacy segmentation heads, ONNX export and match tooling. No version tag.
+- Working tree: only `Cargo.lock` is modified, and it is not part of the ported work. The eight untracked drafts listed under "Not started" are still untracked and unbuilt.
 - `refs/heads/main` was missing commit `dcbd197a5da7a09db8f3cd887842e6f050ff3fd0`, a zero-byte loose file whose content is unrecoverable. It now points to `0362beaa` (remote `origin/main`), by user choice. HEAD is `wip-gpu-parity`.
 - Thirteen zero-byte loose object files were moved, not deleted, to `.git/corrupt-empty-objects/`. Five of the moved objects are blobs that dangling trees reference. None are reachable from HEAD (`git rev-list --objects HEAD` runs without errors).
 - The index cache-tree still references missing object `8f5064135548b63d658603b1ba5d8b28e388dae1`. This is a cache only.
@@ -81,6 +87,28 @@ Built on 2026-10-30: `cargo xtask check` and `cargo xtask gpu-check` both pass, 
 - **Decoded ONNX tests.** `decoded_detection_export_{fp32,fp16}_{nchw,nhwc}` (new) and the existing `decoded_detection_export_replaces_raw_heads_with_boxes_and_confs` (now uses a valid 16x16 `DECODE_CFG`; the old `CFG` gave a head channel mismatch). All 5 pass in the host run. No numerical comparison against Darknet.
 - **ONNX export tests from earlier.** The 13 focused exporter tests and the CLI option test passed at their earlier checkpoints. They have not been rerun since the decode option was added.
 
+### Segmentation training and ONNX match (`0afbaad`, `f003801`)
+
+Source: commit messages. I did not rerun these for this update.
+
+- `detector train` routes a `[segmentation]`, `[logistic]` or `[softmax] spatial=1` network to `src/lightnet-cli/src/segmentation_train.rs`. The native segmentation loss feeds the seeded device backward and the deferred optimizer step. No geometric augmentation, single scale.
+- `-map` evaluates mean IoU on the `valid=` list (per-class IoU, Dice, precision, recall, pixel counts), keeps `<name>_best.weights` and writes `<name>_miou.csv`. Validation uses `GpuExecutableNetwork::forward_inference_device` and `download_layer_output`.
+- Fixed in `segmentation_train.rs`: the per-image slice length used `element_count / batch`; `element_count` is already per image.
+- New xtask commands: `train_segmentation_bin`, `train_segmentation_multi`, `export_train_legogears`, `export_segmentation_bin`, `export_segmentation_multi`, `export_test_onnx_match`, `export_test_onnx_match_segmentation_{bin,multi,all}`. Scripts: `tools/{train_segmentation_oxide,export_onnx,onnx_match,onnx_match_seg}.sh`, `tools/onnx_check_seg.py`. New CLI command `lightnet-rs segment-image` is the native reference.
+- Results recorded in the commit message:
+  - `segmentation_multi`, 100 test images: all 8 ONNX variants (FP32/FP16 × NCHW/NHWC × activated/raw) OK, class agreement ≥ 99.996%, FP32 max_abs 1.7e-6, FP16 max_abs 5.0e-3.
+  - `segmentation_bin`: single image, all 8 variants OK, run before the multi-image change.
+  - Training on both datasets ran to iteration 200 only: mIoU 99.87% binary, 99.23% multi.
+- Not run: `segmentation_bin -all`, a full training run, any FP8 segmentation training, a compiled Darknet golden. The reference is the Rust runtime, not Darknet, so this is Rust-runtime parity only.
+
+### Device convolution Muon (`8604cd4`)
+
+- `runtime/gpu_conv_muon.rs` runs the Muon step on the device for owning standard convolutions, including batch-normalized and grouped ones: per-group momentum, Newton-Schulz and decoupled decay on device; biases and BN scales through the device AdamW multi-tensor step. Momentum is mirrored to the host only when a checkpoint is written.
+- `gpu_update.rs` routes eligible convolutions there (`device_conv_muon_eligible`) and no longer rejects them for batch normalization. Non-eligible BN convolutions, and EML, MoE, DCNv4 and deform with BN, are still rejected (around `gpu_update.rs:412` and `:563`).
+- Verified: host `cargo xtask test muon`, 27 passed on the fake backend, including the rewritten BN-convolution case in `tests_06.rs`.
+- Written but not run: Oxide tests `conv_gpu_muon_device_update_matches_cpu_over_two_steps` and `yolo_device_seed_backward_matches_host_seed_backward`. No GPU parity claim for either the device Muon step or device-seed versus host-seed backward.
+- Still host-staged: EML, MoE, DCNv4, deform, DSConv. `grad_centr` uses the existing host-default kernel and `clip` is not applied. Plan and open questions: `tasks/wip-gpu-parity/todo.md` (written as "plan only"; it predates the code).
+
 ### Earlier work
 
 - Segmentation: pixel-mask discovery and truth encoding, spatial softmax, semantic and legacy segmentation ONNX graph outputs. Focused CPU and SM 89 spatial-softmax tests passed at their checkpoint.
@@ -94,7 +122,7 @@ Built on 2026-10-30: `cargo xtask check` and `cargo xtask gpu-check` both pass, 
 - Subagent drafts, **uncommitted and unwired**, not built: `layers/modern_yolo/{yolox,ppyoloe,yolonas}_train.rs`, `layers/centernet/train.rs`, and `lightnet-cuda-oxide/src/kernels/{yolox,ppyoloe,yolonas,centernet}_train.rs`. Re-checked 2026-10-30: none of the eight is declared in any `mod.rs`, so `cargo check`/`cargo xtask gpu-check` do not see them. The `as f32 <` parse defect in `yolox_train.rs:184` and `yolonas_train.rs:460` was fixed with parentheses, and all eight files now survive a standalone `rustc` parse (only the expected unresolved-crate paths remain). Their assignment logic differs from the existing `modern_yolo/cpu.rs` (`assign_tal_like`, YOLOX centre-only geometry, SIMOTA top-k, L1 and class-term gaps). Undecided: fix `cpu.rs` or replace it with these files. `train.rs` has no dispatch for `Region`, `Yolox`, `Ppyoloe`, `Yolonas` or `CenterNet`, so training those heads is rejected today, matching `tasks/rust/02_state/layer-support.md`.
 - Legacy `[detection]` layer: removed in `a51d56c`. It was an identity passthrough, and no shipped cfg uses it. Not built or tested.
 - Per-layer FP8 policy and the FP32 head boundary.
-- Segmentation CLI training: `segmentation_train.rs` (oxide feature) loads images and pixel masks and drives the native segmentation loss, device backward and deferred update. Written, never compiled (`cargo xtask gpu-check` not run) or run. No augmentation, no mIoU or validation, single-scale only.
+- Segmentation CLI training: moved to "Segmentation training and ONNX match" below. It is built and has run.
 - Short LegoGears, `semantic_binary` and `semantic_multi` smoke tests, and the native-vs-native FP8 and ONNX FP32/FP16 comparisons.
 
 ## Detection implementation sequence
@@ -162,16 +190,37 @@ Decided by user (second interview):
 
 Decided by user (interview on the convolutional layer, plus the earlier questions):
 
-- **Convolutional, BN on GPU**: enable batch-norm convolution training natively, so BN convolutions no longer get rejected on the Muon path. Scope: the detection acceptance configs. **Status: not started.** `gpu_update.rs:549` still rejects BN convolution gradients on the Muon path.
+- **Convolutional, BN on GPU**: enable batch-norm convolution training natively, so BN convolutions no longer get rejected on the Muon path. Scope: the detection acceptance configs. **Status: code committed in `8604cd4`, host-tested only.** Eligible BN convolutions no longer get rejected (see [Device convolution Muon](#device-convolution-muon-8604cd4)); no Oxide run yet.
 - **FP8 eligibility**: every convolution except the one immediately before a detection or segmentation head, which stays FP32. **Status: implemented.** `ConvPrecision::NoLowPrecision` from `runtime::conv_feeds_detection_head`; Oxide drops FP8/FP4 to f32 for that call. Pinned by the GPU and host tests above. With AMP storage the boundary conv keeps its 16-bit GEMM rather than going to f32 storage; only the quantised operands are dropped.
-- **Optimizer boundary**: convolution gradients must update natively on device before any smoke test. Host download at the optimizer boundary is not acceptable. **Status: code written, not compiled or run.** `runtime/gpu_conv_muon.rs` adds a device-resident Muon step for owning standard convolutions (per-group momentum, Newton-Schulz and decoupled decay on device; biases and BN scales via device AdamW; momentum mirrored to the host only at checkpoint write). Unverified: needs `cargo xtask check`, the host Muon tests, and `conv_gpu_muon_device_update_matches_cpu_over_two_steps`. `grad_centr` uses the existing host-default kernel, `clip` is not applied, and other Muon families (EML, MoE, DCNv4, deform, DSConv) stay host-staged. See `tasks/wip-gpu-parity/todo.md`.
+- **Optimizer boundary**: convolution gradients must update natively on device before any smoke test. Host download at the optimizer boundary is not acceptable. **Status: committed in `8604cd4`; compiles, host `muon` tests pass (27), Oxide tests written but not run.** `runtime/gpu_conv_muon.rs` adds a device-resident Muon step for owning standard convolutions (per-group momentum, Newton-Schulz and decoupled decay on device; biases and BN scales via device AdamW; momentum mirrored to the host only at checkpoint write). Unverified: `conv_gpu_muon_device_update_matches_cpu_over_two_steps` has not been run on the GPU. `grad_centr` uses the existing host-default kernel, `clip` is not applied, and other Muon families (EML, MoE, DCNv4, deform, DSConv) stay host-staged. See `tasks/wip-gpu-parity/todo.md`.
 - **Ordering**: FP8 policy comes after the detection heads. Native vs ONNX comparisons come after all code is done.
 - **Staged files outside `src/`**: resolved. They are committed in `ed7fcae`.
 
 Next, in this order:
 
-1. Device-seed parity: compare `backward_accumulate_device_seeded_gpu` with the host-seed path on Oxide for a `[conv] -> [yolo]` net, including `delta_normalizer`, loss scaling and `LIGHTNET_YOLO_GPU` on/off.
+1. Device-seed parity: run `yolo_device_seed_backward_matches_host_seed_backward` (written in `8604cd4`, not run). It compares `backward_accumulate_device_seeded_gpu` with the host-seed path on Oxide for a `[conv] -> [yolo]` net, including `delta_normalizer`, loss scaling and `LIGHTNET_YOLO_GPU` on/off.
 2. Wire `LIGHTNET_YOLO_GPU` into a real step: forward, loss, device-seed backward, BN conv Muon update; verify no double activation and that the loss scaler is applied once.
 3. Dense heads follow-up: move the modern-head and CenterNet delta onto the device (the eight drafts are the starting point, after reconciling their assignment logic with the wired `modern_yolo/cpu.rs` / `centernet/cpu.rs`), then add decode coverage. Region first needs the model/` .weights` extensions listed in step 5 above, so it is no longer a "port the loss" task.
 4. Optimizer boundary: device conv Muon is written (`gpu_conv_muon.rs`) but uncompiled; build it, run the host and Oxide Muon tests, then close the gap for EML, MoE, DCNv4 and deform before any training claim.
-5. Short LegoGears / `semantic_binary` / `semantic_multi` smoke tests, then native-vs-ONNX numbers. Do not transfer earlier test results to new changes.
+5. Short LegoGears smoke test and native-vs-ONNX numbers for detection. Segmentation already has 200-iteration training runs and an ONNX-vs-native table (see [Segmentation training and ONNX match](#segmentation-training-and-onnx-match-0afbaad-f003801)); `segmentation_bin -all` and FP8 segmentation training remain. Do not transfer earlier test results to new changes.
+
+## Dense-head device loss (2026-10-31, uncommitted)
+
+Status: **built and run on the RTX 4060 (2026-10-31), uncommitted.** Checks: `cargo xtask check`, `gpu-check`, `clippy` clean; host tests for the batch and sort regressions pass; Oxide `native_dense_head_loss_matches_cpu_loss_across_heads` and `distribution_head_device_decode_matches_host_decode` pass (CPU loss as the reference, tolerance 2e-3). Smoke training on LegoGears_v2 (300 iterations, `burn_in=50`, `max_batches=300`, batch 32, 80 images, `-map` on the 80-image valid list, "dense-head loss: native device" printed): `[yolox]` loss 30.2 to 1.3, mAP@0.50 42.08%; `[ppyoloe]` 89.4 to 5.8, 59.19%; `[yolonas]` 89.9 to 5.6, 51.67%; `[centernet]` 3.7 to 0.025, 22.17%. These are 300-iteration smoke runs, not converged results, and not compared with Darknet. Fixes needed to get there: `augmentation.rs` and `evaluate.rs` rejected the dense heads, and `tools/test_oxide.sh` now sets `CARGO_INCREMENTAL=0` because the Oxide test binary failed to link on unmodified HEAD (undefined `anon.*.llvm.*` symbol from swin `Arc<[usize]>::drop_slow`).
+
+- Device kernels in `lightnet-cuda-oxide/src/kernels/dense_loss.rs`, ported from the host `modern_yolo/cpu.rs` and `centernet/cpu.rs` (not from the eight untracked drafts, which stay undeclared):
+  - `modern_yolo_assign` (one thread per image: SimOTA for `[yolox]`, task-aligned top-13 with the nested-object rule for `[ppyoloe]` and `[yolonas]`, YOLO-NAS duplicate decay), `modern_yolo_delta` (one thread per cell), `modern_yolo_reduce`.
+  - `centernet_targets`, `centernet_focal`, `centernet_regress`.
+- Plumbing: `ModernYoloGpuLossArgs`, `CenterNetGpuLossArgs` and `modern_yolo_loss_f32` / `centernet_loss_f32` in `lightnet-cuda`; Oxide backends in `dense_loss_backend.rs`; `GpuExecutableNetwork::compute_dense_head_training_loss_gpu` in `runtime/gpu_dense_head_loss.rs`.
+- CLI: `detector train` uses the device loss for these heads by default and device-resident seeds; `LIGHTNET_DENSE_GPU=0` forces the host loss. Heads outside the supported subset (a classic YOLO head in the net) fall back to the host.
+- Inference: the forward and head activation already run natively (`modern_yolo_forward_f32`, `centernet_forward_f32`). New: `[ppyoloe]` and `[yolonas]` box decode runs on the device (`modern_yolo_predecode_f32`, kernel `modern_yolo_predecode`) inside `forward_compact`, so the host downloads `5 + classes` channels instead of `4 * (reg_max + 1) + classes + 1`, and `decode_modern_detections` reads the box channels directly (a head with `classes + 5` channels counts as decoded). Thresholding and NMS stay on the host, as do YOLOX and CenterNet box decode, which is cheap arithmetic. Test, not run: `distribution_head_device_decode_matches_host_decode`.
+- Cfgs: `cfg/LegoGears_{yolox,ppyoloe,yolonas,centernet}.cfg`, copied from `Jev_laya`. `cfg-validate` passes on all four.
+- Tests written, not run: Oxide `native_dense_head_loss_matches_cpu_loss_across_heads` (batch 2, nested truths, five head variants, against the Rust CPU loss); host `later_images_in_a_batch_keep_their_own_delta`, `task_aligned_assignment_keeps_the_highest_scoring_cells`, `a_batch_of_two_trains_each_image_separately`.
+
+CPU bugs fixed while porting (untested). Any earlier "it trains" result from these heads is not trustworthy and must be rerun:
+
+- `[yolox]`, `[ppyoloe]`, `[yolonas]`: the per-image delta copy took image 0's slice for every image, so images 1 and up produced no delta.
+- `[centernet]`: the delta buffer held one image while the focal loss wrote the whole batch (out-of-range at batch 2 and up).
+- `[ppyoloe]`, `[yolonas]`: `assign_tal_like` sorted scores ascending and kept the 13 worst cells. The C++ sorts descending (`modern_yolo_layer.cpp:977`).
+
+Known gaps against the C++, not fixed: the task-aligned quality target is `iou` here but `score / max_score * max_iou` in the C++ after an ATSS warmup schedule; YOLO-NAS duplicate decay multiplies `iou` here but `quality` in the C++; class multipliers and a class map have no device path. The device loss mirrors the Rust CPU loss, so it inherits these gaps; no `raptor-fp4` golden exists.

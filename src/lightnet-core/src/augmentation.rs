@@ -40,7 +40,14 @@ impl DetectorAugmentation {
             .find(|s| {
                 matches!(
                     s.name.as_str(),
-                    "yolo" | "gaussian_yolo" | "region" | "obb_yolo"
+                    "yolo"
+                        | "gaussian_yolo"
+                        | "region"
+                        | "obb_yolo"
+                        | "yolox"
+                        | "ppyoloe"
+                        | "yolonas"
+                        | "centernet"
                 )
             })
             .ok_or_else(|| invalid("detector augmentation requires a detector head"))?;

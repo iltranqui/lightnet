@@ -689,7 +689,8 @@ pub fn assign_tal_like(
         if candidates.is_empty() {
             continue;
         }
-        candidates.sort_by(|c, a| {
+        // Best score first (C++ `lhs.score > rhs.score`), then keep the top `TAL_TOPK`.
+        candidates.sort_by(|a, c| {
             c.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -1092,7 +1093,12 @@ pub fn yolox_training_delta(
     for b in 0..l.batch {
         let batch = yolox_train_batch(output, truth, l, spec, settings, b)?;
         let out = l.outputs();
-        for (dst, src) in delta[b * out..(b + 1) * out].iter_mut().zip(&batch.delta) {
+        // `batch.delta` spans the whole batch (`entry_index` is a batch index), so
+        // take image `b`'s own slice; the head of the buffer is image 0.
+        for (dst, src) in delta[b * out..(b + 1) * out]
+            .iter_mut()
+            .zip(&batch.delta[b * out..(b + 1) * out])
+        {
             *dst += src;
         }
         positives += batch.positives;
@@ -2078,5 +2084,71 @@ mod distribution_heads {
         )
         .expect("network builds");
         assert!(matches!(&network.layers[1].kind, LayerKind::Ppyoloe(s) if s.classes == 9));
+    }
+
+    /// Regression: a batch used to copy image 0's slice of every image's delta, so images
+    /// 1.. trained on nothing.
+    #[test]
+    fn later_images_in_a_batch_keep_their_own_delta() {
+        let one = ModernLayout {
+            batch: 1,
+            n: 1,
+            w: 4,
+            h: 4,
+            classes: 1,
+            coords: 4,
+            kind: ModernYoloKind::Yolox,
+        };
+        let two = ModernLayout { batch: 2, ..one };
+        let mut s = dfl_spec(ModernYoloKind::Yolox, 1, 16);
+        s.max_boxes = 1;
+        let settings = ModernYoloSettings::default();
+        let mut x1 = vec![0.0f32; one.len()];
+        activate_modern_output(&mut x1, &one);
+        let mut x2 = x1.clone();
+        x2.extend_from_slice(&x1);
+        let row = [0.5, 0.5, 0.5, 0.5, 0.0, 0.0];
+        let (delta1, _, positives1) = yolox_training_delta(&x1, &row, &one, &s, &settings).unwrap();
+        assert!(positives1 > 0, "the truth must claim at least one cell");
+        let mut truth2 = row.to_vec();
+        truth2.extend_from_slice(&row);
+        let (delta2, _, positives2) =
+            yolox_training_delta(&x2, &truth2, &two, &s, &settings).unwrap();
+        assert_eq!(positives2, 2 * positives1);
+        let out = one.outputs();
+        assert_eq!(&delta2[..out], &delta1[..]);
+        assert_eq!(&delta2[out..], &delta1[..], "image 1 must carry its own delta");
+    }
+
+    /// Regression: the task-aligned assignment keeps the best-scoring cells (C++
+    /// `lhs.score > rhs.score`), not the worst.
+    #[test]
+    fn task_aligned_assignment_keeps_the_highest_scoring_cells() {
+        let l = ModernLayout {
+            batch: 1,
+            n: 1,
+            w: 8,
+            h: 8,
+            classes: 1,
+            coords: 8,
+            kind: ModernYoloKind::Ppyoloe,
+        };
+        let mut s = dfl_spec(ModernYoloKind::Ppyoloe, 1, 1);
+        s.max_boxes = 1;
+        let settings = ModernYoloSettings::default();
+        let mut x = vec![0.0f32; l.len()];
+        for loc in 0..64 {
+            x[l.obj_index(0, 0, loc)] = 0.5;
+            x[l.class_index(0, 0, loc, 0)] = 0.5;
+        }
+        x[l.obj_index(0, 0, 10)] = 0.99;
+        x[l.obj_index(0, 0, 20)] = 0.01;
+        // One truth covering every cell, so all 64 cells are candidates and only 13 are kept.
+        let truth = [0.5, 0.5, 0.98, 0.98, 0.0, 0.0];
+        let tal = assign_tal_like(&x, &truth, &l, &s, &settings, 0).unwrap();
+        assert_eq!(tal.assignments[10].truth_index, 0, "best cell must be kept");
+        assert_eq!(tal.assignments[20].truth_index, usize::MAX, "worst cell must be dropped");
+        let kept = tal.assignments.iter().filter(|a| a.truth_index == 0).count();
+        assert_eq!(kept, TAL_TOPK);
     }
 }
