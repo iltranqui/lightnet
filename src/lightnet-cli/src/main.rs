@@ -29,6 +29,8 @@ use lightnet_cuda_oxide::OxideBackend;
 
 mod colour;
 mod lm;
+#[cfg(feature = "oxide")]
+mod segmentation_train;
 
 fn main() {
     let handle = std::thread::Builder::new()
@@ -2954,6 +2956,10 @@ fn run_detector_train_gpu(
     options: &TrainOptions,
     backend: OxideBackend,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // A `[segmentation]` network trains on pixel masks, not YOLO labels.
+    if segmentation_train::is_segmentation_network(&Network::from_path(cfg)?) {
+        return segmentation_train::run(cfg, data, options, backend);
+    }
     let data_config = DataConfig::from_path(data)?;
     let augmentation = DetectorAugmentation::from_config(&ConfigFile::parse_file(cfg)?)?;
     let mut executable = GpuExecutableNetwork::from_path(cfg, backend)?;

@@ -17,6 +17,9 @@ usage: cargo xtask <cmd> [args...]
   clippy|l [pkg...]     cargo clippy (default: lightnet-cli lightnet-core)
   test|host|t [filter...]  host tests, same as tools/test_host.sh (PKGS overrides)
   oxide|o [args...]     ./tools/test_oxide.sh (GPU tests; args pass through)
+  train_segmentation_bin|train_segmentation_multi [precision flags] [w] [flags]
+                        like train_legogears on ../datasets/semantic_binary|semantic_multi
+                        (./tools/train_segmentation_oxide.sh; no -map)
   train_legogears|train|tr [-fp8|-fp16|-bf16|-fp8 -fp16|-fp8 -bf16] [w] [flags]
                         -fp8: LIGHTNET_OXIDE_GEMM=fp8 and LIGHTNET_OXIDE_GEMM_BWD=fp8 (f32 storage; an inherited
                         LIGHTNET_OXIDE_AMP is unset, as without any flag); -fp16: LIGHTNET_OXIDE_AMP=1
@@ -96,13 +99,25 @@ fn main() -> ExitCode {
         }
         // Release build + `detector train` on LegoGears_v2 (oxide backend); the script
         // caps itself. Overrides: CFG, DATA, SEED, PROFILE. LIGHTNET_OXIDE_AMP is set or unset from the precision flags.
-        "train_legogears" | "train" | "tr" => {
+        "train_legogears" | "train" | "tr" | "train_segmentation_bin" | "train_segmentation_multi" => {
+            // Segmentation datasets reuse the same build, precision flags and 4 thread cap.
+            let script = match cmd.as_str() {
+                "train_segmentation_bin" => {
+                    unsafe { env::set_var("SEG_DATASET", "semantic_binary") };
+                    "./tools/train_segmentation_oxide.sh"
+                }
+                "train_segmentation_multi" => {
+                    unsafe { env::set_var("SEG_DATASET", "semantic_multi") };
+                    "./tools/train_segmentation_oxide.sh"
+                }
+                _ => "./tools/train_legogears_oxide.sh",
+            };
             // Same 4 build thread cap as every other command.
             if env::var_os("JOBS").is_none() {
                 // SAFETY: single-threaded at this point; no other thread reads the env.
                 unsafe { env::set_var("JOBS", "4") };
             }
-            let mut v = vec!["./tools/train_legogears_oxide.sh".to_owned()];
+            let mut v = vec![script.to_owned()];
             match precision_env(&rest) {
                 Ok((rest, vars, extra)) => {
                     apply_precision_env(&vars, |k, val| {
