@@ -7,6 +7,7 @@ Reference: [darkmark_gui_behavior.md](../../04_reference/darkmark_gui_behavior.m
 - [DarkMark layout reference](#darkmark-layout-reference)
 - [Project tree](#project-tree)
 - [Component breakdown](#component-breakdown)
+- [Phase 1: small independent fixes](#phase-1-small-independent-fixes)
 - [Implementation plan](#implementation-plan)
 - [Open questions](#open-questions)
 
@@ -60,6 +61,14 @@ src/
   - Role today: first window with project path field, Open, Open folder... and Recent. The legacy-sidecar fix (missing `annotation_mode` accepted) is already in `annotation.rs`.
   - DarkMark reference (user screenshot, "DarkMark v1.5.19-2 Launcher"): a tab per project across the top; a table for the selected project (name, project directory, size of directory and cache size, last opened, image files, markup files with percentage and negative samples, number of classes, number of marks with per-class and per-image averages, newest and oldest markup with relative age, exclusion regex, network dimensions, darknet template, configuration, weights, classes/names paths); a file list (filename, type, size, timestamp with relative age, newest rows highlighted green) for `.cfg`, `.weights` and `.names` with a "hide extra .weights files" checkbox; a thumbnail; and the buttons Add..., Delete..., Import video..., Open folder..., Refresh, Load..., Cancel.
   - Target: rebuild the launcher as project tabs plus the info table, file list and these buttons. Stats come from the sidecars (`Project` scan; cache them, a large project must not block the UI). Import video is out of scope for v1 and may be a disabled button.
+
+## Phase 1: small independent fixes
+
+Done first and committed one item at a time, because they are independent of the layout. Verification for each: `JOBS=4 MEM=4G cargo xtask check lightnet-gui`, `PKGS=lightnet-gui-project JOBS=4 MEM=4G cargo xtask test`, and a look at `cargo xtask gui <project-dir>` (the app takes an optional project directory so the editor can be opened without clicking through the launcher).
+
+- [x] a. Hover crosshair: 1 px red vertical and horizontal lines through the pointer over the whole canvas, only while the pointer is over the image, hidden while a drag or a pan is active; the system cursor is hidden over the image (`canvas()` in `main.rs`). DarkMark tints the crosshair with the most-recent-class colour instead of red; step 3 of the layout plan can revisit that.
+- [ ] b. Hotkey parity for `p`, `m`, `a`, `A` (see [Hotkeys p, m, a, A](../../04_reference/darkmark_gui_behavior.md#hotkeys-p-m-a-a)).
+- [ ] c. Save pipeline fixes (see [Save pipeline](../../04_reference/darkmark_gui_behavior.md#save-pipeline)).
 
 ## Implementation plan
 

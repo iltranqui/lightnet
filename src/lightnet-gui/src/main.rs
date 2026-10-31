@@ -19,6 +19,9 @@ use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use image::{GrayImage, RgbaImage};
 
 fn main() -> eframe::Result<()> {
+    // `lightnet-gui [--project] <dir>` opens that project instead of showing the
+    // launcher; `cargo xtask gui <dir>` forwards its arguments here.
+    let project = project_argument(std::env::args().skip(1));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1400.0, 900.0])
@@ -28,8 +31,20 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Darknet Annotator",
         options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(App::new(cc, project)))),
     )
+}
+
+fn project_argument(mut args: impl Iterator<Item = String>) -> Option<String> {
+    let mut project = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--project" | "-p" => project = args.next(),
+            other if !other.starts_with('-') => project = Some(other.to_owned()),
+            _ => {}
+        }
+    }
+    project
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -193,11 +208,11 @@ struct App {
 }
 
 impl App {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, project: Option<String>) -> Self {
         let mut style = (*cc.egui_ctx.style()).clone();
         style.visuals = egui::Visuals::dark();
         cc.egui_ctx.set_style(style);
-        Self {
+        let mut app = Self {
             settings: Settings::load(),
             project: None,
             filter: Filter::default(),
@@ -235,7 +250,11 @@ impl App {
             drag_start: None,
             drag_now: None,
             pan_start: None,
+        };
+        if let Some(project) = project {
+            app.open_project(Path::new(&project));
         }
+        app
     }
 
     fn fail(&mut self, error: String) {
@@ -831,6 +850,29 @@ impl App {
             }
         }
 
+        // DarkMark hides the system pointer over the canvas and paints a 1 px
+        // crosshair through the mouse instead (`CrosshairComponent.cpp:40-49`,
+        // `:60-104`, `:119-137`). While a rubber band is active it paints the
+        // band rather than the crosshair, and panning has no crosshair either.
+        let dragging = self.drag_start.is_some();
+        let panning = self.pan_start.is_some();
+        if let Some(pointer) = response.hover_pos()
+            && image_rect.contains(pointer)
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+            if !dragging && !panning {
+                let stroke = Stroke::new(1.0_f32, CROSSHAIR_COLOUR);
+                painter.line_segment(
+                    [Pos2::new(rect.left(), pointer.y), Pos2::new(rect.right(), pointer.y)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [Pos2::new(pointer.x, rect.top()), Pos2::new(pointer.x, rect.bottom())],
+                    stroke,
+                );
+            }
+        }
+
         let mods = ui.input(|input| Mods {
             ctrl: input.modifiers.command,
             alt: input.modifiers.alt,
@@ -954,6 +996,11 @@ fn apply_view(view: View, gray: &GrayImage, rgba: &RgbaImage) -> RgbaImage {
         }
     }
 }
+
+/// Hover crosshair colour. DarkMark tints it with the most-recent-class colour
+/// (`crosshair_colour`, `CrosshairComponent.cpp:119-137`); this port keeps the
+/// thin red lines the layout plan asks for.
+const CROSSHAIR_COLOUR: Color32 = Color32::from_rgb(0xF0, 0x20, 0x20);
 
 fn class_color(class_id: usize) -> Color32 {
     const PALETTE: [Color32; 10] = [
