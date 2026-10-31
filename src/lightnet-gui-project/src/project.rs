@@ -155,7 +155,7 @@ impl Project {
         let (width, height) = entry.dimensions()?;
         match fs::read_to_string(&entry.json_path) {
             Ok(text) => {
-                let mut annotation = Annotation::from_json(&text)?;
+                let mut annotation = Annotation::from_json_sized(&text, width, height)?;
                 if annotation.image_width == 0 || annotation.image_height == 0 {
                     annotation.image_width = width;
                     annotation.image_height = height;

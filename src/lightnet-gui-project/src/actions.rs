@@ -6,7 +6,7 @@ use crate::annotation::{Annotation, Mark, Point};
 
 /// Linear interpolation between two annotations by index (`t = 0` is `a`,
 /// `t = 1` is `b`). Marks beyond the shorter list are dropped.
-pub fn interpolate(a: &Annotation, b: &Annotation, t: f32) -> Annotation {
+pub fn interpolate(a: &Annotation, b: &Annotation, t: f64) -> Annotation {
     let t = t.clamp(0.0, 1.0);
     let mut out = Annotation::new(a.image_width.max(b.image_width), a.image_height.max(b.image_height));
     let count = a.marks.len().min(b.marks.len());
@@ -20,6 +20,7 @@ pub fn interpolate(a: &Annotation, b: &Annotation, t: f32) -> Annotation {
         out.marks.push(Mark {
             class_id: first.class_id,
             name: first.name.clone(),
+            description: first.description.clone(),
             points,
             is_prediction: false,
             confidence: 1.0,
@@ -75,11 +76,12 @@ pub fn clipboard_paste(text: &str, width: u32, height: u32, classes: &[String]) 
             let pair = point.as_array().ok_or_else(|| "bad point".to_owned())?;
             let x = pair.first().and_then(serde_json::Value::as_f64).unwrap_or(0.0) * sx;
             let y = pair.get(1).and_then(serde_json::Value::as_f64).unwrap_or(0.0) * sy;
-            *slot = Point::new(x as f32, y as f32);
+            *slot = Point::new(x, y);
         }
         marks.push(Mark {
             class_id,
             name: classes.get(class_id).cloned().unwrap_or_else(|| format!("class {class_id}")),
+            description: classes.get(class_id).cloned().unwrap_or_else(|| format!("class {class_id}")),
             points: corners,
             is_prediction: false,
             confidence: 1.0,
@@ -114,7 +116,7 @@ pub fn snap(annotations: &mut Annotation, image: &GrayImage, radius: u32, scope:
         if mark.is_prediction {
             continue;
         }
-        let mut best: Option<(f32, f32, bool)> = None; // (gradient, delta, vertical)
+        let mut best: Option<(f32, f64, bool)> = None; // (gradient, delta, vertical)
         for (edge, vertical) in [(0, true), (1, false), (2, true), (3, false)] {
             let wanted = matches!(
                 (scope, vertical),
@@ -140,7 +142,7 @@ pub fn snap(annotations: &mut Annotation, image: &GrayImage, radius: u32, scope:
                 if value > 0.0
                     && best.is_none_or(|(best_value, _, _)| value > best_value)
                 {
-                    best = Some((value, (candidate - axis) as f32, vertical));
+                    best = Some((value, (candidate - axis) as f64, vertical));
                 }
             }
         }
@@ -166,9 +168,9 @@ pub fn snap(annotations: &mut Annotation, image: &GrayImage, radius: u32, scope:
 pub fn homography(corners: [Point; 4], image: &RgbaImage) -> RgbaImage {
     let identity = [
         Point::new(0.0, 0.0),
-        Point::new(image.width() as f32, 0.0),
-        Point::new(image.width() as f32, image.height() as f32),
-        Point::new(0.0, image.height() as f32),
+        Point::new(image.width() as f64, 0.0),
+        Point::new(image.width() as f64, image.height() as f64),
+        Point::new(0.0, image.height() as f64),
     ];
     if corners
         .iter()
@@ -183,7 +185,7 @@ pub fn homography(corners: [Point; 4], image: &RgbaImage) -> RgbaImage {
     let mut out = RgbaImage::new(image.width(), image.height());
     for y in 0..image.height() {
         for x in 0..image.width() {
-            let (sx, sy) = apply(&matrix, x as f32, y as f32);
+            let (sx, sy) = apply(&matrix, x as f64, y as f64);
             let (sx, sy) = (sx.round() as i64, sy.round() as i64);
             if sx < 0 || sy < 0 || sx >= image.width() as i64 || sy >= image.height() as i64 {
                 continue;
@@ -194,12 +196,11 @@ pub fn homography(corners: [Point; 4], image: &RgbaImage) -> RgbaImage {
     out
 }
 
-fn apply(m: &[f64; 9], x: f32, y: f32) -> (f32, f32) {
-    let (x, y) = (x as f64, y as f64);
+fn apply(m: &[f64; 9], x: f64, y: f64) -> (f64, f64) {
     let denominator = m[6] * x + m[7] * y + m[8];
     (
-        ((m[0] * x + m[1] * y + m[2]) / denominator) as f32,
-        ((m[3] * x + m[4] * y + m[5]) / denominator) as f32,
+        (m[0] * x + m[1] * y + m[2]) / denominator,
+        (m[3] * x + m[4] * y + m[5]) / denominator,
     )
 }
 
@@ -208,8 +209,8 @@ fn apply(m: &[f64; 9], x: f32, y: f32) -> (f32, f32) {
 fn solve_homography(from: &[Point; 4], to: &[Point; 4]) -> Option<[f64; 9]> {
     let mut a = [[0.0f64; 9]; 8];
     for index in 0..4 {
-        let (x, y) = (from[index].x as f64, from[index].y as f64);
-        let (u, v) = (to[index].x as f64, to[index].y as f64);
+        let (x, y) = (from[index].x, from[index].y);
+        let (u, v) = (to[index].x, to[index].y);
         a[index * 2] = [x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y, u];
         a[index * 2 + 1] = [0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y, v];
     }

@@ -230,6 +230,9 @@ struct App {
     drag_start: Option<Pos2>,
     drag_now: Option<Pos2>,
     pan_start: Option<(Vec2, Pos2)>,
+    /// Last canvas scale (fit * zoom), written to `image.scale` on save, as
+    /// DarkMark does with `scale_factor` (`DMContent.cpp:2967`).
+    canvas_scale: f64,
 }
 
 impl App {
@@ -278,6 +281,7 @@ impl App {
             drag_start: None,
             drag_now: None,
             pan_start: None,
+            canvas_scale: 1.0,
         };
         if let Some(project) = project {
             app.open_project(Path::new(&project));
@@ -321,7 +325,8 @@ impl App {
         let (Some(project), Some(editor)) = (self.project.as_mut(), self.editor.as_ref()) else {
             return;
         };
-        let annotation = editor.to_annotation();
+        let mut annotation = editor.to_annotation();
+        annotation.scale = self.canvas_scale;
         match project.save_annotation(self.index, &annotation) {
             Ok(()) => {
                 self.dirty = false;
@@ -488,11 +493,11 @@ impl App {
                 unreachable!("handled before the editor borrow")
             }
             Action::Scale(delta) => {
-                editor.scale(delta);
+                editor.scale(delta as f64);
                 self.dirty = true;
             }
             Action::Nudge(dx, dy) => {
-                editor.nudge(dx, dy);
+                editor.nudge(dx as f64, dy as f64);
                 self.dirty = true;
             }
             Action::Undo => {
@@ -656,7 +661,8 @@ impl App {
         let marks: Vec<Mark> = predictions
             .into_iter()
             .map(|Prediction { class, conf, cx, cy, w, h }| {
-                let (width, height) = (editor.width as f32, editor.height as f32);
+                let (width, height) = (editor.width as f64, editor.height as f64);
+                let (cx, cy, w, h) = (cx as f64, cy as f64, w as f64, h as f64);
                 Mark::prediction(
                     class,
                     editor.class_name(class),
@@ -870,6 +876,7 @@ impl App {
         let rect = response.rect;
         let painter = ui.painter_at(rect);
         let scale = ((rect.width() / width).min(rect.height() / height) * self.zoom).max(0.01);
+        self.canvas_scale = scale as f64;
         let image_rect = Rect::from_center_size(rect.center() + self.pan, Vec2::new(width, height) * scale);
         painter.image(
             view_image.id(),
@@ -880,14 +887,14 @@ impl App {
 
         let to_screen = |p: Point| {
             Pos2::new(
-                image_rect.left() + p.x / width * image_rect.width(),
-                image_rect.top() + p.y / height * image_rect.height(),
+                image_rect.left() + (p.x / width as f64) as f32 * image_rect.width(),
+                image_rect.top() + (p.y / height as f64) as f32 * image_rect.height(),
             )
         };
         let to_image = |p: Pos2| {
             Point::new(
-                (p.x - image_rect.left()) / image_rect.width().max(1.0) * width,
-                (p.y - image_rect.top()) / image_rect.height().max(1.0) * height,
+                ((p.x - image_rect.left()) / image_rect.width().max(1.0)) as f64 * width as f64,
+                ((p.y - image_rect.top()) / image_rect.height().max(1.0)) as f64 * height as f64,
             )
         };
 

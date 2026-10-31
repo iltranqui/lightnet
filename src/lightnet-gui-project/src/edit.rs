@@ -8,7 +8,7 @@ use crate::annotation::{Annotation, Mark, Point};
 use crate::undo::UndoStack;
 
 /// Smallest box side, in pixels, that a drag may create.
-pub const MIN_SIZE: f32 = 2.0;
+pub const MIN_SIZE: f64 = 2.0;
 
 /// `DMCanvas::rebuild_cache_image` (`DMCanvas.cpp:289-330`): predictions are
 /// drawn unless `show_predictions` is off; Auto also hides them once a real mark
@@ -41,15 +41,18 @@ pub struct Editor {
     /// Class used for the next created mark.
     pub class_id: usize,
     pub class_names: Vec<String>,
-    pub most_recent_size: (f32, f32),
+    pub most_recent_size: (f64, f64),
     pub most_recent_class: usize,
     /// Corner hit radius in pixels (`G9` default 10).
-    pub corner_size: f32,
+    pub corner_size: f64,
     pub width: u32,
     pub height: u32,
     /// Prediction confidence threshold (`G15`).
     pub threshold: f32,
     pub completely_empty: bool,
+    /// The annotation this editor was loaded from, so unknown sidecar fields and
+    /// `image.scale` survive a save (`to_annotation`).
+    pub source: Option<Annotation>,
     drag: Option<Drag>,
     preview: Option<(Point, Point)>,
     undo: UndoStack<Vec<Mark>>,
@@ -70,6 +73,7 @@ impl Editor {
             height: height.max(1),
             threshold: 0.25,
             completely_empty: false,
+            source: None,
             drag: None,
             preview: None,
             undo: UndoStack::new(),
@@ -80,11 +84,15 @@ impl Editor {
         let mut editor = Self::new(annotation.image_width, annotation.image_height, class_names);
         editor.marks = annotation.marks.clone();
         editor.completely_empty = annotation.completely_empty;
+        editor.source = Some(annotation.clone());
         editor
     }
 
     pub fn to_annotation(&self) -> Annotation {
-        let mut annotation = Annotation::new(self.width, self.height);
+        let mut annotation = self
+            .source
+            .clone()
+            .unwrap_or_else(|| Annotation::new(self.width, self.height));
         annotation.marks = self.marks.clone();
         annotation.completely_empty = self.completely_empty && !self.has_real_marks();
         annotation
@@ -121,8 +129,8 @@ impl Editor {
 
     fn clamp_point(&self, point: Point) -> Point {
         Point::new(
-            point.x.clamp(0.0, self.width as f32),
-            point.y.clamp(0.0, self.height as f32),
+            point.x.clamp(0.0, self.width as f64),
+            point.y.clamp(0.0, self.height as f64),
         )
     }
 
@@ -165,7 +173,7 @@ impl Editor {
     /// Nearest real-mark corner within `corner_size` of `point`, if the point is
     /// inside that mark's rect (`G9`).
     fn corner_hit(&self, point: Point) -> Option<(usize, usize)> {
-        let mut best: Option<(usize, usize, f32)> = None;
+        let mut best: Option<(usize, usize, f64)> = None;
         for (index, mark) in self.marks.iter().enumerate() {
             if mark.is_prediction || !mark.contains(point) {
                 continue;
@@ -276,7 +284,7 @@ impl Editor {
         self.preview
     }
 
-    fn make_mark(&self, class_id: usize, x0: f32, y0: f32, x1: f32, y1: f32) -> Option<Mark> {
+    fn make_mark(&self, class_id: usize, x0: f64, y0: f64, x1: f64, y1: f64) -> Option<Mark> {
         let a = self.clamp_point(Point::new(x0, y0));
         let b = self.clamp_point(Point::new(x1, y1));
         let mark = Mark::from_corners(
@@ -375,7 +383,7 @@ impl Editor {
 
     /// Ctrl+W/A/S/D: move every real mark by one pixel; a mark that would leave
     /// the image is left untouched (`G16`).
-    pub fn nudge(&mut self, dx: f32, dy: f32) {
+    pub fn nudge(&mut self, dx: f64, dy: f64) {
         self.push_undo();
         for mark in &mut self.marks {
             if mark.is_prediction {
@@ -383,7 +391,7 @@ impl Editor {
             }
             let (left, right) = (mark.left() + dx, mark.right() + dx);
             let (top, bottom) = (mark.top() + dy, mark.bottom() + dy);
-            if left < 0.0 || top < 0.0 || right > self.width as f32 || bottom > self.height as f32 {
+            if left < 0.0 || top < 0.0 || right > self.width as f64 || bottom > self.height as f64 {
                 continue;
             }
             for point in &mut mark.points {
@@ -397,9 +405,9 @@ impl Editor {
     /// height around its centre. DarkMark calls `scale_all_marks(+-0.01)`, so
     /// the delta is a fraction of the image, not of the box. Shrinking below
     /// `MIN_SIZE` is refused (`G16`).
-    pub fn scale(&mut self, delta: f32) {
+    pub fn scale(&mut self, delta: f64) {
         self.push_undo();
-        let (dx, dy) = (delta * self.width as f32, delta * self.height as f32);
+        let (dx, dy) = (delta * self.width as f64, delta * self.height as f64);
         for mark in &mut self.marks {
             if mark.is_prediction {
                 continue;
@@ -530,7 +538,7 @@ mod tests {
         Editor::new(100, 100, vec!["a".into(), "b".into(), "c".into()])
     }
 
-    fn mark(class_id: usize, x0: f32, y0: f32, x1: f32, y1: f32) -> Mark {
+    fn mark(class_id: usize, x0: f64, y0: f64, x1: f64, y1: f64) -> Mark {
         Mark::from_corners(class_id, "a", x0, y0, x1, y1)
     }
 
@@ -669,6 +677,36 @@ mod tests {
         editor.selected = Some(0);
         assert!(editor.accept_selected().is_ok());
         assert!(editor.accept_selected().is_err(), "already accepted");
+    }
+
+    #[test]
+    fn accepting_a_prediction_keeps_its_description() {
+        let mut editor = editor();
+        let mut prediction = mark(1, 0.0, 0.0, 10.0, 10.0);
+        prediction.is_prediction = true;
+        prediction.description = "front wheel".to_owned();
+        editor.marks = vec![prediction];
+        assert_eq!(editor.accept_all(), Ok(1));
+        assert_eq!(editor.marks[0].name, "b", "the class name is refreshed");
+        assert_eq!(
+            editor.marks[0].description, "front wheel",
+            "a save must not overwrite the description"
+        );
+    }
+
+    #[test]
+    fn to_annotation_keeps_the_loaded_sidecar_metadata() {
+        let mut loaded = Annotation::new(100, 100);
+        loaded.scale = 2.5;
+        let mut original = Mark::from_corners(0, "a", 10.0, 10.0, 20.0, 20.0);
+        original.description = "kept".to_owned();
+        loaded.marks.push(original);
+        let editor = Editor::from_annotation(&loaded, vec!["a".into()]);
+        let out = editor.to_annotation();
+        assert_eq!(out.scale, 2.5);
+        let text = out.to_json();
+        assert!(text.contains("\"description\": \"kept\""), "{text}");
+        assert!(text.contains("\"scale\": 2.5"), "{text}");
     }
 
     #[test]
