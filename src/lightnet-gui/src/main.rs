@@ -298,6 +298,8 @@ struct App {
     pan_start: Option<(Vec2, Pos2)>,
     /// Last canvas scale (fit or manual zoom), written to `image.scale` on save.
     canvas_scale: f64,
+    /// Cached filtered texture for the non-normal views (`view` + image index).
+    view_cache: Option<(String, egui::TextureHandle)>,
     scrollfield: ScrollField,
     /// Pending 500 ms full load after a quick load.
     pending_full: Option<Instant>,
@@ -368,6 +370,7 @@ impl App {
             drag_now: None,
             pan_start: None,
             canvas_scale: 1.0,
+            view_cache: None,
             scrollfield,
             pending_full: None,
             launcher_selected,
@@ -1105,26 +1108,41 @@ impl App {
             self.fail(error);
             return;
         }
-        let Some(texture) = self.cache.entries.get(&self.index) else {
-            return;
-        };
-        let (width, height, view_image) = (
-            texture.rgba.width() as f32,
-            texture.rgba.height() as f32,
-            match self.view {
+        let (width, height, view_image) = {
+            let Some(texture) = self.cache.entries.get(&self.index) else {
+                return;
+            };
+            let size = (texture.rgba.width() as f32, texture.rgba.height() as f32);
+            // The filtered views are expensive (Canny especially); keep the last
+            // one per image instead of re-uploading it every frame.
+            let handle = match self.view {
                 View::Normal => texture.handle.clone(),
-                other => {
-                    let filtered = apply_view(other, &texture.gray, &texture.rgba);
-                    let size = [filtered.width() as usize, filtered.height() as usize];
-                    let color = egui::ColorImage::from_rgba_unmultiplied(size, filtered.as_raw());
-                    ui.ctx().load_texture(
-                        format!("view-{}-{}", other.label(), self.index),
-                        color,
-                        egui::TextureOptions::LINEAR,
-                    )
+                view => {
+                    let key = format!("{}-{}", view.label(), self.index);
+                    let cached = match &self.view_cache {
+                        Some((cached, handle)) if *cached == key => Some(handle.clone()),
+                        _ => None,
+                    };
+                    match cached {
+                        Some(handle) => handle,
+                        None => {
+                            let filtered = apply_view(view, &texture.gray, &texture.rgba);
+                            let size = [filtered.width() as usize, filtered.height() as usize];
+                            let color =
+                                egui::ColorImage::from_rgba_unmultiplied(size, filtered.as_raw());
+                            let handle = ui.ctx().load_texture(
+                                key.clone(),
+                                color,
+                                egui::TextureOptions::LINEAR,
+                            );
+                            self.view_cache = Some((key, handle.clone()));
+                            handle
+                        }
+                    }
                 }
-            },
-        );
+            };
+            (size.0, size.1, handle)
+        };
 
         let response = ui.allocate_response(ui.available_size(), Sense::click_and_drag());
         let rect = response.rect;
