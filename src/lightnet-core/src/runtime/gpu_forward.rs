@@ -29,6 +29,28 @@ where
         self.forward_with_state_impl(input, true, false)
     }
 
+    /// Inference forward that keeps the layer outputs on the device: no host
+    /// copies except what a CPU-only layer forces. Rolling batch-norm statistics
+    /// are used (unlike [`Self::forward_training_device`]). Read a layer with
+    /// [`Self::download_layer_output`].
+    pub fn forward_inference_device(&self, input: &Tensor) -> Result<GpuForwardState<B::Tensor>> {
+        self.forward_with_state_impl(input, false, false)
+    }
+
+    /// Download one layer output of a device-resident forward as host f32.
+    pub fn download_layer_output(
+        &self,
+        state: &GpuForwardState<B::Tensor>,
+        layer: usize,
+    ) -> Result<Vec<f32>> {
+        let tensor = state.gpu_layer_outputs.get(layer).ok_or_else(|| {
+            Error::InvalidConfig(format!("missing device output for layer #{layer}"))
+        })?;
+        self.backend
+            .download_f32(tensor)
+            .map_err(|err| backend_error("download layer output", err))
+    }
+
     pub(super) fn forward_with_state_mode(
         &self,
         input: &Tensor,

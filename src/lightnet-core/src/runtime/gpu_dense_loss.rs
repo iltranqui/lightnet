@@ -111,11 +111,30 @@ where
             let Some(target) = truth[layer.index].as_ref() else {
                 continue;
             };
-            let LayerKind::Segmentation(spec) = &layer.kind else {
-                return Err(Error::UnsupportedLayer {
-                    layer_index: layer.index,
-                    name: format!("{} (native dense loss)", layer.kind.name()),
-                });
+            let head = match &layer.kind {
+                LayerKind::Segmentation(spec) => SegmentationLossParams {
+                    softmax: spec.loss == crate::model::SegmentationLoss::SoftmaxCe,
+                    scale: spec.lambda_ce * spec.ce_normalizer * spec.cls_normalizer,
+                    gate_strength: crate::segmentation::gate_strength(spec, iteration),
+                    gate_t_correct: spec.gate_t_correct,
+                    gate_max_compensation: spec.gate_max_compensation,
+                    max_delta: spec.max_delta,
+                    seed_index: layer.index,
+                },
+                // Legacy heads: a trailing `[logistic]` (binary) or `[softmax] spatial=1`
+                // trained on pixel masks. Plain cross-entropy, no gate, no clip. The
+                // delta is already with respect to the logits, so a softmax head seeds
+                // the layer before it: the softmax backward would apply its Jacobian again.
+                LayerKind::Logistic => SegmentationLossParams::legacy(false, layer.index),
+                LayerKind::Softmax { spatial: true, .. } if layer.index > 0 => {
+                    SegmentationLossParams::legacy(true, layer.index - 1)
+                }
+                _ => {
+                    return Err(Error::UnsupportedLayer {
+                        layer_index: layer.index,
+                        name: format!("{} (native dense loss)", layer.kind.name()),
+                    });
+                }
             };
             if target.shape != layer.output_shape {
                 return Err(Error::InvalidConfig(format!(
@@ -133,7 +152,6 @@ where
                 .backend
                 .upload_f32(&tensor_backend_shape(target.shape), &target.data)
                 .map_err(|err| backend_error("upload segmentation truth", err))?;
-            let scale = spec.lambda_ce * spec.ce_normalizer * spec.cls_normalizer;
             let (cost, delta) = self
                 .backend
                 .segmentation_loss_f32(
@@ -142,13 +160,13 @@ where
                     &tensor_backend_shape(layer.output_shape),
                     layer.output_shape.channels,
                     layer.output_shape.width * layer.output_shape.height,
-                    spec.loss == crate::model::SegmentationLoss::SoftmaxCe,
-                    scale,
-                    crate::segmentation::gate_strength(spec, iteration),
-                    spec.gate_t_correct,
-                    spec.gate_max_compensation,
-                    spec.max_delta,
-                    spec.max_delta < crate::segmentation::FLT_MAX,
+                    head.softmax,
+                    head.scale,
+                    head.gate_strength,
+                    head.gate_t_correct,
+                    head.gate_max_compensation,
+                    head.max_delta,
+                    head.max_delta < crate::segmentation::FLT_MAX,
                     config,
                 )
                 .map_err(|err| backend_error("segmentation loss", err))?;
@@ -156,7 +174,7 @@ where
                 .backend
                 .download_f32(&delta)
                 .map_err(|err| backend_error("download segmentation delta", err))?;
-            seeds[layer.index] = Some(Tensor::from_data(layer.output_shape, data)?);
+            seeds[head.seed_index] = Some(Tensor::from_data(layer.output_shape, data)?);
             total += cost;
             count += 1;
         }
@@ -168,5 +186,32 @@ where
             },
             layer_output_gradient_seeds: seeds,
         })
+    }
+}
+
+/// Per-head inputs of the native segmentation loss.
+struct SegmentationLossParams {
+    softmax: bool,
+    scale: f32,
+    gate_strength: f32,
+    gate_t_correct: f32,
+    gate_max_compensation: f32,
+    max_delta: f32,
+    /// Layer whose output receives the delta.
+    seed_index: usize,
+}
+
+impl SegmentationLossParams {
+    /// Cross-entropy without gate or clip, the defaults of `[segmentation]`.
+    fn legacy(softmax: bool, seed_index: usize) -> Self {
+        Self {
+            softmax,
+            scale: 1.0,
+            gate_strength: 0.0,
+            gate_t_correct: 0.9,
+            gate_max_compensation: 10.0,
+            max_delta: crate::segmentation::FLT_MAX,
+            seed_index,
+        }
     }
 }

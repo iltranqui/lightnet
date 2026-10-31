@@ -1,5 +1,5 @@
 //! Checked launch wrappers for native MambaVision primitives.
-use lightnet_cuda::{ElementwiseLaunchConfig, F32TensorOpsBackend};
+use lightnet_cuda::ElementwiseLaunchConfig;
 use lightnet_cuda::mambavision::{MambaScanForward, MambaScanGeometry, MambaScanGrad};
 use crate::{OxideBackend, OxideError, OxideTensorF32, launch, launch_err};
 

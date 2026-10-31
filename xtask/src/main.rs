@@ -19,7 +19,7 @@ usage: cargo xtask <cmd> [args...]
   oxide|o [args...]     ./tools/test_oxide.sh (GPU tests; args pass through)
   train_segmentation_bin|train_segmentation_multi [precision flags] [w] [flags]
                         like train_legogears on ../datasets/semantic_binary|semantic_multi
-                        (./tools/train_segmentation_oxide.sh; no -map)
+                        (./tools/train_segmentation_oxide.sh; -map is always on: mean IoU on valid=)
   train_legogears|train|tr [-fp8|-fp16|-bf16|-fp8 -fp16|-fp8 -bf16] [w] [flags]
                         -fp8: LIGHTNET_OXIDE_GEMM=fp8 and LIGHTNET_OXIDE_GEMM_BWD=fp8 (f32 storage; an inherited
                         LIGHTNET_OXIDE_AMP is unset, as without any flag); -fp16: LIGHTNET_OXIDE_AMP=1
@@ -29,6 +29,15 @@ usage: cargo xtask <cmd> [args...]
                         storage (both env sets above; the -fp16 scaler rule applies)
                         train LegoGears_v2 on oxide (./tools/train_legogears_oxide.sh;
                         optional initial.weights, extra flags pass to `detector train`)
+  export_train_legogears|export_segmentation_bin|export_segmentation_multi [export flags]
+                        ./tools/export_onnx.sh: ONNX from the trained weights (-fp16 -nhwc -decode ...)
+  export_test_onnx_match_segmentation_bin|export_test_onnx_match_segmentation_multi [image] [flags]
+                        ./tools/onnx_match_seg.sh: segmentation ONNX head vs native forward (GPU, CPU fallback;
+                        -all (every test image) --variants --cpu --fp16 --nhwc --raw -help)
+  export_test_onnx_match_segmentation_all [flags]
+                        both datasets, all 8 exports (FP32/FP16 x NCHW/NHWC x activated/raw), one summary table each; add -all for every test image
+  export_test_onnx_match [image] [flags]
+                        ./tools/onnx_match.sh: LegoGears_v2 ONNX heads vs Rust runtime (needs python deps)
   fmt|f                 cargo fmt --all
   help                  this text
 
@@ -137,6 +146,38 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             }
+            return run(v, &mem, false);
+        }
+        // ONNX export of a trained model (CPU, release binary; built if missing).
+        "export_train_legogears" | "export_segmentation_bin" | "export_segmentation_multi" => {
+            let target = cmd.trim_start_matches("export_").replace("train_", "");
+            let mut v = vec!["./tools/export_onnx.sh".to_owned(), target];
+            v.extend(rest.clone());
+            return run(v, &mem, false);
+        }
+        // Compare an exported segmentation ONNX model with the Rust runtime (CPU).
+        "export_test_onnx_match_segmentation_bin"
+        | "export_test_onnx_match_segmentation_multi"
+        | "export_test_onnx_match_segmentation_all" => {
+            let set = if cmd.ends_with("_bin") {
+                "bin"
+            } else if cmd.ends_with("_all") {
+                "both"
+            } else {
+                "multi"
+            };
+            let mut v = vec!["./tools/onnx_match_seg.sh".to_owned(), set.to_owned()];
+            // `_all`: both datasets, every FP32/FP16 x NCHW/NHWC x activated/raw export (add -all for every test image).
+            if set == "both" {
+                v.push("--variants".to_owned());
+            }
+            v.extend(rest.clone());
+            return run(v, &mem, false);
+        }
+        // Compare the exported LegoGears_v2 ONNX heads with the Rust runtime dumps.
+        "export_test_onnx_match" => {
+            let mut v = vec!["./tools/onnx_match.sh".to_owned()];
+            v.extend(rest.clone());
             return run(v, &mem, false);
         }
         "fmt" | "f" => vec!["cargo".into(), "fmt".into(), "--all".into()],

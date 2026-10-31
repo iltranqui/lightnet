@@ -2,6 +2,24 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
+use crate::model::{LayerKind, Network};
+
+/// Layers that take pixel-mask truth: every `[segmentation]`, plus the legacy
+/// trailing `[logistic]` (binary) or `[softmax] spatial=1` that Darknet segmenter
+/// cfgs end with. The legacy forms count only as the last layer.
+pub fn segmentation_head_layers(network: &Network) -> Vec<usize> {
+    let last = network.layers.len().saturating_sub(1);
+    network
+        .layers
+        .iter()
+        .filter(|layer| match &layer.kind {
+            LayerKind::Segmentation(_) => true,
+            LayerKind::Logistic | LayerKind::Softmax { spatial: true, .. } => layer.index == last,
+            _ => false,
+        })
+        .map(|layer| layer.index)
+        .collect()
+}
 
 /// Find the first existing mask using Darknet's candidate order.
 pub fn segmentation_mask_path(image: &Path) -> PathBuf {

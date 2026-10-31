@@ -130,6 +130,8 @@ pub(crate) struct DeviceCache<T> {
 }
 
 /// Native inference forward; no intermediates are kept.
+// Kept for the residency work; the runtime currently uses the resident-parameter path.
+#[allow(dead_code)]
 pub(crate) fn forward<B: F32TensorOpsBackend>(
     backend: &B,
     g: &SwinGeometry,
@@ -146,6 +148,8 @@ where
 
 /// Native training forward: the same composition as [`forward`], returning the
 /// device cache that [`GpuExecutableNetwork::backward_swin_gpu`] consumes.
+// Kept for the residency work; the runtime currently uses the resident-parameter path.
+#[allow(dead_code)]
 pub(crate) fn forward_training<B: F32TensorOpsBackend>(
     backend: &B,
     g: &SwinGeometry,

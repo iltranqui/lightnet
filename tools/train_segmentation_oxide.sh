@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build and train a semantic-segmentation dataset (SEG_DATASET=semantic_binary|semantic_multi) on the Rust oxide backend.
 # Usage: SEG_DATASET=semantic_binary ./tools/train_segmentation_oxide.sh [initial.weights] [training flags...]
-# Overrides: CFG, DATA, SEED, JOBS (build threads, default 4), LIGHTNET_OXIDE_AMP=1, PROFILE=release|debug
+# Overrides: CFG, DATA, SEED, JOBS (build threads, default 4), LIGHTNET_OXIDE_AMP=1, PROFILE=release|debug,
+# BUILD_ONLY=1 (build the oxide binary and exit; used before the ONNX match tests)
 #
 # PROFILE defaults to `release`: the trainer's host code (image loader, phase
 # bookkeeping, launch preparation) is a large part of the measured step time,
@@ -9,7 +10,7 @@
 # need a debuggable binary (CUDA-GDB, backtraces).  cuda-oxide compiles the
 # device code release-like either way.
 #
-# No -map: it is a detection metric.
+# -map is always on: it evaluates mean IoU on the valid= list (every -map_every iterations, default max(100, images/batch)), keeps <name>_best.weights and writes <name>_miou.csv.
 set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -58,8 +59,13 @@ capped 3G env RUSTUP_TOOLCHAIN=nightly-2026-08-28 \
     target/debug/cargo-oxide oxide build -- \
     -p lightnet-cli --features oxide -j "$JOBS" "${CARGO_PROFILE_FLAG[@]}"
 
+if [[ -n "${BUILD_ONLY:-}" ]]; then
+    printf "BUILD_ONLY set: built %s/lightnet-rs, not training.\n" "$BIN_DIR" >&2
+    exit 0
+fi
+
 printf 'Running %s/%s (PROFILE=%s)\n' "$BIN_DIR" "lightnet-rs" "$PROFILE" >&2
 
 export LIGHTNET_BACKEND=oxide
 exec "$BIN_DIR/lightnet-rs" detector train \
-    "$DATA" "$CFG" -seed "$SEED" -dont_show "$@"
+    "$DATA" "$CFG" -seed "$SEED" -dont_show -map "$@"

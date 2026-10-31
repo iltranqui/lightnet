@@ -457,6 +457,51 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        // Native forward on one image; the layer outputs go to LIGHTNET_LAYER_DUMP_DIR
+        // (`layer_NNN.f32`, NCHW). tools/onnx_check_seg.py compares the head with ONNX.
+        "segment-image" => {
+            let cfg = required_arg(args.next(), "cfg path")?;
+            let weights = required_arg(args.next(), "weights path")?;
+            // One image: every layer is dumped to the directory. Several images: the model
+            // is loaded once and only the last layer is dumped, to `<dir>/NNNNN/`.
+            let images: Vec<String> = args.collect();
+            if images.is_empty() {
+                return Err("segment-image needs at least one image path".into());
+            }
+            let dump_dir = PathBuf::from(
+                std::env::var_os("LIGHTNET_LAYER_DUMP_DIR")
+                    .ok_or("segment-image needs LIGHTNET_LAYER_DUMP_DIR")?,
+            );
+            let network = Network::from_path(&cfg)?.with_batch(1);
+            // LIGHTNET_BACKEND unset or `auto`: GPU (oxide) when built in and available,
+            // otherwise the CPU forward. `cpu` / `oxide` force one.
+            let requested = std::env::var("LIGHTNET_BACKEND").unwrap_or_else(|_| "auto".to_owned());
+            if !matches!(requested.as_str(), "auto" | "cpu" | "oxide") {
+                return Err(format!("invalid LIGHTNET_BACKEND: {requested} (expected auto, cpu or oxide)").into());
+            }
+            let many = images.len() > 1;
+            let mut sink = |index: usize, outputs: Vec<Tensor>| -> Result<(), Box<dyn std::error::Error>> {
+                if !many {
+                    return dump_rust_layer_outputs(&dump_dir, &network, &outputs);
+                }
+                let dir = dump_dir.join(format!("{index:05}"));
+                fs::create_dir_all(&dir)?;
+                let last = outputs.len() - 1;
+                let mut raw = fs::File::create(dir.join(format!("layer_{last:03}.f32")))?;
+                for value in &outputs[last].data {
+                    raw.write_all(&value.to_le_bytes())?;
+                }
+                Ok(())
+            };
+            let used = segment_forward(&network, &weights, &requested, &images, &mut sink)?;
+            println!(
+                "segment-image backend {used}: {} image(s), {} layers {} dumped to {}",
+                images.len(),
+                network.layers.len(),
+                if many { "(head only)" } else { "(all)" },
+                dump_dir.display()
+            );
+        }
         "detect-server" => {
             let cfg = required_arg(args.next(), "cfg path")?;
             let weights = required_arg(args.next(), "weights path")?;
@@ -694,6 +739,54 @@ fn format_obb_detection_line(detection: &ObbDetection, class_name: &str, tsv: bo
             )
         }
     }
+}
+
+/// One image resized to the network input, as the Rust inference path does.
+fn segment_input(network: &Network, path: &str) -> Result<Tensor, Box<dyn std::error::Error>> {
+    Ok(PlanarRgbImage::load(path)?
+        .resize_linear_exact(network.net.width, network.net.height)?
+        .into())
+}
+
+/// Native forward for `segment-image`: loads the weights once, runs each image and
+/// hands every layer output (on the host) to `sink`. Returns the backend that ran
+/// (`oxide` or `cpu`).
+fn segment_forward(
+    network: &Network,
+    weights: &str,
+    requested: &str,
+    images: &[String],
+    sink: &mut dyn FnMut(usize, Vec<Tensor>) -> Result<(), Box<dyn std::error::Error>>,
+) -> Result<&'static str, Box<dyn std::error::Error>> {
+    #[cfg(feature = "oxide")]
+    if requested != "cpu" {
+        match OxideBackend::new() {
+            Ok(backend) => {
+                let mut executable = GpuExecutableNetwork::new(network.clone(), backend);
+                executable.load_weights_file(weights)?;
+                for (index, path) in images.iter().enumerate() {
+                    let input = segment_input(network, path)?;
+                    sink(index, executable.forward(&input)?.layer_outputs)?;
+                }
+                return Ok("oxide");
+            }
+            Err(err) if requested == "oxide" => {
+                return Err(format!("requested oxide backend unavailable: {err}").into());
+            }
+            Err(err) => eprintln!("oxide backend unavailable ({err}); falling back to the CPU forward"),
+        }
+    }
+    #[cfg(not(feature = "oxide"))]
+    if requested == "oxide" {
+        return Err("LIGHTNET_BACKEND=oxide needs a build with --features oxide".into());
+    }
+    let mut executable = ExecutableNetwork::new(network.clone());
+    executable.load_weights_file(weights)?;
+    for (index, path) in images.iter().enumerate() {
+        let input = segment_input(network, path)?;
+        sink(index, executable.forward(&input)?.layer_outputs)?;
+    }
+    Ok("cpu")
 }
 
 fn dump_rust_layer_outputs(
@@ -3733,6 +3826,7 @@ fn print_usage() {
     println!(
         "  detect-image <cfg> <weights> <names> <image> [thresh] [nms] [resize|letterbox|resize-exact]"
     );
+    println!("  segment-image <cfg> <weights> <image>...   (native forward; set LIGHTNET_LAYER_DUMP_DIR; several images dump the head only)");
     println!("  export-onnx <cfg> <weights> [out.onnx] [--no-fuse] [-fp32|-fp16] [-nchw|-nhwc] [-activation|-noactivation]");
     println!("  lm tokenizer --documents <tsv> --out <bpe> [--vocab N] [--latin-fold]");
     println!(
