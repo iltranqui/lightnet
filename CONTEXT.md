@@ -26,11 +26,11 @@ lightnet/
 ## Crate graph
 
 ```
-lightnet-cli ──► lightnet-core ──► lightnet-cuda
-     │                                ▲
+lightnet-cli ──► lightnet-core ──► lightnet-train ──► lightnet-runtime ──► lightnet-layers ──► lightnet-model
+     │              (facade)       (all five also depend on lightnet-cuda)
      ├─(feature oxide)─► lightnet-cuda-oxide ──► cuda-oxide crates cuda-device, cuda-host
-     │                       (not a workspace member)
-lightnet-cuda-cutile ───────────────────┘   (not a workspace member)
+     │                       (not a workspace member; dev-depends on lightnet-core)
+lightnet-cuda-cutile ──► lightnet-cuda   (not a workspace member)
 lightnet-examples ──► lightnet-core
 lightnet-lm ──► lightnet-cuda
 lightnet-gui ──► lightnet-gui-project, lightnet-gui-engine ──(child process)──► lightnet-rs detect-server

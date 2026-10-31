@@ -1,0 +1,18 @@
+[package]
+name = "lightnet-layers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "lightnet_layers"
+path = "src/lib.rs"
+
+[dependencies]
+lightnet-model = { path = "../lightnet-model" }
+lightnet-cuda = { path = "../lightnet-cuda" }
+
+[features]
+# Test-only call counters read by cross-crate tests in `lightnet-core`
+# (enabled through its dev-dependency); off in every normal build.
+test-hooks = []

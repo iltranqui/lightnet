@@ -1,0 +1,12 @@
+[package]
+name = "lightnet-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "lightnet_model"
+path = "src/lib.rs"
+
+[dependencies]
+lightnet-cuda = { path = "../lightnet-cuda" }

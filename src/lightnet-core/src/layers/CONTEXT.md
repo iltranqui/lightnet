@@ -14,9 +14,10 @@ One folder per layer. This file is the single home of the layer layout contract;
 ## Layout
 
 ```
-src/lightnet-core/src/layers/<layer>/
-  mod.rs   re-exports cpu::*; a GPU-only layer has only `pub(crate) mod gpu;`
-  cpu.rs   host reference: spec use, forward, exact backward, weights, optimizer arms
+src/lightnet-model/src/<layer>/geometry.rs  data-only geometry, validation, weight counts (some layers)
+src/lightnet-layers/src/<layer>/cpu.rs   host reference and CPU tests
+src/lightnet-runtime/src/layers/<layer>/
+  mod.rs   re-exports the CPU items from lightnet-layers and declares `gpu`
   gpu.rs   GpuExecutableNetwork methods: forward_<layer>_gpu, forward_<layer>_compact_gpu,
            backward_<layer>_gpu, update (present once the layer's arms are moved)
 src/lightnet-cuda/src/host_ops.rs      host math shared with the backend trait defaults
@@ -24,15 +25,21 @@ src/lightnet-cuda-oxide/src/kernels/   device kernels, one file per layer as the
 src/lightnet-cuda-oxide/tests/oxide_<layer>.rs   CPU-versus-GPU parity for that layer
 ```
 
+CPU reference and GPU glue no longer share a folder: `cpu.rs` is in `lightnet-layers`, `gpu.rs` is in `lightnet-runtime`, because the glue needs `GpuExecutableNetwork` and the CPU math must stay below it (production graph `model <- layers <- runtime <- train <- core`). This replaces the old one-folder co-location rule.
+
+Exception: `clifford/cpu.rs` stays in `lightnet-runtime/src/layers/clifford/` because it holds the executor-side Clifford code (`CliffordRuntimeCache`, train buffers); its pure data is in `lightnet-layers/src/clifford_params.rs`.
+
+The runtime `layers/` tree is `#[doc(hidden)] pub`; `lightnet-core` re-exports it, so `lightnet_core::...` paths are unchanged. Layer tests that need both the executor and the CPU reference (`carpn/tests.rs`, `gru/tests.rs`, `laya_scorer/wiring_tests.rs`) stay in this folder, `lightnet-core/src/layers/<layer>/`, and are wired by `lightnet-core/src/layer_tests.rs`. The runtime test tree is `lightnet-core/src/runtime_tests/`.
+
 `lightnet-cuda-oxide` depends on `lightnet-core`, so device kernels cannot sit beside the CPU code. It is not a workspace member and builds only through `cargo xtask oxide`.
 
 ## Where each piece plugs in
 
 | Piece | File | Wiring |
 |---|---|---|
-| Module | `layers/mod.rs` | `pub(crate) mod <layer>;` |
-| Old path | `src/lib.rs` | `pub(crate) use layers::<layer>;` so callers never change |
-| Full forward | `runtime/gpu_forward.rs` | match arm calls `self.forward_<layer>_gpu(..)` |
+| Module | `lightnet-runtime/src/layers/mod.rs` and `lightnet-runtime/src/lib.rs` | `pub mod <layer>;` here, `pub use layers::<layer>;` at the crate root |
+| Old path | `lightnet-core/src/lib.rs` | `pub use lightnet_train::*;` keeps every `lightnet_core::...` path; nothing to add per layer |
+| Full forward | `lightnet-runtime/src/runtime/gpu_forward.rs` | match arm calls `self.forward_<layer>_gpu(..)` |
 | Compact (f16) forward | `runtime/gpu_forward_compact.rs` | arm calls `forward_<layer>_compact_gpu`; unsupported layers return the "compact f16 GPU execution is unsupported" error |
 | Backward | `runtime/gpu_backward.rs` | arm calls `backward_<layer>_gpu` |
 | Device cache | `runtime/gpu_types.rs`, `gpu_state.rs`, `gpu_forward.rs` | a `<layer>_caches` field, initialised in every constructor |
@@ -66,7 +73,7 @@ cargo xtask oxide --test oxide_<layer>
 ## Rules
 
 - Keep every old path working through re-exports.
-- Widen visibility only as far as needed (`pub(crate)`); never to `pub` just to compile.
+- Expose cross-crate implementation items only as needed with `pub` and `#[doc(hidden)]`.
 - Backward is the exact derivative of the Rust forward. C++ deviations only under `GradMode::Cpp`.
 - Unknown config is an error, never silent identity.
 - A native primitive or forward alone does not complete a layer; see the Layer Completion Contract in `tasks/rust/AGENTS.md`.

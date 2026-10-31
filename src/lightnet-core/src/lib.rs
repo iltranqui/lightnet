@@ -1,188 +1,24 @@
-//! `float_erf` is needed by `[laya_scorer]`, whose activation is the *exact
-//! erf* GELU (torch `nn.GELU()`'s default) rather than darknet's tanh
-//! approximation; C++ uses `std::erf` there, so a hand-rolled approximation
-//! would be a real numerical divergence. The toolchain is already pinned to
-//! nightly (see `rust-toolchain.toml`).
-#![feature(float_erf)]
-
 //! CPU-first Rust implementation of the Darknet/YOLO runtime.
 //!
-//! The port keeps Darknet's observable contracts—`.cfg` parsing, planar
-//! `B x C x H x W` tensors, layer ordering, `.weights` byte ordering,
-//! detector target assignment, and SGD update semantics—while replacing
-//! pointer-owned C++ objects with explicit Rust values.  Parsing, model
-//! description, execution, training, and post-processing are separate modules
-//! so the CPU executor can remain the correctness reference for GPU backends.
+//! This crate is a facade. The code lives in four crates, each depending only
+//! on the ones before it:
 //!
-//! The public re-exports below form the application-facing API.  The modules
-//! remain public for advanced users extending a specific part of the port.
+//! 1. `lightnet-model`: `.cfg` parsing, the network description, shared types.
+//! 2. `lightnet-layers`: CPU reference math for each layer family.
+//! 3. `lightnet-runtime`: CPU and backend executors, per-layer GPU glue,
+//!    `.weights` I/O, initialisation, Muon state, ONNX export.
+//! 4. `lightnet-train`: losses, augmentation, detection decode, evaluation.
+//!
+//! `pub use lightnet_train::*` re-exports the whole stack under the old
+//! `lightnet_core::...` paths, so the CLI, the examples and the Oxide crate
+//! need no source change. Unit tests that span several of these crates live
+//! here, next to the facade.
 
-mod layers;
-pub(crate) mod activation_math;
-pub mod augmentation;
+pub use lightnet_train::*;
+
 #[cfg(test)]
-pub(crate) mod axis_fixture;
-pub use augmentation::DetectorAugmentation;
-pub use layers::carpn;
-pub use layers::centernet;
-pub mod cfg;
-pub(crate) use layers::channel_shuffle;
-pub(crate) use layers::channel_slice;
-pub mod chart;
-pub use layers::clifford;
-pub(crate) use layers::contrastive;
-pub mod cuboid_labels;
-pub use cuboid_labels::{
-    CuboidLabel, MixedLabel, Yolo3dCrop, Yolo3dImageMeta, Yolo3dTruthBatch,
-    encode_mixed_yolo_3d_truths, encode_yolo_3d_truths, load_cuboid_labels,
-    load_pure_cuboid_labels, parse_cuboid_labels, parse_mixed_cuboid_labels,
-};
-pub(crate) use layers::dcnv4;
-pub(crate) use layers::deform_conv;
-pub(crate) use layers::dsconv;
-pub(crate) use layers::foveation_film;
-pub(crate) use layers::graph_conv;
-pub(crate) use layers::hyperbolic_foveation;
-pub use chart::{ChartPoint, write_training_chart};
-pub use clifford::{CliffordBranchTrainBuffers, CliffordParams, CliffordTrainBuffers};
-pub mod dense_loss;
-pub use layers::depth_anything;
-pub(crate) use layers::dpt_head;
-pub use dense_loss::{
-    DenseTrainingLoss, compute_dense_training_loss, compute_dense_training_loss_at,
-};
-pub use dpt_head::DptHeadWeights;
-pub(crate) use layers::deconvolutional;
-pub mod detect;
-pub(crate) mod detection_geometry;
-pub(crate) use layers::eml_conv_math;
-pub mod error;
-pub mod evaluate;
-pub use evaluate::{
-    MapReport, ObbValidationDataset, REPORT_CONFIDENCE, ValidationDataset, carpn_detector_map,
-    detector_map, obb_detector_map,
-};
-pub mod image;
-pub mod initialize;
-pub(crate) use layers::jev_ce;
-pub use layers::kimi_kda;
-pub use layers::laya_act_head;
-pub use layers::laya_encoder;
-pub use layers::laya_head;
-pub use layers::laya_loss;
-pub use layers::laya_marker_gather;
-pub use layers::laya_scorer;
-pub mod loader_profile;
-pub use layers::moe_conv;
-pub use initialize::initialize_training_params;
-pub use layers::mambavision;
-pub(crate) use layers::maxpool_depth;
-pub mod model;
-pub use layers::modern_yolo;
-pub(crate) mod muon;
-pub(crate) mod muon_runtime;
-pub mod names;
-pub mod onnx;
-pub mod segmentation_data;
-pub use onnx::{OnnxOptions, export_onnx};
-pub mod obb_geometry;
-pub mod obb_labels;
-pub use obb_labels::{ObbLabel, flip_obb_labels, load_obb_labels, rotate_obb_labels};
-pub mod obb_training;
-pub use obb_training::{
-    OBB_YOLO_TRUTH_SIZE, ObbYoloAnchorAssignment, ObbYoloBatchCellMatch,
-    ObbYoloBatchCellPrediction, ObbYoloBatchPositiveAssignment, ObbYoloBatchTrainingDeltaStats,
-    ObbYoloBoxDeltaConfig, ObbYoloCellTruthMatch, ObbYoloClassDeltaResult, ObbYoloClassDeltaStats,
-    ObbYoloFrontPointDeltaConfig, ObbYoloFrontPointDeltas, ObbYoloFrontPointMetrics,
-    ObbYoloHeadAssignmentSpec, ObbYoloHeadMatchConfig, ObbYoloHeadTrainingDeltaStats,
-    ObbYoloMatchScore, ObbYoloMatchScoreBranch, ObbYoloMatchScoreConfig, ObbYoloPositiveAssignment,
-    ObbYoloPositiveKind, ObbYoloPositiveObjectnessConfig, ObbYoloPredictionMatchContext,
-    ObbYoloTrainingHeadConfig, ObbYoloTruthBatch, apply_obb_yolo_batch_head_objectness_deltas,
-    apply_obb_yolo_batch_head_positive_box_deltas, apply_obb_yolo_batch_head_positive_class_deltas,
-    apply_obb_yolo_batch_head_positive_front_point_deltas,
-    apply_obb_yolo_batch_head_positive_objectness_deltas,
-    apply_obb_yolo_batch_head_training_deltas,
-    apply_obb_yolo_batch_head_training_deltas_with_front_point,
-    apply_obb_yolo_batch_head_truth_threshold_deltas,
-    apply_obb_yolo_batch_head_truth_threshold_front_point_deltas,
-    apply_obb_yolo_batch_multi_head_training_deltas,
-    apply_obb_yolo_batch_multi_head_training_deltas_with_front_point,
-    apply_obb_yolo_batch_multi_head_training_deltas_with_front_point_configs,
-    assign_obb_yolo_anchor, build_obb_yolo_training_head_config, decode_obb_yolo_front_point,
-    encode_obb_yolo_truth_batch, enumerate_obb_yolo_batch_positives,
-    enumerate_obb_yolo_head_positives, match_obb_yolo_batch_cell_predictions,
-    match_obb_yolo_cell_prediction, match_obb_yolo_cell_prediction_with_score_config,
-    obb_yolo_anchor_match_score, obb_yolo_angular_prediction_match_score_with_viou,
-    obb_yolo_box_regression_deltas, obb_yolo_cell_objectness_delta,
-    obb_yolo_ciou_prediction_match_score, obb_yolo_class_deltas,
-    obb_yolo_cobb_prediction_match_score_with_viou, obb_yolo_covariance_prediction_match_score,
-    obb_yolo_covariance_prediction_match_score_with_viou, obb_yolo_front_point_regression_deltas,
-    obb_yolo_match_score, select_obb_yolo_cell_truth_match, visit_obb_yolo_batch_head_matches,
-};
-pub(crate) use layers::omd_loss;
-pub mod runtime;
-pub(crate) use layers::segmentation;
-pub(crate) use layers::shortcut_weights;
-pub(crate) use layers::swin;
-pub(crate) use layers::swin::block as swin_block;
-pub mod train;
-pub mod training_types;
-pub(crate) use layers::tucker_attention;
-pub(crate) use layers::vc_attention;
-pub(crate) use layers::vit;
-pub mod weights;
-pub(crate) use layers::wmhf;
-pub mod yolo_3d;
-
-pub use carpn::{ObbRefineOutput, ObbRefineProposal};
-pub use cfg::{ConfigFile, RawSection};
-pub use detect::{
-    Detection, DetectionBox, DetectionOptions, ObbDetection, ObbDetectionGeometry, apply_obb_nms,
-    decode_modern_detections, decode_network_detections, decode_obb_network_detections,
-    decode_obb_yolo_detections, decode_obb_yolo_head, decode_yolo_detections,
-};
-pub use error::{Error, Result};
-pub use image::PlanarRgbImage;
-pub use kimi_kda::{KimiKdaForwardCache, KimiKdaParams};
-pub use mambavision::{
-    MambaVisionForward, MambaVisionGradients, MambaVisionParams, MambaVisionState,
-    mambavision_backward, mambavision_forward,
-};
-pub use model::{
-    Activation, CliffordContextMode, CliffordGffnMode, CliffordGlobalOp, CliffordHigherMode,
-    CliffordInteractionMode, CliffordSpec, CrnnSpec, DeformConvSpec, DsConvSpec, HfInverseMethod,
-    HfRadiusMode, HfWarpSource, HyperbolicFoveationSpec, KimiKdaSpec, Layer, LayerKind,
-    LayerWeights, LrPolicy, LstmSpec, MambaVisionSpec, NetConfig, Network, ObbRefineLoss,
-    ObbRefineSpec, RecursiveBlockSpec, RnnSpec, ShortcutWeightsNorm, ShortcutWeightsType, SwinSpec,
-    TensorShape, TuckerAttentionSpec, WeightsArray, WmhfSpec, YoloIouLoss,
-};
-pub use names::load_names_file;
-pub use runtime::{
-    BackwardResult, BatchNormTrainBuffers, ConnectedTrainBuffers, ConvolutionalTrainBuffers,
-    CrnnParams, CrnnTrainBuffers, DeformConvParams, DeformConvTrainBuffers, DsConvParams,
-    DsConvTrainBuffers, ExecutableNetwork, ForwardResult, GpuExecutableNetwork, GpuForwardState, GpuYoloLoss,
-    GpuForwardSummary, HyperbolicFoveationParams, HyperbolicFoveationTrainBuffers,
-    KimiKdaTrainBuffers, LayerParams, LayerTrainBuffers, LossScaler, LstmParams, LstmTrainBuffers,
-    MambaVisionTrainBuffers, RecurrentForwardCache, ScaleStep, RecursiveBlockForwardCache,
-    RecursiveBlockParams, RecursiveBlockTrainBuffers, RnnParams, RnnTrainBuffers, ShortcutParams,
-    ShortcutTrainBuffers, Tensor, TuckerAttentionTrainBuffers, WmhfParams, WmhfTrainBuffers,
-    Yolo3dHeadOutput, YoloHeadOutput, compute_learning_rate,
-};
-pub use swin::SwinWeights;
-pub use swin_block::SwinForwardCache;
-pub use train::{
-    DataConfig, ObbTrainingBatch, ObbYoloTrainingBackward, ObbYoloTrainingDeltaBatch,
-    TrainingBatch, YoloLabel, YoloTrainingLoss, YoloTrainingState, backward_obb_yolo_training,
-    compute_obb_yolo_training_deltas, compute_yolo_training_loss,
-    compute_yolo_training_loss_with_state, load_augmented_training_batch_from_paths,
-    load_obb_training_batch, load_obb_training_batch_from_paths,
-    load_obb_training_batch_with_flips_from_paths, load_paths_file, load_training_batch,
-    load_training_batch_from_paths, load_yolo_labels, replace_image_to_label,
-    train_obb_yolo_batch_step, train_obb_yolo_subdivisions,
-};
-pub use tucker_attention::{TuckerAttentionForwardCache, TuckerAttentionParams};
-pub use weights::{WeightsHeader, WeightsInspection, inspect_weights_file, save_weights};
-
-pub const DARKNET_WEIGHTS_VERSION_MAJOR: i32 = 0;
-pub const DARKNET_WEIGHTS_VERSION_MINOR: i32 = 2;
-pub const DARKNET_WEIGHTS_VERSION_PATCH: i32 = 5;
+mod layer_tests;
+#[cfg(test)]
+mod model_tests;
+#[cfg(test)]
+mod runtime_tests;

@@ -1,0 +1,17 @@
+[package]
+name = "lightnet-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "lightnet_runtime"
+path = "src/lib.rs"
+
+[dependencies]
+lightnet-model = { path = "../lightnet-model" }
+lightnet-layers = { path = "../lightnet-layers" }
+lightnet-cuda = { path = "../lightnet-cuda" }
+image = "0.25.10"
+mozjpeg = { version = "0.10", default-features = false }
+half.workspace = true

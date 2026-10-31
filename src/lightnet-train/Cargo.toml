@@ -1,0 +1,18 @@
+[package]
+name = "lightnet-train"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "lightnet_train"
+path = "src/lib.rs"
+
+[dependencies]
+lightnet-model = { path = "../lightnet-model" }
+lightnet-layers = { path = "../lightnet-layers" }
+lightnet-runtime = { path = "../lightnet-runtime" }
+lightnet-cuda = { path = "../lightnet-cuda" }
+image = "0.25.10"
+rayon = "1"
+half.workspace = true

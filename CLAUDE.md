@@ -14,7 +14,7 @@ Rust port of Darknet/YOLO (branch `rust`) with CPU, cuTile and cuda-oxide GPU ba
 
 | Zone | Path | Entry file |
 |---|---|---|
-| Product (Darknet port) | `src/lightnet-*` | `src/<crate>/CONTEXT.md` |
+| Product (Darknet port) | `src/lightnet-*` | `src/<crate>/CONTEXT.md`; layer contract in `src/lightnet-core/src/layers/CONTEXT.md` |
 | cuda-oxide (submodule) | `third_party/cuda-oxide` | `third_party/CONTEXT.md` |
 | Roadmap and plans | `tasks/rust/` | `tasks/rust/CONTEXT.md` |
 | Reference docs | `docs/` | `docs/CONTEXT.md` |
@@ -37,10 +37,10 @@ Whole-repo map: [CONTEXT.md](CONTEXT.md).
 
 | Command | Alias | Runs |
 |---|---|---|
-| `cargo xtask check [pkg...]` | `c` | `cargo check` (default: `lightnet-cli`, `lightnet-core`) |
+| `cargo xtask check [pkg...]` | `c` | `cargo check` (default: `lightnet-cli`, `lightnet-core`, `lightnet-model`, `lightnet-layers`, `lightnet-runtime`, `lightnet-train`) |
 | `cargo xtask gpu-check` | `gc` | `cargo check -p lightnet-cli --features oxide` |
 | `cargo xtask build [pkg...]` | `b` | `cargo build` (default: `lightnet-cli`) |
-| `cargo xtask clippy [pkg...]` | `l` | `cargo clippy` (default: `lightnet-cli`, `lightnet-core`) |
+| `cargo xtask clippy [pkg...]` | `l` | `cargo clippy` (default: `lightnet-cli`, `lightnet-core`, `lightnet-model`, `lightnet-layers`, `lightnet-runtime`, `lightnet-train`) |
 | `cargo xtask test [filter...]` | `t`, `host` | host tests, same as `tools/test_host.sh` (`PKGS` overrides the packages) |
 | `cargo xtask oxide [args...]` | `o` | `tools/test_oxide.sh` (GPU tests; args pass through) |
 | `cargo xtask train_legogears [-fp8\|-fp16\|-bf16\|-fp8 -fp16\|-fp8 -bf16] [weights] [flags...]` | `train`, `tr` | `tools/train_legogears_oxide.sh`: release oxide build, then LegoGears_v2 training. `-fp8` sets `LIGHTNET_OXIDE_GEMM=fp8` and `LIGHTNET_OXIDE_GEMM_BWD=fp8` (e5m2 gradients), `-fp16` sets `LIGHTNET_OXIDE_AMP=1` (mixed precision) and adds `-dyn_scale -loss_scale 1024` unless supplied; `-bf16` sets `LIGHTNET_OXIDE_AMP=bf16` (no loss scaling). Plain `-fp8` and the no-flag default keep f32 storage (an inherited `LIGHTNET_OXIDE_AMP` is unset for the child); `-fp8 -fp16` and `-fp8 -bf16` (either order) set both groups, i.e. fp8 convolution GEMMs on 16-bit activation storage, with the `-fp16` scaler rule. Default is fp32 |
@@ -57,6 +57,7 @@ Environment: `MEM` (default `3G`), `JOBS` (default 2, clamped to 4; `train_legog
 
 ## Hard rules
 
+- Production crate graph must stay acyclic (`tools/check_module_layers.sh`).
 - Max 4 build threads, wrap builds in `systemd-run --user --scope -p MemoryHigh=3G`; `cargo xtask` does both (see [Commands](#commands)).
 - `src/lightnet-cuda-oxide` is not a workspace member; build it only with `cargo xtask oxide` (`./tools/test_oxide.sh`).
 - Commit only the files a task names, never `git add -A`.
@@ -72,6 +73,6 @@ Full rule set lives in `tasks/rust/AGENTS.md`.
 - Limit all builds and checks to a maximum of 4 threads in this project (`JOBS=4 MEM=4G cargo xtask ...`).
 - Do code edits and refactors in the main session with shell tools, `Edit` and `Write`; no Python scripts and no subagents unless the user asks.
 - Run `cargo xtask check` (4 threads) after each layer when moving layer code, not only at the end.
-- Each layer's CPU reference and GPU runtime glue live together in `src/lightnet-core/src/layers/<layer>/` (`cpu.rs`, `gpu.rs`, `mod.rs`); `lib.rs` re-exports the old paths. Oxide kernels stay in `lightnet-cuda-oxide`, which depends on `lightnet-core` and cannot host CPU code.
+- Crate graph: `lightnet-model` <- `lightnet-layers` <- `lightnet-runtime` <- `lightnet-train` <- `lightnet-core` (facade; all on `lightnet-cuda`). CPU reference layers live in `src/lightnet-layers/src/<layer>/cpu.rs`; GPU glue lives in `src/lightnet-runtime/src/layers/<layer>/gpu.rs` (this replaces the old one-folder co-location rule). `lightnet-core` re-exports every old path with `pub use lightnet_train::*` and holds the tests that span several crates. Items other crates or those tests need are `pub` plus `doc(hidden)`. Run `tools/check_module_layers.sh` after moving code. Oxide kernels remain in `lightnet-cuda-oxide`, which depends on `lightnet-core` and cannot host CPU code.
 - Run all new codex tasks with model gpt-6.1-terra at medium reasoning effort.
 <!-- end claude-reflect -->

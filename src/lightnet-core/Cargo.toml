@@ -9,9 +9,15 @@ name = "lightnet_core"
 path = "src/lib.rs"
 
 [dependencies]
+lightnet-layers = { path = "../lightnet-layers" }
+lightnet-model = { path = "../lightnet-model" }
+lightnet-runtime = { path = "../lightnet-runtime" }
+lightnet-train = { path = "../lightnet-train" }
 lightnet-cuda = { path = "../lightnet-cuda" }
+# Used by the cross-crate unit tests and integration tests kept in this crate.
 image = "0.25.10"
-imageproc = "0.26.1"
-mozjpeg = { version = "0.10", default-features = false }
 rayon = "1"
 half.workspace = true
+
+[dev-dependencies]
+lightnet-layers = { path = "../lightnet-layers", features = ["test-hooks"] }

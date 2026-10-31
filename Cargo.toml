@@ -9,6 +9,10 @@ members = [
     # Darknet Rust port
     "src/lightnet-cli",
     "src/lightnet-core",
+    "src/lightnet-model",
+    "src/lightnet-layers",
+    "src/lightnet-runtime",
+    "src/lightnet-train",
     "src/lightnet-cuda",
     "src/lightnet-examples",
     "src/lightnet-lm",
@@ -58,6 +62,10 @@ members = [
 default-members = [
     "src/lightnet-cli",
     "src/lightnet-core",
+    "src/lightnet-model",
+    "src/lightnet-layers",
+    "src/lightnet-runtime",
+    "src/lightnet-train",
     "src/lightnet-cuda",
     "src/lightnet-examples",
     "src/lightnet-lm",

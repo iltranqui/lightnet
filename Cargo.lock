@@ -2264,10 +2264,13 @@ dependencies = [
 name = "lightnet-core"
 version = "0.1.1"
 dependencies = [
+ "half",
  "image",
- "imageproc",
  "lightnet-cuda",
- "mozjpeg",
+ "lightnet-layers",
+ "lightnet-model",
+ "lightnet-runtime",
+ "lightnet-train",
  "rayon",
 ]
 
@@ -2292,7 +2295,9 @@ dependencies = [
  "image",
  "imageproc",
  "lightnet-core",
+ "lightnet-lm",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -2330,12 +2335,52 @@ dependencies = [
 ]
 
 [[package]]
+name = "lightnet-layers"
+version = "0.1.1"
+dependencies = [
+ "lightnet-cuda",
+ "lightnet-model",
+]
+
+[[package]]
 name = "lightnet-lm"
 version = "0.1.1"
 dependencies = [
  "lightnet-cuda",
  "sha2",
  "unicode-normalization",
+]
+
+[[package]]
+name = "lightnet-model"
+version = "0.1.1"
+dependencies = [
+ "lightnet-cuda",
+]
+
+[[package]]
+name = "lightnet-runtime"
+version = "0.1.1"
+dependencies = [
+ "half",
+ "image",
+ "lightnet-cuda",
+ "lightnet-layers",
+ "lightnet-model",
+ "mozjpeg",
+]
+
+[[package]]
+name = "lightnet-train"
+version = "0.1.1"
+dependencies = [
+ "half",
+ "image",
+ "lightnet-cuda",
+ "lightnet-layers",
+ "lightnet-model",
+ "lightnet-runtime",
+ "rayon",
 ]
 
 [[package]]

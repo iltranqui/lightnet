@@ -11,10 +11,10 @@ use std::process::{Command, ExitCode, Stdio};
 const USAGE: &str = "\
 usage: cargo xtask <cmd> [args...]
 
-  check|c [pkg...]      cargo check (default: lightnet-cli lightnet-core)
+  check|c [pkg...]      cargo check (default: lightnet-cli lightnet-core lightnet-model lightnet-layers lightnet-runtime lightnet-train)
   gpu-check|gc          cargo check -p lightnet-cli --features oxide
   build|b [pkg...]      cargo build (default: lightnet-cli)
-  clippy|l [pkg...]     cargo clippy (default: lightnet-cli lightnet-core)
+  clippy|l [pkg...]     cargo clippy (default: lightnet-cli lightnet-core lightnet-model lightnet-layers lightnet-runtime lightnet-train)
   test|host|t [filter...]  host tests, same as tools/test_host.sh (PKGS overrides)
   oxide|o [args...]     ./tools/test_oxide.sh (GPU tests; args pass through)
   train_segmentation_bin|train_segmentation_multi [precision flags] [w] [flags]
@@ -51,7 +51,7 @@ fn main() -> ExitCode {
     let jobs = env::var("JOBS")
         .ok()
         .and_then(|j| j.parse::<u32>().ok())
-        .unwrap_or(2)
+        .unwrap_or(4)
         .clamp(1, 4)
         .to_string();
 
@@ -70,7 +70,7 @@ fn main() -> ExitCode {
     let argv: Vec<String> = match cmd.as_str() {
         "check" | "c" => cargo(
             &["check", "-j", &jobs],
-            pkgs(&["lightnet-cli", "lightnet-core"]),
+            pkgs(&["lightnet-cli", "lightnet-core", "lightnet-model", "lightnet-layers", "lightnet-runtime", "lightnet-train"]),
         ),
         "gpu-check" | "gc" => cargo(
             &[
@@ -87,10 +87,10 @@ fn main() -> ExitCode {
         "build" | "b" => cargo(&["build", "-j", &jobs], pkgs(&["lightnet-cli"])),
         "clippy" | "l" => cargo(
             &["clippy", "-j", &jobs],
-            pkgs(&["lightnet-cli", "lightnet-core"]),
+            pkgs(&["lightnet-cli", "lightnet-core", "lightnet-model", "lightnet-layers", "lightnet-runtime", "lightnet-train"]),
         ),
         "test" | "host" | "t" => {
-            let packages = env::var("PKGS").unwrap_or_else(|_| "lightnet-core lightnet-cli".into());
+            let packages = env::var("PKGS").unwrap_or_else(|_| "lightnet-core lightnet-model lightnet-layers lightnet-runtime lightnet-train lightnet-cli".into());
             let flags = packages
                 .split_whitespace()
                 .flat_map(|p| ["-p".to_owned(), p.to_owned()])
