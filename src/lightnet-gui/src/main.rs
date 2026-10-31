@@ -12,8 +12,8 @@ use lightnet_gui_engine::{DetectWorker, Prediction};
 use lightnet_gui_project::classes::{ClassEdit, apply_remap, plan_remap};
 use lightnet_gui_project::create::create_project;
 use lightnet_gui_project::filter::{Filter, SortKey, Tri};
-use lightnet_gui_project::hotkeys::{Action, Key, KeyInput, map_key};
-use lightnet_gui_project::{Editor, Mark, Mods, Point, Project, actions, nav};
+use lightnet_gui_project::hotkeys::{self, Action, Key, KeyInput, map_key};
+use lightnet_gui_project::{Editor, Mark, Mods, Point, Project, actions, edit, nav};
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, Sense, Stroke, Vec2};
 use image::{GrayImage, RgbaImage};
@@ -71,9 +71,34 @@ impl View {
     }
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Settings {
+    #[serde(default)]
     recent: Vec<String>,
+    /// DarkMark's `show_predictions` (`EToggle`: 0 off, 1 on, 2 auto).
+    #[serde(default = "default_prediction_mode")]
+    prediction_mode: u8,
+    /// DarkMark's `show_marks`.
+    #[serde(default = "default_show_marks")]
+    show_marks: bool,
+}
+
+fn default_prediction_mode() -> u8 {
+    2
+}
+
+fn default_show_marks() -> bool {
+    true
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            recent: Vec::new(),
+            prediction_mode: default_prediction_mode(),
+            show_marks: default_show_marks(),
+        }
+    }
 }
 
 impl Settings {
@@ -212,8 +237,11 @@ impl App {
         let mut style = (*cc.egui_ctx.style()).clone();
         style.visuals = egui::Visuals::dark();
         cc.egui_ctx.set_style(style);
+        let settings = Settings::load();
+        let prediction_mode = settings.prediction_mode.min(2);
+        let show_marks = settings.show_marks;
         let mut app = Self {
-            settings: Settings::load(),
+            settings,
             project: None,
             filter: Filter::default(),
             filter_text: String::new(),
@@ -239,13 +267,13 @@ impl App {
             weights_path: String::new(),
             worker: None,
             clipboard: arboard::Clipboard::new().ok(),
-            prediction_mode: 2,
+            prediction_mode,
             label_mode: 1,
             bold: false,
             shade: false,
             snapping: true,
             random_order: None,
-            show_marks: true,
+            show_marks,
             threshold: 0.25,
             drag_start: None,
             drag_now: None,
@@ -371,6 +399,31 @@ impl App {
     }
 
     fn run_action(&mut self, action: Action) {
+        // These need `App` state as well as the editor, so they run before the
+        // editor borrow below.
+        match action {
+            Action::AcceptAll => {
+                self.accept_all_marks();
+                return;
+            }
+            Action::AcceptSelected => {
+                self.accept_mark();
+                return;
+            }
+            Action::TogglePredictions => {
+                self.set_prediction_mode(hotkeys::next_prediction_mode(self.prediction_mode));
+                return;
+            }
+            Action::SetPredictions(mode) => {
+                self.set_prediction_mode(mode);
+                return;
+            }
+            Action::ToggleMarks => {
+                self.toggle_marks();
+                return;
+            }
+            _ => {}
+        }
         let Some(editor) = self.editor.as_mut() else {
             return;
         };
@@ -421,21 +474,18 @@ impl App {
             }
             Action::CopyPrev => self.copy_neighbour(nav::Dir::Previous),
             Action::CopyNext => self.copy_neighbour(nav::Dir::Next),
-            Action::ToggleMarks => self.show_marks = !self.show_marks,
-            Action::TogglePredictions => self.prediction_mode = (self.prediction_mode + 1) % 3,
             Action::ToggleLabels => self.label_mode = (self.label_mode + 1) % 3,
             Action::ToggleBold => self.bold = !self.bold,
             Action::ToggleShade => self.shade = !self.shade,
             Action::ToggleSnapping => self.snapping = !self.snapping,
-            Action::AcceptAll => {
-                if editor.accept_all() {
-                    self.dirty = true;
-                }
-            }
-            Action::AcceptSelected => {
-                if editor.accept_selected() {
-                    self.dirty = true;
-                }
+            // AcceptAll, AcceptSelected, TogglePredictions, SetPredictions and
+            // ToggleMarks are handled before this match, above.
+            Action::AcceptAll
+            | Action::AcceptSelected
+            | Action::TogglePredictions
+            | Action::SetPredictions(_)
+            | Action::ToggleMarks => {
+                unreachable!("handled before the editor borrow")
             }
             Action::Scale(delta) => {
                 editor.scale(delta);
@@ -591,40 +641,101 @@ impl App {
         }
     }
 
-    fn detect(&mut self) {
-        let (Some(project), Some(editor)) = (&self.project, self.editor.as_mut()) else {
-            return;
-        };
-        if self.prediction_mode == 0 {
-            return;
-        }
+    fn detect(&mut self) -> Result<usize, String> {
         let Some(worker) = self.worker.as_mut() else {
-            return;
+            return Err("no model is loaded".to_owned());
+        };
+        let (Some(project), Some(editor)) = (&self.project, self.editor.as_mut()) else {
+            return Err("no image is open".to_owned());
         };
         let Some(entry) = project.images.get(self.index) else {
+            return Err("no image is open".to_owned());
+        };
+        let predictions = worker.detect(&entry.path, self.threshold)?;
+        let count = predictions.len();
+        let marks: Vec<Mark> = predictions
+            .into_iter()
+            .map(|Prediction { class, conf, cx, cy, w, h }| {
+                let (width, height) = (editor.width as f32, editor.height as f32);
+                Mark::prediction(
+                    class,
+                    editor.class_name(class),
+                    (cx - w * 0.5) * width,
+                    (cy - h * 0.5) * height,
+                    (cx + w * 0.5) * width,
+                    (cy + h * 0.5) * height,
+                    conf,
+                )
+            })
+            .collect();
+        editor.set_predictions(marks);
+        Ok(count)
+    }
+
+    /// `p` and the prediction menu: store the new `show_predictions` value, then
+    /// re-run Darknet. DarkMark reloads the image for every change so the
+    /// predictions match the current mode (`DMC:2239-2252`).
+    fn set_prediction_mode(&mut self, mode: u8) {
+        self.prediction_mode = mode.min(2);
+        self.settings.prediction_mode = self.prediction_mode;
+        self.settings.save();
+        let label = prediction_label(self.prediction_mode);
+        if self.prediction_mode == 0 {
+            // Turning predictions off drops the ones in memory: they are never
+            // saved, and DarkMark rebuilds the image without them.
+            if let Some(editor) = self.editor.as_mut() {
+                editor.set_predictions(Vec::new());
+            }
+            self.ok(format!("predictions: {label}"));
+            return;
+        }
+        match self.worker.is_some().then(|| self.detect()) {
+            Some(Err(error)) => self.fail(format!("predictions: {label}; {error}")),
+            _ => self.ok(format!("predictions: {label}")),
+        }
+    }
+
+    /// `m`: DarkMark's `toggle_show_marks` (`DMC:1713-1736`).
+    fn toggle_marks(&mut self) {
+        self.show_marks = !self.show_marks;
+        self.settings.show_marks = self.show_marks;
+        self.settings.save();
+        self.ok(format!(
+            "user marks: {}",
+            if self.show_marks { "visible" } else { "hidden" }
+        ));
+    }
+
+    /// `a`: accept every prediction (`DMC:3922-3961`).
+    fn accept_all_marks(&mut self) {
+        let Some(editor) = self.editor.as_mut() else {
             return;
         };
-        match worker.detect(&entry.path, self.threshold) {
-            Ok(predictions) => {
-                let marks: Vec<Mark> = predictions
-                    .into_iter()
-                    .map(|Prediction { class, conf, cx, cy, w, h }| {
-                        let (width, height) = (editor.width as f32, editor.height as f32);
-                        Mark::prediction(
-                            class,
-                            editor.class_name(class),
-                            (cx - w * 0.5) * width,
-                            (cy - h * 0.5) * height,
-                            (cx + w * 0.5) * width,
-                            (cy + h * 0.5) * height,
-                            conf,
-                        )
-                    })
-                    .collect();
-                editor.set_predictions(marks);
-                self.ok("predictions loaded");
+        match editor.accept_all() {
+            Ok(accepted) => {
+                self.dirty = true;
+                self.ok(format!("accepted {accepted} prediction(s)"));
             }
-            Err(error) => self.fail(error),
+            Err(error) => self.fail(format!("cannot accept predictions: {error}")),
+        }
+    }
+
+    /// `A`: accept the selected prediction; with nothing selected accept all
+    /// (`DMC:3893-3920`).
+    fn accept_mark(&mut self) {
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        if editor.selected.is_none() {
+            self.accept_all_marks();
+            return;
+        }
+        match editor.accept_selected() {
+            Ok(()) => {
+                self.dirty = true;
+                self.ok("accepted the selected prediction");
+            }
+            Err(error) => self.fail(format!("cannot accept the prediction: {error}")),
         }
     }
 
@@ -781,12 +892,14 @@ impl App {
         };
 
         if let Some(editor) = &self.editor {
+            // `DMCanvas::rebuild_cache_image` (`DMCanvas.cpp:289-330`).
+            let marks_shown = self.show_marks && editor.has_real_marks();
+            let predictions_visible = edit::predictions_are_visible(
+                self.prediction_mode,
+                marks_shown,
+                self.drag_start.is_some(),
+            );
             for mark in &editor.marks {
-                let predictions_visible = match self.prediction_mode {
-                    1 => true,
-                    2 => !editor.has_real_marks(),
-                    _ => false,
-                };
                 if mark.is_prediction && !predictions_visible {
                     continue;
                 }
@@ -1001,6 +1114,15 @@ fn apply_view(view: View, gray: &GrayImage, rgba: &RgbaImage) -> RgbaImage {
 /// (`crosshair_colour`, `CrosshairComponent.cpp:119-137`); this port keeps the
 /// thin red lines the layout plan asks for.
 const CROSSHAIR_COLOUR: Color32 = Color32::from_rgb(0xF0, 0x20, 0x20);
+
+/// `show_predictions` label (`DMContent.cpp:1698-1701`).
+fn prediction_label(mode: u8) -> &'static str {
+    match mode {
+        1 => "on",
+        2 => "auto",
+        _ => "off",
+    }
+}
 
 fn class_color(class_id: usize) -> Color32 {
     const PALETTE: [Color32; 10] = [
@@ -1258,9 +1380,22 @@ impl App {
         if self.show_classes {
             self.class_window(ctx);
         }
-        if self.worker.is_none() {
-            egui::TopBottomPanel::bottom("model").show(ctx, |ui| {
-                ui.horizontal(|ui| {
+        egui::TopBottomPanel::bottom("model").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                // `p` skips On, so the full Off/On/Auto list lives here: this is
+                // the port of DarkMark's View > predictions menu
+                // (`DMContent.cpp:4128-4130`).
+                ui.menu_button(
+                    format!("predictions: {}", prediction_label(self.prediction_mode)),
+                    |ui| {
+                        for (mode, name) in [(0u8, "off"), (1, "on"), (2, "auto")] {
+                            if ui.selectable_label(self.prediction_mode == mode, name).clicked() {
+                                self.run_action(Action::SetPredictions(mode));
+                            }
+                        }
+                    },
+                );
+                if self.worker.is_none() {
                     ui.label("cfg:");
                     ui.add(egui::TextEdit::singleline(&mut self.cfg_path).desired_width(240.0));
                     ui.label("weights:");
@@ -1291,26 +1426,17 @@ impl App {
                             }
                         }
                     }
-                });
-            });
-        } else {
-            egui::TopBottomPanel::bottom("model").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    let label = match self.prediction_mode {
-                        1 => "predictions: on",
-                        2 => "predictions: auto",
-                        _ => "predictions: off",
-                    };
-                    if ui.button(label).clicked() {
-                        self.run_action(Action::TogglePredictions);
-                    }
+                } else {
                     ui.label(format!("threshold {:.2}", self.threshold));
                     if ui.button("Detect").clicked() {
-                        self.detect();
+                        match self.detect() {
+                            Ok(count) => self.ok(format!("{count} prediction(s)")),
+                            Err(error) => self.fail(error),
+                        }
                     }
-                });
+                }
             });
-        }
+        });
     }
 
     fn class_window(&mut self, ctx: &egui::Context) {

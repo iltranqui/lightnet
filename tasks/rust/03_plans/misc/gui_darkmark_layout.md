@@ -67,7 +67,7 @@ src/
 Done first and committed one item at a time, because they are independent of the layout. Verification for each: `JOBS=4 MEM=4G cargo xtask check lightnet-gui`, `PKGS=lightnet-gui-project JOBS=4 MEM=4G cargo xtask test`, and a look at `cargo xtask gui <project-dir>` (the app takes an optional project directory so the editor can be opened without clicking through the launcher).
 
 - [x] a. Hover crosshair: 1 px red vertical and horizontal lines through the pointer over the whole canvas, only while the pointer is over the image, hidden while a drag or a pan is active; the system cursor is hidden over the image (`canvas()` in `main.rs`). DarkMark tints the crosshair with the most-recent-class colour instead of red; step 3 of the layout plan can revisit that.
-- [ ] b. Hotkey parity for `p`, `m`, `a`, `A` (see [Hotkeys p, m, a, A](../../04_reference/darkmark_gui_behavior.md#hotkeys-p-m-a-a)).
+- [x] b. Hotkey parity for `p`, `m`, `a`, `A` (see [Hotkeys p, m, a, A](../../04_reference/darkmark_gui_behavior.md#hotkeys-p-m-a-a)). `p` is Off -> Auto -> Off with `On` only in the model-bar menu; both toggles persist in `~/.config/lightnet-gui/settings.json`; `p` re-runs the detector when a model is loaded; Auto honours `m`; the crosshair rule lives in `edit::predictions_are_visible`; `a`/`A` report DarkMark's refusal reasons. Verified live on an Xvfb display (XTest cannot give the app keyboard focus under WSLg XWayland): `p` off/auto/off with messages and persisted state, `m` hidden/visible with messages, `a` and `A` refusal messages, `A` with no selection falling back to accept-all. Not verified live: the re-detect on `p` (no weights loaded) and the Auto hide rule (needs predictions).
 - [ ] c. Save pipeline fixes (see [Save pipeline](../../04_reference/darkmark_gui_behavior.md#save-pipeline)).
 
 ## Implementation plan
@@ -89,3 +89,4 @@ Verification for every step: `JOBS=4 MEM=4G cargo xtask check lightnet-gui`. Lau
 - Scrollfield width: DarkMark defaults to 100 px (`Cfg.cpp:74`, slider 0-200). Use 100 and keep it configurable. Resolved by reading DarkMark.
 - Should the old left panel remain available as an optional toggle (`F3`) for users who prefer it?
 - `predictions.jpg` and other non-dataset images in the project root appear in the image list (the first entry in the screenshot). DarkMark lists them too, so keep parity unless you want them excluded by the project regex.
+- Prediction mode is re-run only when `p` or the menu changes it. DarkMark runs Darknet again on every image load (`DMContent.cpp:2537`), so in this port navigating away and back loses the predictions. Decide before the scrollfield's quick/full load (step 7), which is where the load hook belongs.

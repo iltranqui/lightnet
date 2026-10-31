@@ -10,6 +10,14 @@ use crate::undo::UndoStack;
 /// Smallest box side, in pixels, that a drag may create.
 pub const MIN_SIZE: f32 = 2.0;
 
+/// `DMCanvas::rebuild_cache_image` (`DMCanvas.cpp:289-330`): predictions are
+/// drawn unless `show_predictions` is off; Auto also hides them once a real mark
+/// is actually visible (`m` off lets them through); an active drag hides them in
+/// every mode. `mode` is DarkMark's `EToggle`: 0 off, 1 on, 2 auto.
+pub fn predictions_are_visible(mode: u8, real_marks_visible: bool, drag_active: bool) -> bool {
+    mode != 0 && !(mode == 2 && real_marks_visible) && !drag_active
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Mods {
     pub ctrl: bool,
@@ -408,13 +416,19 @@ impl Editor {
         }
     }
 
-    /// `a`: accept every prediction, but only when no accepted mark exists (`G14`).
-    pub fn accept_all(&mut self) -> bool {
+    /// `a`: accept every prediction, but only when no accepted mark exists
+    /// (`G14`). A refusal carries DarkMark's reason so the GUI can show
+    /// "Cannot accept predictions: ..." (`DMContent.cpp:3922-3961`).
+    pub fn accept_all(&mut self) -> Result<usize, String> {
         if self.has_real_marks() {
-            return false;
+            return Err("the image already has user marks".to_owned());
         }
-        if !self.marks.iter().any(|mark| mark.is_prediction) {
-            return false;
+        if let Some(mark) = self.marks.iter().find(|mark| mark.class_id >= self.class_count) {
+            return Err(format!("a prediction references unknown class {}", mark.class_id));
+        }
+        let count = self.marks.iter().filter(|mark| mark.is_prediction).count();
+        if count == 0 {
+            return Err("there are no predictions to accept".to_owned());
         }
         self.push_undo();
         let names = self.class_names.clone();
@@ -425,22 +439,32 @@ impl Editor {
                 .cloned()
                 .unwrap_or_else(|| format!("class {}", mark.class_id));
         }
-        true
+        Ok(count)
     }
 
-    /// `A`: accept the selected prediction only; a no-op otherwise (`:1586`).
-    pub fn accept_selected(&mut self) -> bool {
-        match self.selected {
-            Some(index) if index < self.marks.len() && self.marks[index].is_prediction => {
-                self.push_undo();
-                let name = self.class_name(self.marks[index].class_id);
-                let mark = &mut self.marks[index];
-                mark.is_prediction = false;
-                mark.name = name;
-                true
-            }
-            _ => false,
+    /// `A`: accept the selected prediction only (`:1586`); a selected real mark
+    /// is refused, and no selection at all accepts every prediction
+    /// (`:3915-3920`).
+    pub fn accept_selected(&mut self) -> Result<(), String> {
+        let Some(index) = self.selected else {
+            return Err("no mark is selected".to_owned());
+        };
+        let Some(mark) = self.marks.get(index) else {
+            return Err("no mark is selected".to_owned());
+        };
+        if !mark.is_prediction {
+            return Err("the selected mark is already a user mark".to_owned());
         }
+        let class_id = mark.class_id;
+        if class_id >= self.class_count {
+            return Err(format!("the prediction references unknown class {class_id}"));
+        }
+        self.push_undo();
+        let name = self.class_name(class_id);
+        let mark = &mut self.marks[index];
+        mark.is_prediction = false;
+        mark.name = name;
+        Ok(())
     }
 
     /// `o`: delete predictions only.
@@ -508,6 +532,19 @@ mod tests {
 
     fn mark(class_id: usize, x0: f32, y0: f32, x1: f32, y1: f32) -> Mark {
         Mark::from_corners(class_id, "a", x0, y0, x1, y1)
+    }
+
+    #[test]
+    fn predictions_visibility_follows_dmcanvas() {
+        // Off: never drawn, whatever else is true.
+        assert!(!predictions_are_visible(0, false, false));
+        // On: drawn unless a drag is active.
+        assert!(predictions_are_visible(1, true, false));
+        assert!(!predictions_are_visible(1, false, true));
+        // Auto: only while no real mark is visible.
+        assert!(predictions_are_visible(2, false, false));
+        assert!(!predictions_are_visible(2, true, false));
+        assert!(!predictions_are_visible(2, false, true));
     }
 
     #[test]
@@ -583,9 +620,23 @@ mod tests {
         let mut prediction = mark(0, 0.0, 0.0, 10.0, 10.0);
         prediction.is_prediction = true;
         editor.marks = vec![prediction];
-        assert!(editor.accept_all());
+        assert_eq!(editor.accept_all(), Ok(1));
         assert!(editor.has_real_marks());
-        assert!(!editor.accept_all());
+        assert!(editor.accept_all().is_err(), "a second accept must be refused");
+    }
+
+    #[test]
+    fn accept_all_names_the_reason_when_refused() {
+        let mut editor = editor();
+        assert_eq!(
+            editor.accept_all(),
+            Err("there are no predictions to accept".to_owned())
+        );
+        let mut prediction = mark(0, 0.0, 0.0, 10.0, 10.0);
+        prediction.is_prediction = true;
+        editor.marks = vec![prediction];
+        editor.class_count = 0;
+        assert!(editor.accept_all().is_err_and(|error| error.contains("unknown class")));
     }
 
     #[test]
@@ -614,9 +665,10 @@ mod tests {
         let mut prediction = mark(0, 0.0, 0.0, 10.0, 10.0);
         prediction.is_prediction = true;
         editor.marks = vec![prediction];
-        assert!(!editor.accept_selected(), "no selection is a no-op");
+        assert!(editor.accept_selected().is_err(), "no selection is a refusal");
         editor.selected = Some(0);
-        assert!(editor.accept_selected());
+        assert!(editor.accept_selected().is_ok());
+        assert!(editor.accept_selected().is_err(), "already accepted");
     }
 
     #[test]

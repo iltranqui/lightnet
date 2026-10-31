@@ -73,8 +73,11 @@ pub enum Action {
     AcceptSelected,
     /// `,` / `.`: signed normalized size delta applied to every mark (`:1606`).
     Scale(f32),
-    /// `p`: on -> auto -> off (`:1672-1712`).
+    /// `p`: off -> auto -> off; `On` is skipped and reachable only from the menu
+    /// (`:1687-1691`).
     TogglePredictions,
+    /// Menu-only prediction mode: 0 off, 1 on, 2 auto (`EToggle`, `Cfg.hpp:12-18`).
+    SetPredictions(u8),
     ToggleMarks,
     /// `o`: mass-delete click-drag mode (`:1736`).
     MassDelete,
@@ -117,8 +120,15 @@ pub enum Action {
     UndoDeleteImage,
 }
 
-pub fn map_key(input: KeyInput) -> Option<Action> {
-    let mods = input.mods;
+/// `p` cycles predictions `Off -> Auto -> Off`. `On` exists in `EToggle` but is
+/// skipped by the key and is reachable only from the View menu
+/// (`DMContent.cpp:1687-1691`).
+pub fn next_prediction_mode(mode: u8) -> u8 {
+    let next = (mode + 1) % 3;
+    if next == 1 { 2 } else { next }
+}
+
+pub fn map_key(input: KeyInput) -> Option<Action> {    let mods = input.mods;
     match input.key {
         Key::Digit(digit) => Some(Action::ClassDigit(digit)),
 
@@ -199,6 +209,14 @@ mod tests {
 
     fn input(key: Key) -> KeyInput {
         KeyInput { key, mods: Mods::default() }
+    }
+
+    #[test]
+    fn p_cycles_off_and_auto_and_skips_on() {
+        assert_eq!(next_prediction_mode(0), 2);
+        assert_eq!(next_prediction_mode(2), 0);
+        // A mode set to `On` from the menu falls through to `Auto`.
+        assert_eq!(next_prediction_mode(1), 2);
     }
 
     #[test]
