@@ -20,8 +20,8 @@ One Rust kernel source that runs on NVIDIA through cuda-oxide (PTX) and on AMD t
 ## Items
 
 - [x] Copy hip_tile to `third_party/hip_tile`
-- [ ] Design the adapter surface: thread/block index, input slice, disjoint output slice, barrier
-- [ ] Create the shared `no_std` kernel crate (not a workspace member)
+- [x] Design the adapter surface: pure per-element functions plus a thin entry kernel per backend
+- [x] Create the shared `no_std` kernel crate `src/lightnet-kernels-shared` (not a workspace member)
 - [ ] Port bias add as the first shared kernel; run on cuda-oxide and on the 680M
 - [ ] Port activation, shortcut, route, upsample
 - [ ] Parity test: both backends against the CPU reference
