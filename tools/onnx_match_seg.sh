@@ -10,6 +10,8 @@
 #   --variants    check all 8 exports: FP32/FP16 x NCHW/NHWC x activated/raw logits
 #   --fp16 --nhwc --raw   the single export to check (default FP32, NCHW, activated)
 #   --cpu         force the CPU native forward (default: oxide GPU, CPU fallback)
+#   --amd         use the AMD GPU (hip_tile, third_party/hip_tile) forward as the reference;
+#                 HIP_BIN overrides the hip_darknet binary, built on demand
 #   --no-fuse     keep batch norm unfused        --tol X   max_abs tolerance
 #   -help, --help, -h   this text
 # Overrides (environment): CFG, WEIGHTS, BIN, IMAGE, LIGHTNET_BACKEND=cpu|oxide|auto.
@@ -62,9 +64,11 @@ fi
 # -all / --all: every image of the test list instead of one.
 FLAGS=()
 ALL=0
+AMD=0
 for arg in "$@"; do
     case "$arg" in
         -all | --all) ALL=1 ;;
+        --amd) AMD=1 ;;
         *) FLAGS+=("$arg") ;;
     esac
 done
@@ -80,7 +84,14 @@ else
     TARGET=("$IMAGE")
     CHECK_IMAGE="$IMAGE"
 fi
-for path in "$CFG" "${WEIGHTS:-}" "$CHECK_IMAGE" "$BIN"; do
+CHECKS=("$CFG" "${WEIGHTS:-}" "$CHECK_IMAGE")
+# AMD mode still exports the ONNX with lightnet-rs (CPU export), so the binary is required;
+# use the CPU-only build when no release binary exists.
+if [[ "$AMD" == 1 && ! -x "$BIN" && -x target/cpu-release/release/lightnet-rs ]]; then
+    BIN="target/cpu-release/release/lightnet-rs"
+fi
+CHECKS+=("$BIN")
+for path in "${CHECKS[@]}"; do
     if [[ -z "$path" || ! -e "$path" ]]; then
         printf 'Missing: %s\n' "${path:-<no weights found in $DIR/darknet/backup>}" >&2
         exit 1
@@ -90,6 +101,14 @@ done
 # The binary must know `segment-image`. A stale one is rebuilt as the oxide release binary
 # (the same build as training, so the native reference runs on the GPU). Only if that build
 # fails is a CPU-only copy built into its own target dir; the reference is then CPU.
+HIP_BIN="${HIP_BIN:-third_party/hip_tile/target/release/hip_darknet}"
+if [[ "$AMD" == 1 ]]; then
+    if [[ ! -x "$HIP_BIN" ]]; then
+        printf "Building hip_darknet (release, AMD GPU)...\n" >&2
+        (cd third_party/hip_tile && capped 3G cargo build --release -p hip_darknet -j 4)
+    fi
+    exec python3 tools/onnx_check_seg.py "$CFG" "$WEIGHTS" "${TARGET[@]}" --binary "$BIN" --amd-binary "$HIP_BIN" "${FLAGS[@]}"
+fi
 if ! "$BIN" help 2>&1 | grep -qF "segment-image <cfg> <weights> <image>..."; then
     printf "Rebuilding the oxide release binary (first build takes minutes)...\n" >&2
     if SEG_DATASET="$SET" BUILD_ONLY=1 ./tools/train_segmentation_oxide.sh && "$BIN" help 2>&1 | grep -qF "segment-image <cfg> <weights> <image>..."; then

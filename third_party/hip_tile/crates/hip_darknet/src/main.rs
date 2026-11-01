@@ -8,6 +8,7 @@ const USAGE: &str =
     "usage: hip_darknet --cfg C --weights W --names N [--gpu] [--thresh 0.25] [--nms 0.45] [--out PATH] [--bench N] image...
        hip_darknet train --data D [--cfg C] [--gpu] [--iters N] [--batch N] [--subdivisions N] [--seed S] [--out DIR]
                          [--save-every N] [--eval-every N] [--eval] [--weights W] [--resume STATE]
+       hip_darknet segment --cfg C --weights W [--dump DIR] [--compare DIR] IMAGE
        hip_darknet detector train CFG DATA [-gpu] [-map] [-dont_show] [-gpus N] [-iters N] [-batch N] [-out DIR]
   --gpu       run the forward pass on the AMD GPU (needs the default `gpu` feature)
   --out PATH  write annotated image(s); a directory when several images are given
@@ -318,6 +319,98 @@ fn run_detector(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     run_train(&train_argv)
 }
 
+/// Run a segmentation net on the GPU and optionally dump/compare every layer.
+fn run_segment(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut cfg, mut weights, mut dump, mut compare, mut image) = (None, None, None, None, None);
+    let mut i = 0;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        let mut val = |what: &str| -> Result<String, String> {
+            i += 1;
+            argv.get(i).cloned().ok_or(format!("{what} needs a value"))
+        };
+        match a {
+            "--cfg" => cfg = Some(val("--cfg")?),
+            "--weights" => weights = Some(val("--weights")?),
+            "--dump" => dump = Some(val("--dump")?),
+            "--compare" => compare = Some(val("--compare")?),
+            "-h" | "--help" => return Err(USAGE.into()),
+            s if s.starts_with('-') => return Err(format!("segment: unknown option {s}\n{USAGE}").into()),
+            s if image.is_none() => image = Some(s.to_string()),
+            s => return Err(format!("segment: unexpected argument {s}\n{USAGE}").into()),
+        }
+        i += 1;
+    }
+    let cfg = cfg.ok_or_else(|| format!("segment needs --cfg\n{USAGE}"))?;
+    let weights = weights.ok_or_else(|| format!("segment needs --weights\n{USAGE}"))?;
+    let image = image.ok_or_else(|| format!("segment needs an image\n{USAGE}"))?;
+    let model = Model::load(cfg, weights)?;
+    let img = Image::load(&image)?.resize_linear_exact(model.net.width, model.net.height);
+    let gpu = hip_darknet::gpu::GpuModel::new(&model)?;
+    let outputs = gpu.forward_all(&img.data)?;
+
+    if let Some(dir) = &dump {
+        std::fs::create_dir_all(dir)?;
+        for (i, output) in outputs.iter().enumerate() {
+            let bytes: Vec<u8> = output.iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write(Path::new(dir).join(format!("layer_{i:03}.f32")), bytes)?;
+        }
+    }
+    if let Some(dir) = compare {
+        println!("{:>5} {:<8} {:>14} {:>10} {:>10}", "layer", "kind", "out CxHxW", "max abs", "max rel");
+        for (i, (layer, got)) in model.layers.iter().zip(&outputs).enumerate() {
+            let path = Path::new(&dir).join(format!("layer_{i:03}.f32"));
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("{}: {e}", path.display()).into()),
+            };
+            if bytes.len() != got.len() * 4 {
+                return Err(format!("{}: expected {} bytes, got {}", path.display(), got.len() * 4, bytes.len()).into());
+            }
+            let reference: Vec<f32> = bytes.chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect();
+            let peak = reference.iter().fold(0f64, |m, v| m.max(f64::from(v.abs())));
+            let floor = (peak * 0.01).max(1e-12);
+            let (mut max_abs, mut max_rel) = (0f64, 0f64);
+            for (&g, &r) in got.iter().zip(&reference) {
+                let d = (f64::from(g) - f64::from(r)).abs();
+                max_abs = max_abs.max(d);
+                max_rel = max_rel.max(d / f64::from(r.abs()).max(floor));
+            }
+            let kind = match &layer.kind {
+                hip_darknet::LayerKind::Conv(_) => "conv",
+                hip_darknet::LayerKind::Maxpool(_) => "maxpool",
+                hip_darknet::LayerKind::Route { .. } => "route",
+                hip_darknet::LayerKind::Upsample { .. } => "upsample",
+                hip_darknet::LayerKind::Logistic => "logistic",
+                hip_darknet::LayerKind::Softmax(_) => "softmax",
+                hip_darknet::LayerKind::Yolo(_) => "yolo",
+            };
+            let s = layer.out_shape;
+            println!("{i:>5} {kind:<8} {:>14} {:>10.2e} {:>10.2e}", format!("{}x{}x{}", s.c, s.h, s.w), max_abs, max_rel);
+            if i + 1 == outputs.len() {
+                let plane = s.h * s.w;
+                let agree = if s.c == 1 {
+                    got.iter().zip(&reference).filter(|(a, b)| (**a > 0.5) == (**b > 0.5)).count()
+                } else {
+                    (0..plane).filter(|&p| {
+                        let argmax = |values: &[f32]| (0..s.c).max_by(|&a, &b| values[a * plane + p].total_cmp(&values[b * plane + p])).unwrap();
+                        argmax(got) == argmax(&reference)
+                    }).count()
+                };
+                let agreement = agree as f64 / plane as f64;
+                println!("classes agreement: {agreement:.6}");
+                if agreement < 0.999 {
+                    return Err(format!("last-layer class agreement {agreement:.6} is below 0.999").into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(String::as_str) == Some("detector") {
@@ -329,6 +422,13 @@ fn main() {
     }
     if argv.first().map(String::as_str) == Some("train") {
         if let Err(e) = run_train(&argv[1..]) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if argv.first().map(String::as_str) == Some("segment") {
+        if let Err(e) = run_segment(&argv[1..]) {
             eprintln!("{e}");
             std::process::exit(1);
         }

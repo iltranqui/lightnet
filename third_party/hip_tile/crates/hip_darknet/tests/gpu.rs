@@ -70,6 +70,8 @@ fn per_layer_parity() {
             hip_darknet::LayerKind::Maxpool(_) => "maxpool",
             hip_darknet::LayerKind::Route { .. } => "route",
             hip_darknet::LayerKind::Upsample { .. } => "upsample",
+            hip_darknet::LayerKind::Logistic => "logistic",
+            hip_darknet::LayerKind::Softmax(_) => "softmax",
             hip_darknet::LayerKind::Yolo(_) => "yolo",
         };
         let s = l.out_shape;

@@ -73,6 +73,58 @@ impl Image {
         }
         Image { w, h, c: self.c, data: out }
     }
+
+    /// Resize RGB input with OpenCV `INTER_LINEAR_EXACT`'s half-pixel sampling and fixed-point
+    /// coefficients, matching lightnet's layer-dump preprocessing.
+    pub fn resize_linear_exact(&self, w: usize, h: usize) -> Image {
+        if self.w == w && self.h == h {
+            return Image { w, h, c: self.c, data: self.data.clone() };
+        }
+        let exact_coeffs = |src: usize, dst: usize| {
+            (0..dst)
+                .map(|d| {
+                    let fs = (d as f64 + 0.5) * src as f64 / dst as f64 - 0.5;
+                    let mut x0 = fs.floor();
+                    let mut frac = fs - x0;
+                    if x0 < 0.0 {
+                        x0 = 0.0;
+                        frac = 0.0;
+                    }
+                    if x0 >= src as f64 - 1.0 {
+                        x0 = src as f64 - 1.0;
+                        frac = 0.0;
+                    }
+                    let x0 = x0 as usize;
+                    let c1 = (frac * 256.0 + 0.5).floor() as u32;
+                    (x0, (x0 + 1).min(src - 1), 256 - c1, c1)
+                })
+                .collect::<Vec<_>>()
+        };
+        let (cx, cy) = (exact_coeffs(self.w, w), exact_coeffs(self.h, h));
+        let src: Vec<u8> = self.data.iter().map(|&v| (v * 255.0).round() as u8).collect();
+        let mut tmp = vec![0u32; self.h * w * self.c];
+        for y in 0..self.h {
+            for (x, &(x0, x1, c0, c1)) in cx.iter().enumerate() {
+                for ch in 0..self.c {
+                    let a = src[(ch * self.h + y) * self.w + x0] as u32;
+                    let b = src[(ch * self.h + y) * self.w + x1] as u32;
+                    tmp[(ch * self.h + y) * w + x] = a * c0 + b * c1;
+                }
+            }
+        }
+        let mut out = vec![0f32; self.c * h * w];
+        for (y, &(y0, y1, c0, c1)) in cy.iter().enumerate() {
+            for ch in 0..self.c {
+                for x in 0..w {
+                    let a = tmp[(ch * self.h + y0) * w + x];
+                    let b = tmp[(ch * self.h + y1) * w + x];
+                    let v = ((a * c0 + b * c1 + 32768) >> 16) as u8;
+                    out[(ch * h + y) * w + x] = v as f32 / 255.0;
+                }
+            }
+        }
+        Image { w, h, c: self.c, data: out }
+    }
 }
 
 #[cfg(test)]
@@ -92,5 +144,42 @@ mod tests {
         let r = img.resize(3, 1);
         assert_eq!(r.data, vec![0.0, 0.5, 1.0]);
         assert_eq!(img.resize(2, 1).data, img.data);
+    }
+
+    #[test]
+    fn resize_linear_exact_fixed_point_rgb() {
+        // The fixed-point result stays within one byte of an f64 half-pixel bilinear resize
+        // (centres at (d + 0.5) * src / dst - 0.5, edges clamped).
+        let (sw, sh, dw, dh) = (5usize, 4usize, 3usize, 3usize);
+        let rgb: Vec<u8> = (0..sw * sh).flat_map(|v| [(v * 7 % 256) as u8, (v * 13 % 256) as u8, (v * 29 % 256) as u8]).collect();
+        let img = Image::from_rgb8(&rgb, sw, sh);
+        let resized = img.resize_linear_exact(dw, dh);
+        let at = |c: usize, y: usize, x: usize| f64::from(rgb[(y * sw + x) * 3 + c]);
+        let axis = |d: usize, src: usize, dst: usize| {
+            let f = ((d as f64 + 0.5) * src as f64 / dst as f64 - 0.5).clamp(0.0, src as f64 - 1.0);
+            let i = (f.floor() as usize).min(src - 1);
+            (i, (i + 1).min(src - 1), f - i as f64)
+        };
+        for c in 0..3 {
+            for y in 0..dh {
+                for x in 0..dw {
+                    let (y0, y1, fy) = axis(y, sh, dh);
+                    let (x0, x1, fx) = axis(x, sw, dw);
+                    let top = at(c, y0, x0) * (1.0 - fx) + at(c, y0, x1) * fx;
+                    let bot = at(c, y1, x0) * (1.0 - fx) + at(c, y1, x1) * fx;
+                    let want = top * (1.0 - fy) + bot * fy;
+                    let got = f64::from((resized.data[(c * dh + y) * dw + x] * 255.0).round());
+                    assert!((got - want).abs() <= 1.0, "c{c} y{y} x{x}: got {got} want {want}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resize_linear_exact_same_size_copies_input() {
+        let img = Image::from_rgb8(&[0, 1, 2, 3, 4, 5], 2, 1);
+        let resized = img.resize_linear_exact(2, 1);
+        assert_eq!(resized.data, img.data);
+        assert_eq!((resized.w, resized.h, resized.c), (img.w, img.h, img.c));
     }
 }

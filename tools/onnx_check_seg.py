@@ -2,7 +2,7 @@
 """Compare an exported segmentation ONNX model with the Rust runtime.
 
 Usage: tools/onnx_check_seg.py CFG WEIGHTS (IMAGE | --list FILE)
-       [--binary target/release/lightnet-rs] [--cpu] [--variants]
+       [--binary target/release/lightnet-rs] [--cpu] [--amd-binary HIP_DARKNET] [--variants]
        [--fp16] [--nhwc] [--raw] [--no-fuse] [--tol 1e-4] [-help]
 
 Exports the model, runs it in ONNX Runtime (CPU), runs `segment-image` once for
@@ -145,6 +145,8 @@ def main() -> int:
     parser.add_argument("--list", type=Path, default=None)
     parser.add_argument("--binary", default="target/release/lightnet-rs")
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--amd-binary", default=None,
+                        help="hip_darknet binary: use the AMD GPU (hip_tile) forward as the reference")
     parser.add_argument("--variants", action="store_true")
     parser.add_argument("--fp16", action="store_true")
     parser.add_argument("--nhwc", action="store_true")
@@ -163,12 +165,24 @@ def main() -> int:
         env = dict(os.environ, LIGHTNET_LAYER_DUMP_DIR=str(dump))
         if args.cpu:
             env["LIGHTNET_BACKEND"] = "cpu"
-        native = subprocess.run(
-            [args.binary, "segment-image", str(args.cfg), str(args.weights), *map(str, paths)],
-            check=True, env=env, capture_output=True, text=True,
-        )
-        # "segment-image backend oxide|cpu: ..." tells which forward is the reference.
-        print("native reference:", native.stdout.strip().splitlines()[-1] if native.stdout.strip() else "?")
+        if args.amd_binary:
+            # Reference forward on the AMD GPU (hip_tile): one `hip_darknet segment` run per
+            # image, dumping the same `layer_NNN.f32` files in the same directory layout.
+            for index, path in enumerate(paths):
+                where = dump if len(paths) == 1 else dump / f"{index:05}"
+                subprocess.run(
+                    [args.amd_binary, "segment", "--cfg", str(args.cfg), "--weights", str(args.weights),
+                     "--dump", str(where), str(path)],
+                    check=True, capture_output=True, text=True,
+                )
+            print("native reference: hip_tile (AMD GPU)")
+        else:
+            native = subprocess.run(
+                [args.binary, "segment-image", str(args.cfg), str(args.weights), *map(str, paths)],
+                check=True, env=env, capture_output=True, text=True,
+            )
+            # "segment-image backend oxide|cpu: ..." tells which forward is the reference.
+            print("native reference:", native.stdout.strip().splitlines()[-1] if native.stdout.strip() else "?")
 
         head = layer_count(args.cfg) - 1
         references = []
