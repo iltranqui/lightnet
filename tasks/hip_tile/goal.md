@@ -58,5 +58,5 @@ In order. Stop at the first failing gate.
 
 ## Open checks
 
-- Segmentation: not yet checked that hip_tile has a segmentation head. Assumed to need adding. Step 4 only works if the AMD path can run the `[segmentation]` layer.
-- ONNX export: the exporter runs on CPU, so "ONNX on AMD" means the exported model matches the AMD forward in ONNX Runtime. It does not mean exporting from the GPU.
+- Segmentation: hip_tile had no segmentation head; added in v0.2.212 and v0.2.213 (resolved, see `tasks/hip_tile/todo.md` Review).
+- ONNX export: the exporter runs on CPU, so "ONNX on AMD" means the exported model matches the AMD forward in ONNX Runtime (resolved, v0.2.213 and v0.2.214).

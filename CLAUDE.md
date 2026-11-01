@@ -16,6 +16,7 @@ Rust port of Darknet/YOLO (branch `rust`) with CPU, cuTile and cuda-oxide GPU ba
 |---|---|---|
 | Product (Darknet port) | `src/lightnet-*` | `src/<crate>/CONTEXT.md`; layer contract in `src/lightnet-core/src/layers/CONTEXT.md` |
 | cuda-oxide (submodule) | `third_party/cuda-oxide` | `third_party/CONTEXT.md` |
+| hip_tile (AMD ROCm, plain copy) and shared kernel bodies | `third_party/hip_tile`, `src/lightnet-kernels-shared` | `third_party/hip_tile/CLAUDE.md`, `tasks/hip_tile/goal.md` |
 | Roadmap and plans | `tasks/rust/` | `tasks/rust/CONTEXT.md` |
 | Reference docs | `docs/` | `docs/CONTEXT.md` |
 | Model configs | `cfg/` | `cfg/CONTEXT.md` |
@@ -30,6 +31,7 @@ Whole-repo map: [CONTEXT.md](CONTEXT.md).
 - Current state after a context reset: `tasks/rust/02_state/STATUS.md`.
 - Touch a crate: its `CONTEXT.md` first.
 - Touch cuda-oxide: read `third_party/CONTEXT.md` first; it is a pinned submodule, not editable here.
+- AMD ROCm path (hip_tile): `tasks/hip_tile/todo.md` (decisions, results), then `third_party/hip_tile/CLAUDE.md`. An element kernel used by both GPU backends goes in `src/lightnet-kernels-shared` (pure `no_std` functions), with a thin entry kernel per backend. Parity checks against the AMD forward: `./tools/onnx_match.sh --amd`, `./tools/onnx_match_seg.sh <bin|multi|both> --amd`, `hip_darknet segment --compare DIR`.
 
 ## Commands
 

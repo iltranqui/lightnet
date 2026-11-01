@@ -28,6 +28,7 @@ does not imply runtime optimizer integration.
 - [Blocked, not plannable](#blocked-not-plannable)
 - [Defects found while deriving this matrix](#defects-found-while-deriving-this-matrix)
 - [Maintenance](#maintenance)
+- [AMD hip_tile path](#amd-hip_tile-path)
 
 ## Audit 2026-10-27
 
@@ -403,3 +404,17 @@ variants or non-layer work.
 - This file is local-only (`tasks/` is in `.git/info/exclude`); commit it with
   `git add -f` if it should be tracked.
 - Never write "C++ parity" for any cell. No compiled-C++ golden exists.
+
+## AMD hip_tile path
+
+A separate GPU path, `third_party/hip_tile` (`hip_darknet`, Radeon 680M / gfx1031, inference only), not a `LayerKind` column above. Element bodies it shares with the oxide path live in `src/lightnet-kernels-shared`. Verified against the lightnet CPU forward and ONNX Runtime (v0.2.211 to v0.2.214, numbers in `tasks/hip_tile/todo.md`).
+
+| Layer | AMD status |
+|---|---|
+| convolutional (linear, leaky, tanh) | native, tile implicit GEMM, fused bias and activation; no batch norm on the segmentation nets |
+| maxpool | native |
+| route | native (channel-slice copy, no math) |
+| upsample | native, index map shared with oxide |
+| yolo | native forward |
+| logistic, softmax (`spatial=1`) | native, bodies shared with oxide |
+| everything else | not supported (`Error::Unsupported`) |

@@ -98,6 +98,9 @@ with actual-device CPU parity; head loss/backward remains host-owned. See
 uncommitted, with no `version-map.tsv` row.
 
 Latest increments:
+- v0.2.214 (`3d85b4dc718c3581d63f45ad592e592feb8172e6`): AMD (hip_tile) path complete for the LegoGears detector, binary and multi-class segmentation and their ONNX checks; see `tasks/hip_tile/todo.md` review.
+- v0.2.213 (`ab07cf4ff8f532946f6c16b55530c5d275899b5d`): segmentation on the AMD GPU, 10 images class agreement 1.000000, ONNX 16 variants OK.
+- v0.2.212 (`d5d7eb5db78e584d60bde7448d3764a6b5c8b901`): shared DeviceMath, tanh/logistic/spatial softmax on AMD.
 - v0.2.211 (`8046242c267f80130a20c2a9c7c281f9a7f1ae8b`): AMD LegoGears detector gate passes with the shared leaky/upsample source (38/38 matched, per-layer max abs 1.91e-5). Next: segmentation head on AMD (needs tanh, logistic, spatial softmax).
 - v0.2.210 (`0ff16a765879de88fc7134aa060b6dc0ae2f7d40`): shared bias_add element kernel runs on cuda-oxide (RTX 4060) and hip_tile (Radeon 680M) with max_err 0; hip_tile imported at `third_party/hip_tile`. Next: leaky activation, route, upsample, then detector gate. See `tasks/hip_tile/todo.md`.
 - v0.2.209 (`5b14d0c`): dense box-table head training now reaches a training loop. `train::dense_head_truth` packs the `batch * max * 6` truth for `[yolox]`/`[ppyoloe]`/`[yolonas]`/`[centernet]`, `train::network_uses_dense_heads` dispatches, and `train::train_dense_head_batch_step` runs forward -> `compute_dense_training_loss_at` -> seeded backward -> Muon/Adam/SGD. Both CLI detector-train loops branch on it; classic YOLO is unchanged. Host `dense_head` 4, `modern_yolo` 24, `centernet` 14, `dense` 19 passed; `check`/`clippy`/`gpu-check` clean. No dataset training run, no GPU delta kernel (delta on host, backward on device), no compiled-C++ golden; Region still needs learnable biases/scales in `RegionSpec` before its truth loss can be ported. Evidence: `implemented.md` §274.

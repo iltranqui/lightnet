@@ -1,6 +1,6 @@
 # third_party
 
-Pinned git submodules. Treat as upstream code: never edit inside, apply patches from `patches/`.
+Pinned git submodules (`cuda-oxide`), treat as upstream code: never edit inside, apply patches from `patches/`. `hip_tile/` is the exception: a plain copy (no .git) of /home/kerrigan/src/hip_tile at c2c0f7e, edited here.
 
 ## Table of Contents
 
@@ -15,6 +15,7 @@ Pinned git submodules. Treat as upstream code: never edit inside, apply patches 
 |---|---|---|
 | `cuda-oxide/` | https://github.com/NVlabs/cuda-oxide | `728539f65` (first upstream fix after `7d9c19405`; its root Cargo.toml paths are repaired) |
 | `patches/` | local | patches to apply on top of the pin, see `patches/README.md` |
+| `hip_tile/` | local copy of git@github.com:iltranqui/hip_tile.git (c2c0f7e, no history) | AMD ROCm tile kernels and the `hip_darknet` port; standalone workspace excluded from the lightnet workspace; read its `CLAUDE.md` first |
 
 The cuTile submodule lives at `src/cutile-rs-aot` (NVlabs/cutile-rs v0.2.0) because `lightnet-cuda-cutile` uses a relative path to it.
 
@@ -35,6 +36,8 @@ Crates are at `third_party/cuda-oxide/cuda-oxide/crates/<name>`.
 ## Who uses it
 
 `src/lightnet-cuda-oxide` (kernels) and the `oxide` feature of `src/lightnet-cli`. Build via `./tools/test_oxide.sh`.
+
+`hip_tile/` builds on its own (`cd third_party/hip_tile && cargo test`, 4 jobs, soft RAM cap). It depends on `src/lightnet-kernels-shared` by path; so does `src/lightnet-cuda-oxide`. That crate holds the kernel element bodies shared by both GPU backends.
 
 ## Constraints
 
