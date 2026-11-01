@@ -44,3 +44,13 @@ Layout:
 - `src/lightnet-kernels-shared` (new, own `[workspace]`): shared element functions.
 - `third_party/hip_tile/kernels/src/shared_ops.rs`: AMD entries.
 - `src/lightnet-cuda-oxide/src/kernels/shared_ops.rs`: oxide entries.
+
+## Progress
+
+- Step 3 detector gate passed (v0.2.211): `hip_darknet --test gpu` on Radeon 680M, 10 valid images, GPU detections equal CPU (class, IoU >= 0.99, score diff <= 1e-3), 38/38 ground truth matched, per-layer max abs 1.91e-5 and max rel 1.69e-4 over 38 layers. Shared source in use: bias add, leaky, upsample index. Exceptions kept per backend: conv and GEMM (tile kernels on AMD, tuned kernels on NVIDIA), maxpool, route (pure layout copy, no math).
+- Latency per model: not measured yet.
+
+## Step 4 findings (segmentation)
+
+- Trained weights exist: `datasets/semantic_binary/darknet/backup/semantic_segmentation_best.weights` and `semantic_multi/...`. Binary cfg: 23 conv (22 tanh, 1 linear), 5 maxpool, 5 route, 5 upsample, `[logistic]` head. Multi uses the spatial softmax head.
+- hip_tile has no tanh, logistic or softmax. Device `exp` differs per backend, so the shared crate needs a small math trait implemented once per backend.
