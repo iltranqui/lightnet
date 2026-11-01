@@ -97,6 +97,9 @@ impl GpuTrainNet {
     /// Copy `net`'s weights and batch-norm state to the device and allocate the activations.
     pub fn from_net(net: &TrainNet) -> Result<Self> {
         let model = net.model.clone();
+        if model.layers.iter().any(|l| matches!(l.kind, LayerKind::Logistic | LayerKind::Softmax(_))) {
+            return Err(Error::Unsupported("[logistic] and [softmax] training is not implemented".into()));
+        }
         let batch = net.batch;
         let device = hip(Device::init())?;
         let module = hip(Module::from_elf(KERNELS_ELF))?;
@@ -224,6 +227,7 @@ impl GpuTrainNet {
                 LayerKind::Upsample { stride } => {
                     hip(launch_upsample_batched(md, st, batch, Tensor::new(prev, ins.c as u32, ihw, ihw), y, ins.w as u32, *stride as u32))?;
                 }
+                LayerKind::Logistic | LayerKind::Softmax(_) => unreachable!("training head layers rejected by constructor"),
                 LayerKind::Route { sources, groups, group_id } => {
                     let mut ch0 = 0usize;
                     for &s in sources {
@@ -470,6 +474,7 @@ impl GpuTrainNet {
                         ))?;
                     }
                 }
+                LayerKind::Logistic | LayerKind::Softmax(_) => unreachable!("training head layers rejected by constructor"),
                 LayerKind::Route { sources, groups, group_id } => {
                     let mut ch0 = 0usize;
                     for &s in sources {

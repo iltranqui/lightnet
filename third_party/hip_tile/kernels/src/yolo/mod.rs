@@ -16,5 +16,6 @@
 pub mod batched;
 pub mod concat;
 pub mod conv;
+pub mod head;
 pub mod maxpool;
 pub mod upsample;

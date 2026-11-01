@@ -33,7 +33,7 @@ pub struct ConvParams {
     pub pad: u32,
     pub oh: u32,
     pub ow: u32,
-    /// 0 = linear, 1 = leaky (0.1).
+    /// 0 = linear, 1 = leaky (0.1), 2 = tanh.
     pub act: u32,
 }
 
@@ -48,6 +48,7 @@ impl ConvParams {
 
     pub const LINEAR: u32 = 0;
     pub const LEAKY: u32 = 1;
+    pub const TANH: u32 = 2;
 
     /// Output size follows the usual `(in + 2*pad - k) / stride + 1`.
     pub fn new(cin: u32, h: u32, w: u32, k: u32, stride: u32, pad: u32, act: u32) -> Self {
@@ -124,8 +125,11 @@ fn conv_body<const BM: usize, const BN: usize>(
             0.0
         }
     });
-    let leaky = p.act == ConvParams::LEAKY;
-    let out = (acc + bt).map(|v| if leaky { lightnet_kernels_shared::leaky_elem(v) } else { v });
+    let out = (acc + bt).map(|v| match p.act {
+        ConvParams::LEAKY => lightnet_kernels_shared::leaky_elem(v),
+        ConvParams::TANH => lightnet_kernels_shared::tanh_elem::<crate::math::AmdMath>(v),
+        _ => v,
+    });
     y.store_tile(r0, c0, &out);
 }
 

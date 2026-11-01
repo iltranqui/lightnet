@@ -24,10 +24,26 @@ pub const ACT_LHTAN: u32 = 16;
 pub const ACT_PLSE: u32 = 17;
 pub const ACT_STAIR: u32 = 18;
 
+/// Math primitives for the shared bodies: native `exp`, and native `tanh` instead of the
+/// shared exp-based default.
+pub struct OxideMath;
+
+impl lightnet_kernels_shared::DeviceMath for OxideMath {
+    #[inline(always)]
+    fn exp(x: f32) -> f32 {
+        x.exp()
+    }
+
+    #[inline(always)]
+    fn tanh(x: f32) -> f32 {
+        x.tanh()
+    }
+}
+
 #[device]
 pub fn activate(kind: u32, x: f32) -> f32 {
     if kind == 1 {
-        1.0 / (1.0 + (-x).exp())
+        lightnet_kernels_shared::logistic_elem::<OxideMath>(x)
     } else if kind == 2 {
         x.max(0.0)
     } else if kind == 3 {
@@ -37,7 +53,7 @@ pub fn activate(kind: u32, x: f32) -> f32 {
     } else if kind == 5 {
         x / (1.0 + (-x).exp())
     } else if kind == 6 {
-        x.tanh()
+        lightnet_kernels_shared::tanh_elem::<OxideMath>(x)
     } else if kind == 7 {
         x.max(0.0).min(6.0)
     } else if kind == 8 {

@@ -12,6 +12,7 @@ use hip_tile::{Tensor, TensorMut};
 use kernels::yolo::concat::launch_concat;
 use kernels::yolo::conv::{ConvParams, launch_conv};
 use kernels::yolo::maxpool::{PoolParams, launch_maxpool};
+use kernels::yolo::head::{launch_logistic, launch_softmax_spatial};
 use kernels::yolo::upsample::launch_upsample;
 
 /// The kernels crate compiled for gfx1031.
@@ -65,7 +66,7 @@ impl<'m> GpuModel<'m> {
         for (i, l) in model.layers.iter().enumerate() {
             match &l.kind {
                 LayerKind::Conv(c) => {
-                    if !matches!(c.cfg.activation, Activation::Linear | Activation::Leaky) {
+                    if !matches!(c.cfg.activation, Activation::Linear | Activation::Leaky | Activation::Tanh) {
                         return Err(Error::Unsupported(format!("layer {i}: GPU conv activation {:?}", c.cfg.activation)));
                     }
                     if c.weights.len() != c.n_weights() {
@@ -116,7 +117,11 @@ impl<'m> GpuModel<'m> {
             match &l.kind {
                 LayerKind::Conv(c) => {
                     let cb = self.convs[i].as_ref().expect("conv buffers");
-                    let act = if c.cfg.activation == Activation::Leaky { ConvParams::LEAKY } else { ConvParams::LINEAR };
+                    let act = match c.cfg.activation {
+                        Activation::Leaky => ConvParams::LEAKY,
+                        Activation::Tanh => ConvParams::TANH,
+                        _ => ConvParams::LINEAR,
+                    };
                     let p = ConvParams::new(
                         ins.c as u32, ins.h as u32, ins.w as u32, c.cfg.size as u32,
                         c.cfg.stride as u32, c.cfg.padding as u32, act,
@@ -132,6 +137,12 @@ impl<'m> GpuModel<'m> {
                 }
                 LayerKind::Upsample { stride } => {
                     hip(launch_upsample(md, st, Tensor::new(prev, ins.c as u32, ihw, ihw), y, ins.w as u32, *stride as u32))?;
+                }
+                LayerKind::Logistic => {
+                    hip(launch_logistic(md, st, Tensor::new(prev, ins.c as u32, ihw, ihw), y))?;
+                }
+                LayerKind::Softmax(cfg) => {
+                    hip(launch_softmax_spatial(md, st, Tensor::new(prev, ins.c as u32, ihw, ihw), y, cfg.temperature))?;
                 }
                 LayerKind::Route { sources, groups, group_id } => {
                     let mut ch0 = 0usize;

@@ -1,6 +1,6 @@
 //! Layer graph with inferred shapes and (after loading) BN-folded conv weights.
 
-use crate::cfg::{Activation, Cfg, ConvCfg, LayerCfg, MaxpoolCfg, NetCfg, YoloCfg};
+use crate::cfg::{Activation, Cfg, ConvCfg, LayerCfg, MaxpoolCfg, NetCfg, SoftmaxCfg, YoloCfg};
 use crate::error::{Error, Result};
 use std::path::Path;
 
@@ -55,6 +55,8 @@ pub enum LayerKind {
     /// Concatenation of channel group `group_id` of each source layer's output.
     Route { sources: Vec<usize>, groups: usize, group_id: usize },
     Upsample { stride: usize },
+    Logistic,
+    Softmax(SoftmaxCfg),
     /// Output is the (raw, pre-activation) input; see `yolo::decode`.
     Yolo(YoloCfg),
 }
@@ -141,6 +143,8 @@ impl Model {
                     in_shape: prev,
                     out_shape: Shape { c: prev.c, h: prev.h * stride, w: prev.w * stride },
                 },
+                LayerCfg::Logistic => Layer { kind: LayerKind::Logistic, in_shape: prev, out_shape: prev },
+                LayerCfg::Softmax(s) => Layer { kind: LayerKind::Softmax(*s), in_shape: prev, out_shape: prev },
                 LayerCfg::Yolo(y) => {
                     let want = y.mask.len() * (y.classes + 5);
                     if prev.c != want {
@@ -201,6 +205,7 @@ impl Activation {
                     0.1 * x
                 }
             }
+            Activation::Tanh => x.tanh(),
             Activation::Logistic => 1.0 / (1.0 + (-x).exp()),
         }
     }

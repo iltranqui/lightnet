@@ -27,11 +27,26 @@ pub fn forward(model: &Model, input: &[f32]) -> Result<Vec<Vec<f32>>> {
                 route(&parts, *groups, *group_id)
             }
             LayerKind::Upsample { stride } => upsample(prev, layer.in_shape, *stride),
+            LayerKind::Logistic => prev.iter().map(|&x| 1.0 / (1.0 + (-x).exp())).collect(),
+            LayerKind::Softmax(cfg) => softmax_spatial(prev, layer.in_shape, cfg.temperature),
             LayerKind::Yolo(_) => prev.to_vec(),
         };
         outs.push(out);
     }
     Ok(outs)
+}
+
+fn softmax_spatial(input: &[f32], shape: Shape, temperature: f32) -> Vec<f32> {
+    let plane = shape.h * shape.w;
+    let mut out = vec![0.0; input.len()];
+    for pixel in 0..plane {
+        let max = (0..shape.c).map(|c| input[c * plane + pixel] / temperature).fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = (0..shape.c).map(|c| (input[c * plane + pixel] / temperature - max).exp()).sum();
+        for c in 0..shape.c {
+            out[c * plane + pixel] = (input[c * plane + pixel] / temperature - max).exp() / sum;
+        }
+    }
+    out
 }
 
 /// Convolution with bias and activation. `weights` is `[out][in][ky][kx]`.

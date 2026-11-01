@@ -10,6 +10,7 @@
 pub mod backward;
 pub mod copy;
 pub mod gemm;
+pub mod math;
 pub mod saxpy;
 pub mod shared_ops;
 pub mod transpose;

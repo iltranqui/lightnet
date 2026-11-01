@@ -7,6 +7,7 @@ use crate::error::{Error, Result};
 pub enum Activation {
     Linear,
     Leaky,
+    Tanh,
     Logistic,
 }
 
@@ -116,6 +117,12 @@ pub struct MaxpoolCfg {
     pub padding: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SoftmaxCfg {
+    pub spatial: usize,
+    pub temperature: f32,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RouteCfg {
     /// As written in the cfg: negative = relative to this layer, else absolute.
@@ -173,6 +180,8 @@ pub enum LayerCfg {
     Maxpool(MaxpoolCfg),
     Route(RouteCfg),
     Upsample { stride: usize },
+    Logistic,
+    Softmax(SoftmaxCfg),
     Yolo(YoloCfg),
 }
 
@@ -371,6 +380,7 @@ fn parse_conv(s: &Section) -> Result<ConvCfg> {
     let padding = if s.int("pad", 0)? != 0 { size / 2 } else { s.uint("padding", 0)? };
     let activation = match s.str("activation", "logistic").as_str() {
         "leaky" => Activation::Leaky,
+        "tanh" => Activation::Tanh,
         "linear" => Activation::Linear,
         "logistic" => Activation::Logistic,
         other => return Err(Error::Unsupported(format!("activation `{other}` (line {})", s.line))),
@@ -491,6 +501,18 @@ impl Cfg {
                         return Err(Error::Unsupported(format!("[upsample] line {}: stride < 1", s.line)));
                     }
                     LayerCfg::Upsample { stride: stride as usize }
+                }
+                "logistic" => LayerCfg::Logistic,
+                "softmax" => {
+                    let spatial = s.uint("spatial", 0)?;
+                    if spatial != 1 {
+                        return Err(Error::Unsupported(format!("[softmax] line {}: only spatial=1 is supported", s.line)));
+                    }
+                    let temperature = s.float("temperature", 1.0)?;
+                    if !temperature.is_finite() || temperature <= 0.0 {
+                        return Err(s.err(s.line, "temperature must be finite and > 0"));
+                    }
+                    LayerCfg::Softmax(SoftmaxCfg { spatial, temperature })
                 }
                 "yolo" => LayerCfg::Yolo(parse_yolo(s)?),
                 other => return Err(Error::Unsupported(format!("layer type [{other}] (line {})", s.line))),

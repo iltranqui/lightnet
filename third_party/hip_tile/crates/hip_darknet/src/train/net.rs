@@ -66,6 +66,9 @@ impl TrainNet {
     /// BN shift at zero, rolling stats `0/1`.
     pub fn new(cfg: &Cfg, batch: usize, seed: u64) -> Result<TrainNet> {
         let model = Model::from_cfg(cfg)?;
+        if model.layers.iter().any(|l| matches!(l.kind, LayerKind::Logistic | LayerKind::Softmax(_))) {
+            return Err(Error::Unsupported("[logistic] and [softmax] training is not implemented".into()));
+        }
         let mut rng = Rng::new(seed);
         let mut convs = Vec::with_capacity(model.layers.len());
         let mut outs = Vec::with_capacity(model.layers.len());
@@ -192,6 +195,7 @@ impl TrainNet {
                     let prev: &[f32] = if i == 0 { &self.input } else { &self.outs[i - 1] };
                     upsample_forward(prev, &mut dst, ins, shape, *stride, batch);
                 }
+                LayerKind::Logistic | LayerKind::Softmax(_) => unreachable!("training head layers rejected by constructor"),
                 LayerKind::Yolo(y) => {
                     let prev: &[f32] = if i == 0 { &self.input } else { &self.outs[i - 1] };
                     yolo_forward(prev, &mut dst, shape, y, batch);
@@ -310,6 +314,7 @@ impl TrainNet {
                         upsample_backward(&delta, &mut self.grads[i - 1], ins, *stride, batch);
                     }
                 }
+                LayerKind::Logistic | LayerKind::Softmax(_) => unreachable!("training head layers rejected by constructor"),
                 LayerKind::Yolo(_) => unreachable!(),
             }
             self.grads[i] = delta;
@@ -408,6 +413,11 @@ fn apply_activation(buf: &mut [f32], act: Activation) {
                 *v = 1.0 / (1.0 + (-*v).exp());
             }
         }
+        Activation::Tanh => {
+            for v in buf.iter_mut() {
+                *v = v.tanh();
+            }
+        }
     }
 }
 
@@ -424,6 +434,11 @@ fn activation_backward(buf: &mut [f32], post: &[f32], act: Activation) {
         Activation::Logistic => {
             for (d, &o) in buf.iter_mut().zip(post) {
                 *d *= o * (1.0 - o);
+            }
+        }
+        Activation::Tanh => {
+            for (d, &o) in buf.iter_mut().zip(post) {
+                *d *= 1.0 - o * o;
             }
         }
     }

@@ -6,6 +6,7 @@ use kernels::yolo::concat::launch_concat;
 use kernels::yolo::conv::{Config, ConvParams, launch_conv, launch_conv_with};
 use kernels::yolo::maxpool::{PoolParams, launch_maxpool};
 use kernels::yolo::upsample::launch_upsample;
+use kernels::yolo::head::{launch_logistic, launch_softmax_spatial};
 use runner::random_vec;
 
 /// Values in [-1, 1) so leaky and cancellation both matter.
@@ -44,6 +45,8 @@ fn conv_cpu(x: &[f32], w: &[f32], bias: &[f32], cout: usize, p: &ConvParams) -> 
                 }
                 if p.act == ConvParams::LEAKY && acc < 0.0 {
                     acc *= 0.1;
+                } else if p.act == ConvParams::TANH {
+                    acc = acc.tanh();
                 }
                 out[co * oh * ow + oy * ow + ox] = acc;
             }
@@ -153,11 +156,61 @@ macro_rules! conv_test {
 conv_test!(conv_3_32_k3s2_224x160, 3, 32, 160, 224, 3, 2, 1);
 conv_test!(conv_32_64_k3s2_112x80, 32, 64, 80, 112, 3, 2, 1);
 conv_test!(conv_64_64_k3_56x40, 64, 64, 40, 56, 3, 1, 1);
+conv_test!(conv_32_64_k3_tanh_28x20, 32, 64, 20, 28, 3, 1, ConvParams::TANH);
 conv_test!(conv_128_64_k1_28x20, 128, 64, 20, 28, 1, 1, 1);
 conv_test!(conv_256_256_k3_14x10, 256, 256, 10, 14, 3, 1, 1);
 conv_test!(conv_512_30_k1_7x5_linear, 512, 30, 5, 7, 1, 1, 0);
 conv_test!(conv_ragged_5x7_cout30, 19, 30, 5, 7, 3, 1, 1);
 conv_test!(conv_ragged_k3s2_odd, 7, 41, 9, 13, 3, 2, 1);
+
+#[test]
+fn logistic_c8_hw140() {
+    let (_dev, module) = runner::load().unwrap();
+    let x = signed(8 * 140, 91);
+    let want: Vec<f32> = x.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect();
+    let dx = DeviceBuffer::from_slice(&x).unwrap();
+    let mut dy = DeviceBuffer::zeroed(x.len()).unwrap();
+    launch_logistic(&module, None, dx.tensor(8, 140), TensorMut::new(dy.as_mut_ptr(), 8, 140, 140)).unwrap();
+    let got = dy.copy_to_vec().unwrap();
+    let max_err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    println!("max_err={max_err:e}");
+    assert!(max_err <= 1e-6, "max_err {max_err:e}");
+}
+
+fn softmax_cpu(x: &[f32], channels: usize, plane: usize, temperature: f32) -> Vec<f32> {
+    let mut out = vec![0.0; x.len()];
+    for p in 0..plane {
+        let max = (0..channels).map(|c| x[c * plane + p] / temperature).fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = (0..channels).map(|c| (x[c * plane + p] / temperature - max).exp()).sum();
+        for c in 0..channels {
+            out[c * plane + p] = (x[c * plane + p] / temperature - max).exp() / sum;
+        }
+    }
+    out
+}
+
+fn check_softmax(channels: u32, plane: u32, temperature: f32, seed: u64) {
+    let (_dev, module) = runner::load().unwrap();
+    let x = signed(channels as usize * plane as usize, seed);
+    let want = softmax_cpu(&x, channels as usize, plane as usize, temperature);
+    let dx = DeviceBuffer::from_slice(&x).unwrap();
+    let mut dy = DeviceBuffer::zeroed(x.len()).unwrap();
+    launch_softmax_spatial(&module, None, dx.tensor(channels, plane), TensorMut::new(dy.as_mut_ptr(), channels, plane, plane), temperature).unwrap();
+    let got = dy.copy_to_vec().unwrap();
+    let max_err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    println!("max_err={max_err:e}");
+    assert!(max_err <= 1e-6, "max_err {max_err:e}");
+}
+
+#[test]
+fn softmax_spatial_c4_hw224sq() {
+    check_softmax(4, 224 * 224, 1.0, 92);
+}
+
+#[test]
+fn softmax_spatial_temperature() {
+    check_softmax(5, 33, 0.5, 93);
+}
 
 #[test]
 fn conv_all_configs() {
