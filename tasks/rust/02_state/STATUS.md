@@ -98,6 +98,7 @@ with actual-device CPU parity; head loss/backward remains host-owned. See
 uncommitted, with no `version-map.tsv` row.
 
 Latest increments:
+- v0.2.216 (`862cc1fdfd14c4e4e8b0ef5f6daf79a2ea9d8cb9`): u32 conv index limit documented and tested; tanh native vs shared measured on the real nets; Codex review of v0.2.215 recorded in `tasks/hip_tile/todo.md`.
 - v0.2.215 (`6e608169a68ce2359e8def55382f0c9f725ab70a`): maxpool, route, the conv gather index and the tanh series come from `src/lightnet-kernels-shared` on both GPU backends; gates rerun on the 680M and RTX 4060, see `tasks/hip_tile/todo.md` second pass.
 - v0.2.214 (`3d85b4dc718c3581d63f45ad592e592feb8172e6`): AMD (hip_tile) path complete for the LegoGears detector, binary and multi-class segmentation and their ONNX checks; see `tasks/hip_tile/todo.md` review.
 - v0.2.213 (`ab07cf4ff8f532946f6c16b55530c5d275899b5d`): segmentation on the AMD GPU, 10 images class agreement 1.000000, ONNX 16 variants OK.
