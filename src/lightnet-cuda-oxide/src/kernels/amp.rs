@@ -30,31 +30,15 @@ fn window_argmax_h(
     off: usize,
     fmt: u32,
 ) -> usize {
-    let y0 = (oy * stride_y) as i64 - off as i64;
-    let x0 = (ox * stride_x) as i64 - off as i64;
-    let mut best = f32::NEG_INFINITY;
-    let mut best_i = usize::MAX;
-    let mut ky = 0usize;
-    while ky < size {
-        let iy = y0 + ky as i64;
-        if iy >= 0 && iy < h as i64 {
-            let mut kx = 0usize;
-            while kx < size {
-                let ix = x0 + kx as i64;
-                if ix >= 0 && ix < w as i64 {
-                    let idx = plane + iy as usize * w + ix as usize;
-                    let v = half_bits_to_f32(x[idx], fmt);
-                    if v > best {
-                        best = v;
-                        best_i = idx;
-                    }
-                }
-                kx += 1;
-            }
-        }
-        ky += 1;
-    }
-    best_i
+    lightnet_kernels_shared::maxpool_window_argmax(
+        |k| half_bits_to_f32(x[k], fmt),
+        plane,
+        (h, w),
+        (oy, ox),
+        size,
+        (stride_x, stride_y),
+        off,
+    )
 }
 
 #[cuda_module]

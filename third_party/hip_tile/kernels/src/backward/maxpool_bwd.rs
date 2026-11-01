@@ -40,24 +40,18 @@ fn selects(shared: &SharedPool, ch: usize, iy: i32, ix: i32, oy: i32, ox: i32) -
     if oy < 0 || ox < 0 || oy >= p.oh as i32 || ox >= p.ow as i32 {
         return false;
     }
-    let off = -((p.pad / 2) as i32);
-    let mut best = f32::NEG_INFINITY;
-    let mut best_at = (i32::MIN, i32::MIN);
-    for ky in 0..p.size as i32 {
-        for kx in 0..p.size as i32 {
-            let sy = off + oy * p.stride as i32 + ky;
-            let sx = off + ox * p.stride as i32 + kx;
-            if sy < 0 || sx < 0 || sy >= p.h as i32 || sx >= p.w as i32 {
-                continue;
-            }
-            let v = unsafe { *shared.x.add(lane + sy as usize * p.w as usize + sx as usize) };
-            if v > best {
-                best = v;
-                best_at = (sy, sx);
-            }
-        }
-    }
-    best_at == (iy, ix)
+    // The window scan is shared with the cuda-oxide backward kernels (`lightnet-kernels-shared`).
+    let at = lightnet_kernels_shared::maxpool_window_argmax(
+        // SAFETY: the scan only reads taps inside this channel's `h x w` plane.
+        |k| unsafe { *shared.x.add(k) },
+        lane,
+        (p.h as usize, p.w as usize),
+        (oy as usize, ox as usize),
+        p.size as usize,
+        (p.stride as usize, p.stride as usize),
+        (p.pad / 2) as usize,
+    );
+    at == lane + iy as usize * p.w as usize + ix as usize
 }
 
 /// Input pointer plus shape, bundled so the per-element closure stays small.

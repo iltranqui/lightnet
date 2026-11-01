@@ -33,12 +33,13 @@ pub mod kernels {
         if i >= batch * per_batch {
             return;
         }
-        let b = i / per_batch;
-        let r = i % per_batch;
-        let c = r / stride;
-        let s = r % stride;
-        let from = (b * src_total + src_offset + c) * stride + s;
-        let to = (b * dst_total + dst_offset + c) * stride + s;
+        let (from, to) = lightnet_kernels_shared::route_copy_index(
+            i,
+            channels,
+            stride,
+            (src_total, src_offset),
+            (dst_total, dst_offset),
+        );
         // SAFETY: each thread writes a distinct `to`; the host checks that
         // `dst` covers `batch * dst_total * stride` elements.
         unsafe {

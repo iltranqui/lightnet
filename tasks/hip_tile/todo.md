@@ -6,6 +6,7 @@
 - [Decisions](#decisions)
 - [Items](#items)
 - [Review](#review)
+- [Second pass: shared maxpool, route, tanh and conv gather](#second-pass-shared-maxpool-route-tanh-and-conv-gather)
 
 ## Goal
 
@@ -77,6 +78,8 @@ Written once in `src/lightnet-kernels-shared`: bias add, leaky, tanh, logistic, 
 
 ### Exceptions (kept per backend, with the reason)
 
+Superseded for maxpool, route, tanh and the conv gather index by the second pass below.
+
 - conv and GEMM: AMD uses hip_tile tile kernels (no matrix cores on RDNA2, FMA), NVIDIA keeps the tuned oxide kernels.
 - maxpool: separate kernels per backend (window logic not moved; not an elementwise op).
 - route: a layout copy on both, no math to share.
@@ -91,3 +94,56 @@ Written once in `src/lightnet-kernels-shared`: bias add, leaky, tanh, logistic, 
 - NVIDIA side: `oxide_parity` 11, `oxide_pool_parity` 9, `oxide_shared_ops` 2 passed. The full oxide suite was not rerun.
 - Clippy exits 0 but reports warnings in `src/lightnet-cuda` (not touched here).
 - `bias_add` has no standalone AMD kernel in the detector path (it is fused into the conv epilogue); its AMD entry kernel exists and is tested (`shared_ops`).
+
+## Second pass: shared maxpool, route, tanh and conv gather
+
+Goal: the ops the first pass kept per backend take their bodies from `src/lightnet-kernels-shared`, or have a justified exception. Versions v0.2.215 and up.
+
+### Now in the shared crate
+
+| Op | Shared function | cuda-oxide caller | hip_tile caller |
+|---|---|---|---|
+| maxpool forward | `maxpool_window_max(load, plane, (h, w), (oy, ox), size, (stride_x, stride_y), off)` | `maxpool_forward` (`pool.rs`) | `maxpool` (`yolo/maxpool.rs`) |
+| maxpool backward (argmax) | `maxpool_window_argmax(load, ...)` (same scan, returns the flat index of the first max) | `window_argmax`, `window_argmax_h` (f16) | `maxpool_bwd::selects` |
+| route copy | `route_copy_index(i, channels, stride, (src_total, src_off), (dst_total, dst_off))` | `route_copy` (`route.rs`) | `route_copy` entry (`shared_ops.rs`), launched by `hip_darknet` through `launch_route_copy` |
+| tanh | `DeviceMath::tanh` default: exp-based, now with an odd series below `|x| < 0.1` | `OxideMath` still overrides it with native `tanh` (kept, see below) | `AmdMath` uses the default |
+| conv gather | `conv_tap(kidx, k)` and `conv_input_offset(pos, ow, (ky, kx), strides, dilation, pad, (h, w))` | `sgemm_conv_implicit`, `im2col`, `im2col_fp8` | `conv_body` (`yolo/conv.rs`) |
+
+Memory access goes through a closure (`maxpool_window_max`) or an index, so the shared code has no backend type. The conv index math is `u32`: it runs per element inside the GEMM loops, where 64-bit division is slow on both GPUs.
+
+### Tanh decision
+
+Measured on the NVIDIA GPU over 1,048,576 inputs in [-12, 12] (`tanh_native_vs_exp_based` in `oxide_shared_ops.rs`):
+
+| | max abs vs f64 | max rel vs f64 |
+|---|---|---|
+| native `tanh` (oxide override) | 9.84e-8 | 1.83e-7 |
+| shared exp-based, before the series | 1.47e-7 | 7.76e-2 |
+| shared exp-based, with the series | 1.27e-7 | 1.13e-6 |
+| native vs shared (with series) | 1.19e-7 | 1.15e-6 |
+
+`1 - 2/(exp(2x)+1)` cancels near zero, which gave the 7.8% relative error; the series fixes it for both backends. The override is kept: with it in place the oxide forward matches ONNX Runtime on both segmentation nets, 16/16 variants OK (fp32 max abs 5.96e-7 binary, 8.3e-7 multi; fp16 7.6e-4, 2.2e-3), and the AMD path, which uses the shared default, passes the same gates. The two tanh bodies differ by at most 1.2e-7 absolute.
+
+### Exceptions that stay, and why
+
+- **conv and GEMM tile structure.** hip_tile writes the GEMM as `mma` over `Tile<f32, BM, BN>` values with whole-tile loads and a block-wide LDS layout chosen by the compiler. The oxide kernels are per-thread SIMT with explicit `cp.async` double buffering, 4x4 register blocking and `__syncthreads`. They have no common source form without a tile abstraction on top of SIMT (or the reverse), which the goal rules out. Shared: gather index, leaky, tanh, bias (the epilogue bodies). Not shared: the loop nest, the tiling and the memory staging.
+- **maxpool backward.** The argmax is shared (`maxpool_window_argmax`): oxide `window_argmax` and its f16 twin `window_argmax_h`, and hip_tile `maxpool_bwd::selects`, all call it. What stays per backend is the gather loop around it (oxide: one thread per input element; hip_tile: a `Tile` over channels x positions with `store_tile_add`).
+- **Native tanh.** See the decision above.
+- **Route views on AMD.** The detector and segmentation path copies every route source with `route_copy`. The training executor (`train/gpu.rs`) still uses `launch_concat_batched`, which is a batched tile copy; it is out of this goal.
+- **Argument order of kernels.** Each backend keeps its own launch signature; only the index and element bodies are shared.
+
+### Gates after the second pass
+
+All rows were rerun in one chain on this machine after the last code change (`final_gates.sh`, scratchpad).
+
+| Gate | Result |
+|---|---|
+| Shared crate host tests | 19 passed (maxpool value 6 and argmax 2, route 2, conv gather 2, tanh relative accuracy 1, plus the first-pass ones); clippy clean |
+| hip_tile workspace tests (release) | exit 0, 33 test binaries ok (includes `maxpool_bwd` and the gradient tests) |
+| AMD detector, 10 images | 38/38 matched, 0 class errors, GPU == CPU detections; 38 layers, per-layer max abs 1.91e-5, max rel 1.69e-4 |
+| AMD segmentation vs lightnet CPU, 5 images per net | class agreement 1.000000 on all 10; head max abs <= 9.54e-7 |
+| AMD ONNX, segmentation (`onnx_match_seg.sh both --variants --amd`, 1 image, 8 variants x 2 nets) | 16/16 OK, agreement 100%; fp32 max abs 7.15e-7 (binary), 9.54e-7 (multi); fp16 7.6e-4, 2.2e-3 |
+| AMD ONNX, detector (`onnx_match.sh --amd`, FP32) | yolo_0 and yolo_1 max abs 2.29e-5 (rel to max 1.03e-6), OK |
+| NVIDIA forward vs ONNX Runtime (`onnx_match_seg.sh both --variants`, release oxide binary rebuilt with the shared kernels, native tanh kept) | 16/16 OK, agreement 100%; fp32 max abs 5.96e-7 (binary), 8.35e-7 (multi); fp16 7.6e-4, 2.2e-3 |
+| Oxide `oxide_parity` / `oxide_pool_parity` / `oxide_shared_ops` / `oxide_amp` | 11 / 9 / 5 / 22 passed (`oxide_amp` covers the f16 argmax) |
+| `cargo xtask check`, `clippy`, `tools/check_module_layers.sh` | exit 0 (clippy warnings remain in untouched `lightnet-cli`, `lightnet-cuda`, `lightnet-layers`) |

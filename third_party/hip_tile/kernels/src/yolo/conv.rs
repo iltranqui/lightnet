@@ -85,7 +85,6 @@ fn conv_body<const BM: usize, const BN: usize>(
     let (bi, bj) = block_id();
     let (r0, c0) = (bi * BM as u32, bj * BN as u32);
     let k_total = w.cols();
-    let kk = p.k * p.k;
     let (xp, ld) = (x.ptr(), x.ld() as usize);
     let n_out = p.oh * p.ow;
     let mut acc = Tile::<f32, BM, BN>::zeros();
@@ -98,18 +97,20 @@ fn conv_body<const BM: usize, const BN: usize>(
             if kidx >= k_total || pos >= n_out {
                 return 0.0;
             }
-            let ci = kidx / kk;
-            let rem = kidx - ci * kk;
-            let ky = rem / p.k;
-            let kx = rem - ky * p.k;
-            let oy = pos / p.ow;
-            let ox = pos - oy * p.ow;
-            let iy = (oy * p.stride + ky) as i32 - p.pad as i32;
-            let ix = (ox * p.stride + kx) as i32 - p.pad as i32;
-            if (iy as u32) < p.h && (ix as u32) < p.w {
-                unsafe { *xp.add(ci as usize * ld + (iy as u32 * p.w + ix as u32) as usize) }
-            } else {
-                0.0
+            // Gather index shared with the cuda-oxide im2col / implicit-GEMM kernels.
+            let (ci, ky, kx) = lightnet_kernels_shared::conv_tap(kidx, p.k);
+            match lightnet_kernels_shared::conv_input_offset(
+                pos,
+                p.ow,
+                (ky, kx),
+                (p.stride, p.stride),
+                1,
+                p.pad,
+                (p.h, p.w),
+            ) {
+                // SAFETY: `ci < cin` and the offset is inside the `h x w` plane.
+                Some(off) => unsafe { *xp.add(ci as usize * ld + off as usize) },
+                None => 0.0,
             }
         });
         acc = mma(&ta, &tb, acc);

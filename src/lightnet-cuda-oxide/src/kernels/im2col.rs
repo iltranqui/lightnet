@@ -43,26 +43,27 @@ pub mod kernels {
         let row = thread::blockIdx_x() as usize;
         let image = row / rows_per_image;
         let r = row % rows_per_image;
-        let c = r / kk;
-        let rem = r % kk;
-        let ky = rem / ksize;
-        let kx = rem % ksize;
+        // Row decode once per block; per element only the shared position -> input offset.
+        let (c, ky, kx) = lightnet_kernels_shared::conv_tap(r as u32, ksize as u32);
+        let c = c as usize;
         let ohw = out_h * out_w;
         let x_img = x_base + image * channels * h * w;
-        let kyd = (ky * dilation) as i64 - padding as i64;
-        let kxd = (kx * dilation) as i64 - padding as i64;
         let col_base = row * ohw;
         let tid = thread::threadIdx_x() as usize;
         let step = thread::blockDim_x() as usize;
         let mut p = tid;
         while p < ohw {
-            let oy = p / out_w;
-            let ox = p % out_w;
-            let iy = (oy * stride_y) as i64 + kyd;
-            let ix = (ox * stride_x) as i64 + kxd;
             let mut v = 0.0f32;
-            if iy >= 0 && iy < h as i64 && ix >= 0 && ix < w as i64 {
-                v = x[x_img + (c * h + iy as usize) * w + ix as usize];
+            if let Some(off) = lightnet_kernels_shared::conv_input_offset(
+                p as u32,
+                out_w as u32,
+                (ky, kx),
+                (stride_x as u32, stride_y as u32),
+                dilation as u32,
+                padding as u32,
+                (h as u32, w as u32),
+            ) {
+                v = x[x_img + c * h * w + off as usize];
             }
             // SAFETY: one thread per (row, p); `col_base + p < images * col_len`.
             unsafe {
@@ -103,14 +104,10 @@ pub mod kernels {
         let row = thread::blockIdx_x() as usize;
         let image = row / rows_per_image;
         let r = row % rows_per_image;
-        let c = r / kk;
-        let rem = r % kk;
-        let ky = rem / ksize;
-        let kx = rem % ksize;
+        let (c, ky, kx) = lightnet_kernels_shared::conv_tap(r as u32, ksize as u32);
+        let c = c as usize;
         let ohw = out_h * out_w;
         let x_img = x_base + image * channels * h * w;
-        let kyd = (ky * dilation) as i64 - padding as i64;
-        let kxd = (kx * dilation) as i64 - padding as i64;
         let col_base = row * ohw;
         let tid = thread::threadIdx_x() as usize;
         let step = thread::blockDim_x() as usize;
@@ -123,13 +120,17 @@ pub mod kernels {
         }
         let mut p = tid;
         while p < ohw {
-            let oy = p / out_w;
-            let ox = p % out_w;
-            let iy = (oy * stride_y) as i64 + kyd;
-            let ix = (ox * stride_x) as i64 + kxd;
             let mut v = 0.0f32;
-            if iy >= 0 && iy < h as i64 && ix >= 0 && ix < w as i64 {
-                v = x[x_img + (c * h + iy as usize) * w + ix as usize];
+            if let Some(off) = lightnet_kernels_shared::conv_input_offset(
+                p as u32,
+                out_w as u32,
+                (ky, kx),
+                (stride_x as u32, stride_y as u32),
+                dilation as u32,
+                padding as u32,
+                (h as u32, w as u32),
+            ) {
+                v = x[x_img + c * h * w + off as usize];
             }
             // SAFETY: one thread per (row, p); `col_base + p < images * col_len`.
             unsafe {

@@ -49,27 +49,23 @@ fn maxpool(x: Tensor<f32>, y: TensorMut<f32>, p: PoolParams) {
     let (r0, c0) = (bi * TILE_M as u32, bj * TILE_N as u32);
     let (xp, ld) = (x.ptr(), x.ld() as usize);
     let n_out = p.oh * p.ow;
-    let off = (p.pad / 2) as i32;
+    let off = (p.pad / 2) as usize;
     let t = Tile::<f32, TILE_M, TILE_N>::from_fn(|r, c| {
         let pos = c0 + c as u32;
         let ch = r0 + r as u32;
         if ch < y.rows() && pos < n_out {
-            let (oy, ox) = (pos / p.ow, pos % p.ow);
-            let (y0, x0) = ((oy * p.stride) as i32 - off, (ox * p.stride) as i32 - off);
             let row = unsafe { xp.add(ch as usize * ld) };
-            let mut m = f32::NEG_INFINITY;
-            for ky in 0..p.size as i32 {
-                for kx in 0..p.size as i32 {
-                    let (iy, ix) = (y0 + ky, x0 + kx);
-                    if (iy as u32) < p.h && (ix as u32) < p.w {
-                        let v = unsafe { *row.add((iy as u32 * p.w + ix as u32) as usize) };
-                        if v > m {
-                            m = v;
-                        }
-                    }
-                }
-            }
-            m
+            // Window scan shared with the cuda-oxide kernel (`lightnet-kernels-shared`).
+            lightnet_kernels_shared::maxpool_window_max(
+                // SAFETY: the shared scan only asks for taps inside the `h x w` plane of `row`.
+                |k| unsafe { *row.add(k) },
+                0,
+                (p.h as usize, p.w as usize),
+                ((pos / p.ow) as usize, (pos % p.ow) as usize),
+                p.size as usize,
+                (p.stride as usize, p.stride as usize),
+                off,
+            )
         } else {
             0.0
         }

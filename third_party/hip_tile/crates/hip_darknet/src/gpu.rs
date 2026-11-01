@@ -1,15 +1,15 @@
 //! GPU executor: runs a [`Model`] on the AMD GPU with the hip-tile YOLO kernels.
 //!
 //! Weights are uploaded once; every layer output has its own preallocated device buffer.
-//! Route group slices are zero-copy views, concatenation uses `launch_concat`; `[yolo]` layers
-//! alias their input. All launches go on one stream, with one sync at the end of a forward.
+//! Route copies each source (or group slice of it) with `launch_route_copy`, whose index math is
+//! the one the cuda-oxide route kernel uses; `[yolo]` layers alias their input. All launches go on one stream, with one sync at the end of a forward.
 
 use crate::error::{Error, Result};
 use crate::model::{LayerKind, Model};
 use crate::cfg::Activation;
 use hip_rt::{Device, DeviceBuffer, Module, Stream};
 use hip_tile::{Tensor, TensorMut};
-use kernels::yolo::concat::launch_concat;
+use kernels::shared_ops::launch_route_copy;
 use kernels::yolo::conv::{ConvParams, launch_conv};
 use kernels::yolo::maxpool::{PoolParams, launch_maxpool};
 use kernels::yolo::head::{launch_logistic, launch_softmax_spatial};
@@ -145,12 +145,22 @@ impl<'m> GpuModel<'m> {
                     hip(launch_softmax_spatial(md, st, Tensor::new(prev, ins.c as u32, ihw, ihw), y, cfg.temperature))?;
                 }
                 LayerKind::Route { sources, groups, group_id } => {
+                    // One copy per source through the index shared with the cuda-oxide route kernel:
+                    // a group is a nonzero source channel offset into the full source layer.
                     let mut ch0 = 0usize;
                     for &s in sources {
-                        let c = m.layers[s].out_shape.c / groups;
-                        let src = unsafe { self.out_ptr(s).add(group_id * c * ohw as usize) };
-                        let dst = TensorMut::new(unsafe { ob.as_ptr().cast_mut().add(ch0 * ohw as usize) }, c as u32, ohw, ohw);
-                        hip(launch_concat(md, st, Tensor::new(src, c as u32, ohw, ohw), dst))?;
+                        let src_total = m.layers[s].out_shape.c;
+                        let c = src_total / groups;
+                        let src = Tensor::new(self.out_ptr(s), src_total as u32, ohw, ohw);
+                        hip(launch_route_copy(
+                            md,
+                            st,
+                            src,
+                            y,
+                            (c as u32, ohw),
+                            (src_total as u32, (group_id * c) as u32),
+                            (outs.c as u32, ch0 as u32),
+                        ))?;
                         ch0 += c;
                     }
                 }

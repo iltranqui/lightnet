@@ -27,31 +27,16 @@ pub fn window_argmax(
     stride_y: usize,
     off: usize,
 ) -> usize {
-    let y0 = (oy * stride_y) as i64 - off as i64;
-    let x0 = (ox * stride_x) as i64 - off as i64;
-    let mut best = f32::NEG_INFINITY;
-    let mut best_i = usize::MAX;
-    let mut ky = 0usize;
-    while ky < size {
-        let iy = y0 + ky as i64;
-        if iy >= 0 && iy < h as i64 {
-            let mut kx = 0usize;
-            while kx < size {
-                let ix = x0 + kx as i64;
-                if ix >= 0 && ix < w as i64 {
-                    let idx = plane + iy as usize * w + ix as usize;
-                    let v = x[idx];
-                    if v > best {
-                        best = v;
-                        best_i = idx;
-                    }
-                }
-                kx += 1;
-            }
-        }
-        ky += 1;
-    }
-    best_i
+    // The scan lives in `lightnet-kernels-shared`, used by the AMD kernels too.
+    lightnet_kernels_shared::maxpool_window_argmax(
+        |k| x[k],
+        plane,
+        (h, w),
+        (oy, ox),
+        size,
+        (stride_x, stride_y),
+        off,
+    )
 }
 
 /// Number of in-image taps of a 1-D window starting at `o * stride - off`.
@@ -179,24 +164,18 @@ pub mod kernels {
         let oplane = out_h * out_w;
         let bc = i / oplane;
         let r = i % oplane;
-        let best = window_argmax(
-            x,
+        // Window scan shared with the AMD hip_tile kernel (`lightnet-kernels-shared`).
+        let best = lightnet_kernels_shared::maxpool_window_max(
+            |k| x[k],
             bc * h * w,
-            h,
-            w,
-            r / out_w,
-            r % out_w,
+            (h, w),
+            (r / out_w, r % out_w),
             size,
-            stride_x,
-            stride_y,
+            (stride_x, stride_y),
             off,
         );
         if let Some(o) = out.get_mut(idx) {
-            *o = if best == usize::MAX {
-                f32::NEG_INFINITY
-            } else {
-                x[best]
-            };
+            *o = best;
         }
     }
 

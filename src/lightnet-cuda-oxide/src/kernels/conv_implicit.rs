@@ -85,7 +85,6 @@ pub mod kernels {
         let image = inst / groups;
         let x_img = x_base + image * channels * in_h * in_w;
         let cbase = group * cpg;
-        let kk = ksize * ksize;
 
         let vec_a = lda % 4 == 0 && a_off % 4 == 0;
 
@@ -125,16 +124,18 @@ pub mod kernels {
                     let mut src = 0usize;
                     let mut ok = false;
                     if gk < kend && gn < n {
-                        let cl = gk / kk;
-                        let rem = gk % kk;
-                        let ky = rem / ksize;
-                        let kx = rem % ksize;
-                        let oy = gn / out_w;
-                        let ox = gn % out_w;
-                        let iy = (oy * stride_y + ky * dilation) as i64 - padding as i64;
-                        let ix = (ox * stride_x + kx * dilation) as i64 - padding as i64;
-                        if iy >= 0 && iy < in_h as i64 && ix >= 0 && ix < in_w as i64 {
-                            src = x_img + ((cbase + cl) * in_h + iy as usize) * in_w + ix as usize;
+                        // Gather index shared with the AMD hip_tile conv (`lightnet-kernels-shared`).
+                        let (cl, ky, kx) = lightnet_kernels_shared::conv_tap(gk as u32, ksize as u32);
+                        if let Some(off) = lightnet_kernels_shared::conv_input_offset(
+                            gn as u32,
+                            out_w as u32,
+                            (ky, kx),
+                            (stride_x as u32, stride_y as u32),
+                            dilation as u32,
+                            padding as u32,
+                            (in_h as u32, in_w as u32),
+                        ) {
+                            src = x_img + (cbase + cl as usize) * in_h * in_w + off as usize;
                             ok = true;
                         }
                     }
