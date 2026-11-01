@@ -411,9 +411,9 @@ A separate GPU path, `third_party/hip_tile` (`hip_darknet`, Radeon 680M / gfx103
 
 | Layer | AMD status |
 |---|---|
-| convolutional (linear, leaky, tanh) | native, tile implicit GEMM, fused bias and activation; no batch norm on the segmentation nets |
-| maxpool | native |
-| route | native (channel-slice copy, no math) |
+| convolutional (linear, leaky, tanh) | native, tile implicit GEMM, fused bias and activation; gather index and epilogue bodies shared with oxide (v0.2.215); no batch norm on the segmentation nets |
+| maxpool | native, window scan shared with oxide (v0.2.215) |
+| route | native (`route_copy`, index shared with oxide, v0.2.215) |
 | upsample | native, index map shared with oxide |
 | yolo | native forward |
 | logistic, softmax (`spatial=1`) | native, bodies shared with oxide |
