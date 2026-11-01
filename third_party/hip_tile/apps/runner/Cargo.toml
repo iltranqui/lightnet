@@ -1,0 +1,16 @@
+[package]
+name = "runner"
+description = "CLI and tests that run the hip-tile kernels on the GPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+hip-rt = { workspace = true, features = ["rocblas"] }
+hip-tile.workspace = true
+kernels.workspace = true
+lightnet-kernels-shared = { path = "../../../../src/lightnet-kernels-shared" }
+
+[build-dependencies]
+hip-tile-build.workspace = true

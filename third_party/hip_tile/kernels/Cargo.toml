@@ -1,0 +1,17 @@
+[package]
+name = "kernels"
+description = "hip-tile device kernels and their host launchers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+hip-tile.workspace = true
+hip-tile-macros.workspace = true
+lightnet-kernels-shared = { path = "../../../src/lightnet-kernels-shared" }
+
+[target.'cfg(not(target_arch = "amdgpu"))'.dependencies]
+hip-rt.workspace = true

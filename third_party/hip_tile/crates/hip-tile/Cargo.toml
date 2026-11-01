@@ -1,0 +1,8 @@
+[package]
+name = "hip-tile"
+description = "cuTile-style tile programming for AMD GPUs, in pure Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

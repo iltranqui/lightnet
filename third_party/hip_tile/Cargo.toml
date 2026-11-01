@@ -1,0 +1,29 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/hip-sys",
+    "crates/hip-rt",
+    "crates/hip-tile",
+    "crates/hip-tile-macros",
+    "crates/hip-tile-build",
+    "crates/hip_darknet",
+    "kernels",
+    "apps/runner",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+hip-sys = { path = "crates/hip-sys" }
+hip-rt = { path = "crates/hip-rt" }
+hip-tile = { path = "crates/hip-tile" }
+hip-tile-macros = { path = "crates/hip-tile-macros" }
+hip-tile-build = { path = "crates/hip-tile-build" }
+kernels = { path = "kernels" }
+
+[profile.release]
+codegen-units = 1

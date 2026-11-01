@@ -1,0 +1,13 @@
+[package]
+name = "lightnet-kernels-shared"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Per-element kernel bodies shared by the cuda-oxide and hip_tile backends"
+
+[lib]
+path = "src/lib.rs"
+
+# Not a member of the lightnet workspace: it is built as a dependency of the
+# cuda-oxide crate and of the hip_tile kernels, each with its own toolchain.
+[workspace]

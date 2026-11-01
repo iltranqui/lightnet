@@ -1,0 +1,22 @@
+[package]
+name = "hip_darknet"
+description = "Pure-Rust Darknet YOLO model loader, CPU reference forward and detection decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+thiserror = "2"
+hip-sys = { workspace = true, optional = true }
+hip-rt = { workspace = true, optional = true }
+hip-tile = { workspace = true, optional = true }
+kernels = { workspace = true, optional = true }
+
+[build-dependencies]
+hip-tile-build = { workspace = true, optional = true }
+
+[features]
+default = ["gpu"]
+# GPU executor (`--gpu`): needs ROCm and the amdgpu-capable nightly toolchain.
+gpu = ["dep:hip-sys", "dep:hip-rt", "dep:hip-tile", "dep:kernels", "dep:hip-tile-build"]

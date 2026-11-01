@@ -10,6 +10,8 @@ path = "src/lib.rs"
 
 [dependencies]
 lightnet-cuda = { path = "../lightnet-cuda" }
+# Per-element kernel bodies shared with the hip_tile (AMD) backend.
+lightnet-kernels-shared = { path = "../lightnet-kernels-shared" }
 # Device-side intrinsics (thread indexing, slices, barriers).
 cuda-device = { path = "../../third_party/cuda-oxide/cuda-oxide/crates/cuda-device" }
 # Host-side launch glue used by `#[cuda_module]`.

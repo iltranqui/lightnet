@@ -1,0 +1,12 @@
+[package]
+name = "hip-sys"
+description = "Hand-written FFI bindings to the HIP runtime (and optionally rocBLAS)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[features]
+rocblas = []
+
+[dependencies]

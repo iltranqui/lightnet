@@ -28,6 +28,7 @@ pub mod local;
 pub mod muon;
 pub mod optim;
 pub mod pool;
+pub mod shared_ops;
 pub mod quant_fp4;
 pub mod resample;
 pub mod route;

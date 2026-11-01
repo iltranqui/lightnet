@@ -1,0 +1,13 @@
+[package]
+name = "hip-rt"
+description = "Safe RAII host API over the HIP runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+rocblas = ["hip-sys/rocblas"]
+
+[dependencies]
+hip-sys.workspace = true
+hip-tile.workspace = true
