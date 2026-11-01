@@ -43,6 +43,8 @@ def main() -> int:
     parser.add_argument("names", type=Path)
     parser.add_argument("image", type=Path)
     parser.add_argument("--binary", default="target/release/lightnet-rs")
+    parser.add_argument("--amd-binary", default=None,
+                        help="hip_darknet binary: use the AMD GPU (hip_tile) forward as the reference")
     parser.add_argument("--no-fuse", action="store_true")
     parser.add_argument("--tol", type=float, default=1e-4)
     args = parser.parse_args()
@@ -56,22 +58,31 @@ def main() -> int:
             cmd.append("--no-fuse")
         subprocess.run(cmd, check=True)
         env = dict(os.environ, LIGHTNET_LAYER_DUMP_DIR=str(dump))
-        subprocess.run(
-            [
-                args.binary,
-                "detect-image",
-                str(args.cfg),
-                str(args.weights),
-                str(args.names),
-                str(args.image),
-                "0.25",
-                "0.45",
-                "resize-exact",
-            ],
-            check=True,
-            env=env,
-            stdout=subprocess.DEVNULL,
-        )
+        if args.amd_binary:
+            # Reference forward on the AMD GPU (hip_tile): exact resize, every layer dumped.
+            subprocess.run(
+                [args.amd_binary, "segment", "--cfg", str(args.cfg), "--weights", str(args.weights),
+                 "--dump", str(dump), str(args.image)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.run(
+                [
+                    args.binary,
+                    "detect-image",
+                    str(args.cfg),
+                    str(args.weights),
+                    str(args.names),
+                    str(args.image),
+                    "0.25",
+                    "0.45",
+                    "resize-exact",
+                ],
+                check=True,
+                env=env,
+                stdout=subprocess.DEVNULL,
+            )
 
         width, height = net_size(args.cfg)
         bgr = cv2.imread(str(args.image), cv2.IMREAD_COLOR)

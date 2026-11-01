@@ -348,6 +348,12 @@ fn run_segment(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let img = Image::load(&image)?.resize_linear_exact(model.net.width, model.net.height);
     let gpu = hip_darknet::gpu::GpuModel::new(&model)?;
     let outputs = gpu.forward_all(&img.data)?;
+    // Latency: the forward is warm after the call above; time 20 more, last layer read back.
+    let timer = std::time::Instant::now();
+    for _ in 0..20 {
+        gpu.forward(&img.data)?;
+    }
+    println!("gpu forward: {:.2} ms (mean of 20, {})", timer.elapsed().as_secs_f64() * 1e3 / 20.0, image);
 
     if let Some(dir) = &dump {
         std::fs::create_dir_all(dir)?;
@@ -390,7 +396,12 @@ fn run_segment(argv: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             };
             let s = layer.out_shape;
             println!("{i:>5} {kind:<8} {:>14} {:>10.2e} {:>10.2e}", format!("{}x{}x{}", s.c, s.h, s.w), max_abs, max_rel);
-            if i + 1 == outputs.len() {
+            // Class agreement only applies to segmentation heads (a detector ends in a YOLO layer).
+            let is_seg_head = matches!(
+                layer.kind,
+                hip_darknet::LayerKind::Logistic | hip_darknet::LayerKind::Softmax(_)
+            );
+            if i + 1 == outputs.len() && is_seg_head {
                 let plane = s.h * s.w;
                 let agree = if s.c == 1 {
                     got.iter().zip(&reference).filter(|(a, b)| (**a > 0.5) == (**b > 0.5)).count()
