@@ -32,9 +32,13 @@ fn upsample(x: Tensor<f32>, y: TensorMut<f32>, p: UpsampleParams) {
         let pos = c0 + c as u32;
         let ch = r0 + r as u32;
         if ch < y.rows() && pos < n_out {
-            let (oy, ox) = (pos / p.ow, pos % p.ow);
-            let i = (oy / p.stride) * p.w + ox / p.stride;
-            unsafe { *xp.add(ch as usize * ld + i as usize) }
+            let i = lightnet_kernels_shared::upsample_src_index(
+                pos as usize,
+                p.w as usize,
+                p.ow as usize,
+                p.stride as usize,
+            );
+            unsafe { *xp.add(ch as usize * ld + i) }
         } else {
             0.0
         }

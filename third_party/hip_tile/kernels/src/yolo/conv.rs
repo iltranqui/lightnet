@@ -125,7 +125,7 @@ fn conv_body<const BM: usize, const BN: usize>(
         }
     });
     let leaky = p.act == ConvParams::LEAKY;
-    let out = (acc + bt).map(|v| if leaky && v < 0.0 { 0.1 * v } else { v });
+    let out = (acc + bt).map(|v| if leaky { lightnet_kernels_shared::leaky_elem(v) } else { v });
     y.store_tile(r0, c0, &out);
 }
 

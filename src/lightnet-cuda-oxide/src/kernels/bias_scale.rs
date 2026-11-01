@@ -24,7 +24,7 @@ pub mod kernels {
         let idx = thread::index_1d();
         let i = idx.get();
         if let Some(o) = out.get_mut(idx) {
-            *o = x[i] + bias[(i / channel_stride) % channels];
+            *o = lightnet_kernels_shared::bias_add_elem(i, x, bias, channel_stride, channels);
         }
     }
 
@@ -41,7 +41,7 @@ pub mod kernels {
         let idx = thread::index_1d();
         let i = idx.get();
         if let Some(o) = out.get_mut(idx) {
-            let v = x[i] + bias[(i / channel_stride) % channels];
+            let v = lightnet_kernels_shared::bias_add_elem(i, x, bias, channel_stride, channels);
             *o = crate::kernels::activations::activate(kind, v);
         }
     }

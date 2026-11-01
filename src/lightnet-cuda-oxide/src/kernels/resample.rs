@@ -113,10 +113,9 @@ pub mod kernels {
         let oplane = out_h * out_w;
         let bc = i / oplane;
         let r = i % oplane;
-        let iy = (r / out_w) / stride;
-        let ix = (r % out_w) / stride;
+        let src = lightnet_kernels_shared::upsample_src_index(r, in_w, out_w, stride);
         if let Some(o) = out.get_mut(idx) {
-            *o = scale * x[bc * in_h * in_w + iy * in_w + ix];
+            *o = scale * x[bc * in_h * in_w + src];
         }
     }
 

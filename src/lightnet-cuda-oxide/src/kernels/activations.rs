@@ -31,7 +31,7 @@ pub fn activate(kind: u32, x: f32) -> f32 {
     } else if kind == 2 {
         x.max(0.0)
     } else if kind == 3 {
-        if x > 0.0 { x } else { 0.1 * x }
+        lightnet_kernels_shared::leaky_elem(x)
     } else if kind == 4 {
         x * (1.0 + x.exp()).ln().tanh()
     } else if kind == 5 {

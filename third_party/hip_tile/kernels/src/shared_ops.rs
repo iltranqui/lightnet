@@ -4,9 +4,11 @@
 //! result. The cuda-oxide backend has the same entries in
 //! `src/lightnet-cuda-oxide/src/kernels/shared_ops.rs`.
 
+#[cfg(target_arch = "amdgpu")]
 use core::slice::from_raw_parts;
 use hip_tile::prelude::*;
 use hip_tile_macros::kernel;
+#[cfg(target_arch = "amdgpu")]
 use lightnet_kernels_shared as shared;
 
 /// `out[i] = x[i] + bias[(i / spatial) % channels]` over `x.cols()` elements.
