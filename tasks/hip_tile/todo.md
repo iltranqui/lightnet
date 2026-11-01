@@ -122,6 +122,16 @@ Measured on the NVIDIA GPU over 1,048,576 inputs in [-12, 12] (`tanh_native_vs_e
 | shared exp-based, with the series | 1.27e-7 | 1.13e-6 |
 | native vs shared (with series) | 1.19e-7 | 1.15e-6 |
 
+On the real nets (22 tanh convolutions in each of `semantic_binary` and `semantic_multi`, 5 test images each, every layer's post-activation output compared; oxide uses native tanh, AMD the shared default, CPU libm `tanhf`):
+
+| Pair | worst max abs over 10 runs | worst max rel-to-max |
+|---|---|---|
+| oxide (native) vs AMD (shared) | 2.00e-6 | 5.71e-6 |
+| oxide (native) vs CPU | 2.74e-6 | 5.28e-6 |
+| AMD (shared) vs CPU | 2.14e-6 | 4.80e-6 |
+
+The native-vs-shared gap is no larger than either backend's gap to the CPU, so the choice of tanh body is below the accumulated convolution rounding. This compares layer outputs, not the isolated tanh inputs (the dumps hold post-activation values only).
+
 `1 - 2/(exp(2x)+1)` cancels near zero, which gave the 7.8% relative error; the series fixes it for both backends. The override is kept: with it in place the oxide forward matches ONNX Runtime on both segmentation nets, 16/16 variants OK (fp32 max abs 5.96e-7 binary, 8.3e-7 multi; fp16 7.6e-4, 2.2e-3), and the AMD path, which uses the shared default, passes the same gates. The two tanh bodies differ by at most 1.2e-7 absolute.
 
 ### Exceptions that stay, and why
@@ -129,7 +139,7 @@ Measured on the NVIDIA GPU over 1,048,576 inputs in [-12, 12] (`tanh_native_vs_e
 - **conv and GEMM tile structure.** hip_tile writes the GEMM as `mma` over `Tile<f32, BM, BN>` values with whole-tile loads and a block-wide LDS layout chosen by the compiler. The oxide kernels are per-thread SIMT with explicit `cp.async` double buffering, 4x4 register blocking and `__syncthreads`. They have no common source form without a tile abstraction on top of SIMT (or the reverse), which the goal rules out. Shared: gather index, leaky, tanh, bias (the epilogue bodies). Not shared: the loop nest, the tiling and the memory staging.
 - **maxpool backward.** The argmax is shared (`maxpool_window_argmax`): oxide `window_argmax` and its f16 twin `window_argmax_h`, and hip_tile `maxpool_bwd::selects`, all call it. What stays per backend is the gather loop around it (oxide: one thread per input element; hip_tile: a `Tile` over channels x positions with `store_tile_add`).
 - **Native tanh.** See the decision above.
-- **Route views on AMD.** The detector and segmentation path copies every route source with `route_copy`. The training executor (`train/gpu.rs`) still uses `launch_concat_batched`, which is a batched tile copy; it is out of this goal.
+- **Route views on AMD.** The goal asked to keep a zero-copy view path where a route is a view. There was none to keep: before this pass `hip_darknet` gave every route layer its own output buffer and copied each source into it with `launch_concat`. The only "view" was the group slice, a pointer offset `group_id * c * ohw` into the source layer; that is now the `src_offset` argument of `route_copy`, still without a separate copy of the slice. A route with one source and `groups = 1` could alias its input and skip the copy, but that changes buffer ownership in `GpuModel` (a yolo layer already aliases its input via `outs[i] = None`) and the saving is one `ohw`-sized copy per route layer, so it is left out. The training executor (`train/gpu.rs`) still uses `launch_concat_batched`, a batched tile copy; it is out of this goal.
 - **Argument order of kernels.** Each backend keeps its own launch signature; only the index and element bodies are shared.
 
 ### Gates after the second pass
@@ -147,3 +157,7 @@ All rows were rerun in one chain on this machine after the last code change (`fi
 | NVIDIA forward vs ONNX Runtime (`onnx_match_seg.sh both --variants`, release oxide binary rebuilt with the shared kernels, native tanh kept) | 16/16 OK, agreement 100%; fp32 max abs 5.96e-7 (binary), 8.35e-7 (multi); fp16 7.6e-4, 2.2e-3 |
 | Oxide `oxide_parity` / `oxide_pool_parity` / `oxide_shared_ops` / `oxide_amp` | 11 / 9 / 5 / 22 passed (`oxide_amp` covers the f16 argmax) |
 | `cargo xtask check`, `clippy`, `tools/check_module_layers.sh` | exit 0 (clippy warnings remain in untouched `lightnet-cli`, `lightnet-cuda`, `lightnet-layers`) |
+
+### Codex review of v0.2.215
+
+`gpt-6-luna`, medium effort, read-only, one bounded task over `git show 6e60816`. It found the maxpool scan, the route index, the grouped and multi-source `hip_darknet` route copy and the tanh series (sign, NaN, continuity at 0.1) equivalent to the removed code. One finding: the callers narrow `usize` conv arguments to `u32` without a range check, so an absurd dilation such as `2^32` would wrap. Fixed as documentation and a test, not a runtime check: `CONV_INDEX_LIMIT` (32,767 for plane sizes, kernel size, strides, dilation, padding) and the contract on `conv_tap` are written down, and `conv_index_math_is_exact_at_the_documented_limit` runs the extremes. The device kernels still do not validate their arguments; the hosts that launch them size layers from Darknet cfgs, orders of magnitude inside the limit.

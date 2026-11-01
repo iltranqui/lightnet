@@ -164,12 +164,21 @@ fn maxpool_window_scan<L: Fn(usize) -> f32>(
     (best, best_i)
 }
 
+/// Largest value of each plane size, kernel size, stride, dilation and padding for which the
+/// `u32` convolution index math below is exact (see the contract on [`conv_tap`]).
+pub const CONV_INDEX_LIMIT: u32 = 32_767;
+
 /// Decode a row `kidx` of the im2col matrix, `kidx = (ci * k + ky) * k + kx`, into
 /// `(ci, ky, kx)`. `ci` counts channels inside the group the GEMM works on.
 ///
 /// The convolution index math (this and [`conv_input_offset`]) is `u32` on purpose: it runs
-/// per element inside the tile GEMM loops, where 64-bit division is slow on both GPUs. Plane
-/// sizes and `C * k * k` are far below `u32::MAX`.
+/// per element inside the tile GEMM loops, where 64-bit division is slow on both GPUs.
+///
+/// Contract (the callers narrow `usize` with `as u32` and do not check): `h`, `w`, `ow`, `k`,
+/// both strides, `dilation` and `pad` are at most [`CONV_INDEX_LIMIT`], and `C * k * k` fits
+/// `u32`. Then `oy * stride + ky * dilation` stays below `2^31`, so the `i32` coordinates cannot
+/// wrap. Darknet cfgs are orders of magnitude inside this (planes up to a few thousand, strides
+/// and dilations in single digits).
 #[inline(always)]
 pub fn conv_tap(kidx: u32, k: u32) -> (u32, u32, u32) {
     let kk = k * k;
@@ -422,6 +431,20 @@ mod tests {
                 assert_eq!(acc, expected, "k{k} sx{sx} sy{sy} dil{dil} pad{pad} pos{pos}");
             }
         }
+    }
+
+    #[test]
+    fn conv_index_math_is_exact_at_the_documented_limit() {
+        // Everything at the limit: the last output position of a huge plane, last tap.
+        let n = CONV_INDEX_LIMIT;
+        // Padding n puts the window's top-left far above the plane, so the last tap lands at
+        // oy*n + (n-1)*n - n, which is still inside the u32 range and wraps to "outside".
+        assert_eq!(conv_input_offset(n * n - 1, n, (n - 1, n - 1), (n, n), n, n, (n, n)), None);
+        // Zero padding, stride 1, dilation 1 at the plane edge is exact.
+        let last = conv_input_offset(n * n - 1, n, (0, 0), (1, 1), 1, 0, (n, n));
+        assert_eq!(last, Some((n - 1) * n + (n - 1)));
+        // One more row than the plane is outside.
+        assert_eq!(conv_input_offset(0, n, (1, 0), (1, 1), n, 0, (n, n)), None);
     }
 
     #[test]
