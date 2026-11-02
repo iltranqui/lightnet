@@ -37,9 +37,9 @@ Current operator override: GPU layers first, edited directly in the main session
 
 State on 2026-10-27, from a static audit of source against the docs (no cargo run):
 
-- Latest versions: `v0.1.044` (CPU, DSConv multi-template) and `v0.2.204` (GPU, ViT resident Muon and sparse MSA). Next free numbers: `v0.1.045`, `v0.2.205`. Never reuse a number; confirm in `02_state/version-map.tsv`.
-- 25 commits sit after `v0.2.202`: layout refactors, `v0.1.043`, `v0.1.044`, the dcnv4 test fix (`a62e123`), the Swin residency WIP (`0362bea`), and `v0.2.203`/`v0.2.204`.
-- Wired in the runtime with no recorded pass: native GPU forward, backward and compact f32 for `wmhf`, `tucker_attention`, `mambavision`, `kimi_kda`, `depth_anything`, `dpt_head`. They come from WIP commits with no version. `swin` (v0.2.203) and `vit` (v0.2.204) now have recorded passes.
+- Latest versions: `v0.1.044` (CPU, DSConv multi-template) and `v0.2.216` (GPU, shared element kernels and the AMD hip_tile path). Next free numbers: `v0.1.045`, `v0.2.217`. Never reuse a number; confirm in `02_state/version-map.tsv`.
+- 67 commits sit after `v0.2.202`: layout refactors and the crate split, the GUI rework, segmentation training and export tooling, the dense box-table heads, the Devicemath/shared-kernel work and the AMD hip_tile path.
+- Wired in the runtime with no recorded pass: native GPU forward, backward and compact f32 for `wmhf`, `kimi_kda`, `depth_anything`, `dpt_head`. They come from WIP commits with no version. `swin` (v0.2.203), `vit` (v0.2.204), `tucker_attention` (v0.2.205) and `mambavision` (v0.2.206) now have recorded passes.
 - No GPU arm: `yolo_3d`, `obb_refine`, GRU training with batch norm. Host-only on GPU: `vc_attention`, `recursive_block` variants other than static `channel_shuffle`, the `clifford` network-wide backward.
 - Host suite baseline is not green: four `cfg_corpus` cases are unresolved (two OOM at about 7 GiB, two 300 s timeouts). Do not claim a green host suite.
 - Details: [02_state/STATUS.md](02_state/STATUS.md) "Audit 2026-10-27", [02_state/layer-support.md](02_state/layer-support.md).
