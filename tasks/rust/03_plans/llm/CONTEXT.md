@@ -10,7 +10,7 @@ Language-model line in `src/lightnet-lm`: Latin pilot, decoder, encoder-decoder,
 
 | File | Holds |
 |---|---|
-| [AGENTS_LLM.md](AGENTS_LLM.md) | Goal document for the lead agent; read first |
+| [ROADMAP_LLM.md](ROADMAP_LLM.md) | Goal document: state snapshot, loop, versioned roadmap todo (CPU from `v0.1.067`, GPU from `v0.2.227`), delegation and user gates |
 | [plan_llm_decoder.md](plan_llm_decoder.md) | Decoder-only model, resumable training, cached generation, Latin pilot |
 | [plan_llm_encdec.md](plan_llm_encdec.md) | Encoder and decoder stacks, encoder-decoder composition |
 | [plan_llm_recursive.md](plan_llm_recursive.md) | Weight-shared recurrent decoder |

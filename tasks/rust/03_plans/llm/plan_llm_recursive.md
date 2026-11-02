@@ -2,7 +2,7 @@
 
 > Drafted by gpt-6.1-sol (reasoning effort high), unreviewed.
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax. The repository instruction in `tasks/rust/03_plans/llm/AGENTS_LLM.md` governs delegation, including its requirement to respect the current operator override against subagents.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax. The repository instruction in `tasks/rust/03_plans/llm/ROADMAP_LLM.md` governs delegation, including its requirement to respect the current operator override against subagents.
 
 **Goal:** Add a weight-shared recurrent decoder with exact CPU reference gradients, reproducible depth sampling, correct generation caches, resident oxide execution, and optional causal adaptive depth.
 
@@ -10,7 +10,7 @@
 
 **Tech Stack:** Rust 2024, pinned `nightly-2026-08-28`, independent `lightnet-lm`, excluded `lightnet-cuda-oxide`, CPU f32 references, bf16 device working storage, and f32 masters, gradients, moments, and reductions.
 
-**Spec:** This request; `tasks/rust/03_plans/llm/plan_llm_decoder.md` Tasks 1–16, Progress, and Open issues; `tasks/rust/03_plans/llm/plan_llm_training_recipe.md` stages A/B/C and R1–R15; `tasks/rust/03_plans/llm/plan_llm_encdec.md` Tasks 17–40; `tasks/rust/03_plans/llm/AGENTS_LLM.md`; `CLAUDE.md`; `src/lightnet-lm/CONTEXT.md`; detector recurrence references identified below.
+**Spec:** This request; `tasks/rust/03_plans/llm/plan_llm_decoder.md` Tasks 1–16, Progress, and Open issues; `tasks/rust/03_plans/llm/plan_llm_training_recipe.md` stages A/B/C and R1–R15; `tasks/rust/03_plans/llm/plan_llm_encdec.md` Tasks 17–40; `tasks/rust/03_plans/llm/ROADMAP_LLM.md`; `CLAUDE.md`; `src/lightnet-lm/CONTEXT.md`; detector recurrence references identified below.
 
 This read-only draft applies `superpowers:writing-plans`. The required repository files were read directly. No files were edited, and no builds, tests, training, corpus processing, or benchmarks were run. Every added file, symbol, configuration field, and acceptance result below is a **proposal**, unless explicitly identified as inspected repository evidence.
 
@@ -139,7 +139,7 @@ lightnet/
 |   `-- lm_latin_sft.json                           [new] R11 prerequisite; extended L16
 |-- tasks/rust/
 |   |-- AGENTS.md                                   [existing] reference
-|   |-- AGENTS_LLM.md                               [existing] reference
+|   |-- ROADMAP_LLM.md                               [existing] reference
 |   |-- lessons.md                                 [existing] reference
 |   |-- plan_llm_decoder.md                         [modified] L1 arithmetic correction
 |   |-- plan_llm_training_recipe.md                 [modified] L1 arithmetic correction
@@ -1117,7 +1117,7 @@ No implementation or runtime gate passed during drafting. Corpus runs, quality c
 - **Normalization/injection:** sandwich norms, learned adapters, random initial state, and warm starts remain separate architecture questions; adopting them changes counts and equivalence contracts.
 - **FP8 and combined experiments:** loop-specific scaling-history ownership, MoE GPU, MTP, MLA, causal split, cuTile, and DPO combinations remain unsupported until their own tests land.
 - **Authorization and data:** corpus rights, inventories, token budgets, G0/GAB/GBC/GCHAT approvals, and Latinist evaluation remain the recipe’s unresolved operational gates.
-- **Delegation:** implementation must re-read `tasks/rust/03_plans/llm/AGENTS_LLM.md` and the live operator override. This drafting request did not dispatch implementation workers.
+- **Delegation:** implementation must re-read `tasks/rust/03_plans/llm/ROADMAP_LLM.md` and the live operator override. This drafting request did not dispatch implementation workers.
 
 ## Self-Review
 
